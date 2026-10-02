@@ -1,0 +1,108 @@
+/*
+ * diag.h - stop codes, trap handler, boot record, register dump (diag.c)
+ */
+#ifndef DIAG_H
+#define DIAG_H
+
+#include <stdint.h>
+#include "regs.h"       /* reg_visit_t, reg_fmt_t (src/port, P4.8) */
+
+/* Bound for every hardware wait loop, in loop iterations. A step that
+ * needs longer than this has failed; fail() then reports which one. */
+#ifdef __MPLAB_DEBUGGER_SIMULATOR
+#define WAIT_LIMIT        20000u     /* simulator runs at ~1/80 real time */
+#else
+#define WAIT_LIMIT        2000000u
+#endif
+
+/* != 0: stopped, see fail() */
+extern volatile uint32_t fail_code;
+
+/* Start-up progress and the last trap, in persistent RAM so both survive
+ * the reset that an unhandled trap would otherwise hide. boot_mark() is
+ * called at each step of main(); _DefaultInterrupt() prints the lot and
+ * blinks code 9. trap_seen != 0 at start-up means the previous run hit a
+ * trap - main() reports that before doing anything else. */
+extern volatile uint32_t boot_stage;
+extern volatile uint32_t trap_seen;
+extern volatile uint32_t trap_vec;
+extern volatile uint32_t trap_stage;
+void boot_mark(uint32_t stage);
+
+/* The chain test's stage (chaintest.c), in persistent RAM: CHAIN_MARK_MAGIC
+ * | stage while a chain run is inside that stage, 0 after its @END. The
+ * next boot reports a run that never reached @END, so that a hang or a
+ * trap in the middle of "chain all" still says where it happened. */
+#define CHAIN_MARK_MAGIC  0xC4A10000u
+extern volatile uint32_t chain_mark;
+
+/* Stop with a blink code (never returns). Codes: table in diag.c. */
+void fail(uint32_t code);
+
+/* Stack high-water mark (BR.6, 27.09.2026), read by "status" (cli.c):
+ * diag_stack_paint() fills the free stack with a pattern once, as the
+ * first thing main() does; diag_stack_size() is how much of it was
+ * painted, in bytes (from main()'s entry SP up to SPLIM less a margin - the
+ * few words crt0 and main() itself hold below it are not counted);
+ * diag_stack_used_max() is the highest RAM address any push has reached
+ * since (an ADDRESS - "status" prints it as stack_hwm_addr);
+ * diag_stack_used_bytes() is that depth in bytes above the paint start
+ * ("status": stack_used); diag_stack_free_pct() is the percentage of
+ * diag_stack_size() still unpainted-over - the board-run pass criterion
+ * (docs/IMPLEMENTATION-PLAN.md, BR.9) is >= 25. See diag.c for how and
+ * why (the stack direction, the ECC-RAM reason painting must run before
+ * any of this is read). Host trace harness build (MinGW gcc, no W15/
+ * SPLIM to read): all three return 0 and diag_stack_paint() does nothing
+ * - no golden trace calls them, since cli.c (the only caller) is never
+ * linked into a scenario. */
+void     diag_stack_paint(void);
+uint32_t diag_stack_size(void);
+uint32_t diag_stack_used_max(void);
+uint32_t diag_stack_used_bytes(void);
+uint32_t diag_stack_free_pct(void);
+
+/* Print RCON, the reset-cause register, decoded, then clear it so the
+ * next boot shows its own cause. Called once, right after the console
+ * is up. A board that "just restarts" is told apart here: POR/BOR
+ * (supply), WDTO, SWR (the reset command), EXTR (MCLR), CM (config
+ * mismatch), BUCKR/VREGxR (the internal regulators gave up). */
+void diag_report_reset(void);
+
+/* Build and configuration, so that a log says by itself what ran: build
+ * id (date, time, git revision), board, ADC core and input, sample time,
+ * clock ratio, buffer size and the compile-time switches from board.h. Printed
+ * at boot and by the "version" command. */
+void diag_report_build(void);
+
+
+/* Wait until a condition becomes false, or give up with a code.
+ *
+ * Simulator build: no waiting at all. The MPLAB X simulator has no PLL,
+ * no ADC conversion and no DMA transfer, so every one of these conditions
+ * would time out and end the run in fail(1) before anything of interest
+ * had executed. The register writes stay exactly as on hardware; only the
+ * waits go - the same pattern MCC's clock.c uses. */
+#ifdef __MPLAB_DEBUGGER_SIMULATOR
+#define WAIT_WHILE(cond, code)  do { (void)(cond); } while (0)
+#else
+#define WAIT_WHILE(cond, code)                              \
+    do {                                                    \
+        uint32_t n_ = WAIT_LIMIT;                           \
+        while (cond) {                                      \
+            if (--n_ == 0u) { fail(code); }                 \
+        }                                                   \
+    } while (0)
+#endif
+
+/* Clock, ADC, DMA, interrupt and UART registers as "name: 0x........"
+ * lines on the console. Printed by fail() and by the "regs" command. */
+void regs_dump(void);
+
+/* The register visitor that prints (port/regs.h, P4.8): REG_HEX ->
+ * console_kv_hex(), REG_DEC -> console_kv(), REG_TITLE -> console_puts()
+ * of the whole line. What regs_dump() passes to every driver's
+ * xxx_regs_visit(); chaintest.c and capture.c pass it for their own
+ * partial dumps. */
+void reg_print(const char *name, uint32_t v, reg_fmt_t fmt);
+
+#endif /* DIAG_H */

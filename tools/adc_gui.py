@@ -1,0 +1,4234 @@
+#!/usr/bin/env python3
+"""
+adc_gui.py - a browser GUI for the ADC/DMA example: configure the triggered
+chain stream, capture its live data over the console, plot it with its FFT,
+repeat.
+
+How it works
+  The only data path is the triggered chain (SCCP1 -> ADC -> DMA0 ->
+  ping-pong, chaintest.c/cli.c): "stream on <ksps> [core pinsel [samc]]"
+  starts it and the firmware's main loop processes every half from then on;
+  this tool's own cycle is "stream grab" - halt the trigger just long
+  enough to send the half that stood still as one binary frame, restart it,
+  repeat (docs/PLAN-BINARY-TRANSFER.md, the GRAB frame). The back-to-back
+  burst mode ("pll"/"snap"/"dump"/"blk", the sweep tile) is retired from
+  this tool - the owner's decision, 25.09.2026: the triggered chain is the
+  only path the GUI shows now. The firmware keeps the back-to-back commands
+  for a terminal; this tool simply no longer sends them.
+
+Modes
+  --fake        no board: a built-in stand-in answers the same commands.
+                With the DAC2 test triangle input it plays back the same
+                synthetic triangle the firmware's own chain test is judged
+                against (tools/eval_chain.py's synth()); with any other
+                input it plays a sine with harmonics and noise, so
+                SNR/THD/harmonics have something to show in the spectrum.
+  --port COMx   the board. Without --port the page offers a port list.
+  --remote      a remote board through a bench_client tunnel
+                (tools/remote.py) instead of --port - preselects "remote" in
+                that same list; --bench-client sets the path to
+                bench_client.py (default: $BENCH_CLIENT). No flashing from
+                here - that stays with bench_client.py.
+  --selftest    no GUI: run the fake target through the stream/grab cycle,
+                parse, FFT, judge the triangle, print the numbers, exit 0/1.
+  --settings F  settings file, read at start-up and written by "save"
+                (default: adc_gui_settings.json next to this script). Every
+                control on the page is in it, so a session survives a
+                restart; "save as" and the setup list's "from a file ..." name
+                a different file, its other entries are ready-made setups. An
+                older file (from before 25.09.2026, with "pll"/"sweep"/
+                "capture" keys) still loads - those keys are simply not
+                read any more.
+
+Requirements: nicegui, pyserial, numpy  (pip install -r requirements-gui.txt)
+"""
+import argparse
+import asyncio
+import json
+import math
+import os
+import re
+import sys
+import time
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Packages, boards, and where a channel comes out
+#
+# 'core <1..5> [pinsel]' and 'input <0..15>' exist in cli.c. Which package
+# pin such a pair reads is silicon layout: pins128.py (MPS512, TQFP-128)
+# and pins64.py (MPS506, the Nano's 64-pin part) carry the data sheet's own
+# tables, DS70005591D Tables 11 and 5, so a pair is resolved from the
+# document and never guessed.
+#
+# Where that pin comes out on a board is board layout, and that is
+# boards.py: the DIM information sheet DS70005563A for the EV74H48A, the
+# Curiosity Nano user guide DS70005634A for the EV17P63A.
+# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pins128  # noqa: E402  (needs the path above)
+import pins64  # noqa: E402
+from boards import BOARDS  # noqa: E402
+# The triangle analysis reuses the SAME evaluator the firmware's tri_eval()
+# (chaintest.c) is ported from, rather than a second implementation that
+# could silently disagree with it; synth() also backs the fake target's
+# "stream grab" frames for the test input (host-testable without a board).
+from eval_chain import tri_eval as chain_tri_eval  # noqa: E402
+from eval_chain import grid_ok as chain_grid_ok  # noqa: E402
+from eval_chain import synth as chain_synth  # noqa: E402
+# CRC-16/CCITT-FALSE, the "stream grab" GRAB frame parser and Target (the
+# serial console client) moved out to tools/protocol.py (P6.5), so a
+# host-side tool can talk to the board's console without pulling in NiceGUI.
+# ACK/NAK stay in use here too, for FakeTarget and the self-test below.
+from protocol import ACK, NAK, PROC_NAMES, crc16_ccitt_false, format_rtt, parse_grab_frame, Target  # noqa: E402
+# "Remote" connection choice (below): a bench_client tunnel (tools/remote.py)
+# instead of a local COM port - see RemoteBench's own docstring for the
+# fixed contract this codes against. No flashing here: that stays in
+# bench_client itself (the connection panel says so).
+import remote  # noqa: E402
+# Trigger mode of the time plot (TRG, docs/IMPLEMENTATION-PLAN.md): a pure
+# search over the grabbed half, no firmware or wire-protocol change.
+from trigger import RISING, FALLING, find_trigger, find_triggers, trigger_window  # noqa: E402
+# The signal generator (SG.6): the table formula, SCCP2's real rate, the
+# zero-order-hold playback and the loop alignment - one model shared with
+# tests/ref/wavegen_ref.py and this file's FakeTarget.
+import wavegen_model  # noqa: E402
+# The firmware's filters (src/core/sigproc.c) come from this script's
+# coefficients; FakeTarget runs the same ones on its samples.
+import sigproc_design  # noqa: E402
+# The application's part of this page (02.10.2026): an optional module
+# gui_app.py next to this file adds its own rows to the signal processing
+# card, its settings, setups, stand-in and self-test through a few fixed
+# hooks (see where `gui_app` is used). Without it the page is the plain
+# example.
+try:
+    import gui_app  # noqa: E402
+except ImportError:
+    gui_app = None
+
+
+# ---------------------------------------------------------------------------
+# Settings file
+#
+# Every control on the page has its value here, so a session can be put
+# down and picked up: the file is read at start-up, "save" writes the
+# controls back to it, "save as" and the setup list's "from a file ..."
+# name a different one. The
+# built-in defaults below are the fallback for a missing file and for
+# any key a file does not carry, so an old or hand-edited file still loads.
+# ---------------------------------------------------------------------------
+# Two files. adc_gui_defaults.json is the STANDARD: tracked in git, every
+# key with its default, read first at every start. adc_gui_settings.json is
+# the user's own state: git-ignored, written by "save", read on top of the
+# standard (a key it lacks keeps the standard's value). The dict below is
+# the same content as the standard file - the fallback if that file is
+# missing, and what --selftest compares it against.
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "adc_gui_settings.json")
+DEFAULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "adc_gui_defaults.json")
+SETTINGS_VERSION = 3
+
+# ---------------------------------------------------------------------------
+# The "documentation" button: docs/ARCHITECTURE.md and the block diagrams next
+# to it (docs/gen_architecture.py writes them). Read from disk on every click
+# and served straight out of docs/ - never copied into this tool - so the page
+# shows whatever the repository says now, and an update to the architecture
+# needs no change here.
+DOCS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs")
+DOCS_URL = "/repo-docs"
+
+
+def architecture_markdown(docs_dir=DOCS_DIR, url=DOCS_URL):
+    """docs/ARCHITECTURE.md with its relative image links pointed at the GUI's
+    static route for docs/. Returns (markdown, [image file names]). Each image
+    gets "?v=<mtime>" so a regenerated SVG is not taken from the browser cache."""
+    path = os.path.join(docs_dir, "ARCHITECTURE.md")
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        return f"`{path}` could not be read: {e.strerror}.", []
+    images = []
+    # ARCHITECTURE.md embeds each diagram as <picture> with a dark variant for
+    # GitHub; here the adaptive SVG alone, as a plain Markdown image
+    text = re.sub(r'<picture>.*?<img alt="([^"]*)" src="([^"]+)">\s*</picture>',
+                  lambda m: f"![{m.group(1)}]({m.group(2)})", text, flags=re.S)
+
+    def local(m):
+        alt, src = m.group(1), m.group(2)
+        if re.match(r"^([a-z][a-z0-9+.-]*:|/)", src, re.I):
+            return m.group(0)
+        f = os.path.join(docs_dir, src)
+        v = int(os.path.getmtime(f)) if os.path.exists(f) else 0
+        images.append(src)
+        return f"![{alt}]({url}/{src}?v={v})"
+    return re.sub(r"!\[([^\]]*)\]\(([^)\s]+)\)", local, text), images
+
+SETTINGS_DEFAULTS = {
+    "version": SETTINGS_VERSION,
+    "board": "EV74H48A",
+    "connection": {"port": ""},
+    "view": {"dac_source": 0, "tooltips": True, "vref": 3.3, "collapsed": []},
+    "acquisition": {
+        "mode": "test",           # "test" (RA8/DAC2 triangle, core 5 pin 3) or "custom"
+        "ksps": 8000,
+        "core": 3, "pinsel": 5, "samc": 0,
+        "interval_ms": 500,
+    },
+    # TRG: the time plot's trigger (display only, tools/trigger.py)
+    "trigger": {"on": False, "level": 2048, "slope": "rising", "hyst": 16},
+    # the signal processing card (02.10.2026, sigproc.c): filter at fs/8
+    # ("off", "lp", "hp", "bp"), Goertzel at fs/16 and its threshold
+    "sigproc": {"filter": "off", "gz": False, "thr": 100,
+                **(gui_app.SIGPROC_DEFAULTS if gui_app else {})},
+    # SG.6: the signal generator card - tab_wave_gen.py's defaults (500 kHz,
+    # 0.01 s = 5000 entries, 10 kHz, 0.2/0.4/0.1, decay 1000), the range
+    # 800..3500 where the board's DAC follows (HARDWARE-LOG 29.09.2026)
+    "siggen": {"on": False, "dac": 2, "n": 5000, "play_hz": 500000, "f0": 10000.0,
+               "h": [0.2, 0.4, 0.1, 0.0, 0.0, 0.0], "decay": 1000.0, "amp": 1.0,
+               "lo": 800, "hi": 3500, "snap": True, "force": True},
+    "buffer": {"size": 4096},
+    "dac": {
+        "1": {"on": False, "low": 0x100, "high": 0xF00, "slpdat": 8},
+        # DAC2 "on" is true, false or "auto": the firmware's own test
+        # triangle, chosen per rate, on the test input
+        "2": {"on": "auto", "low": 0x100, "high": 0xF00, "slpdat": 8},
+    },
+    "fake": {"source": "dac2", "signal_khz": 100.0, "amplitude": 1500.0,
+             "noise": 6.0, "harmonic2": 150.0, "harmonic3": 0.0},
+}
+
+
+# ---------------------------------------------------------------------------
+# Ready-made setups for the "setup" list in the settings card. Each one is a
+# partial settings dict, laid over the page's current state (settings_merge),
+# so it only touches what it names: the input, the rate, the DACs, the
+# signal generator, the trigger and the fake target's source. Every DAC
+# setup reads its own pin through a custom input (DAC1 = RA1 = core 5 /
+# PINSEL 1, DAC2 = RA8 = core 5 / PINSEL 3), except the first, which is the
+# firmware's own test triangle. The triangles start at 0x400, above the
+# ~780 the board's DAC does not follow below. Triangle periods: dac_period_ns_of() -
+# (high - low) x 32 DAC clocks / SLPDAT at 400 MHz. The generator setups stay
+# in 800..3500 (the board's DAC does not follow below about code 780,
+# HARDWARE-LOG 29.09.2026) and at <= 200 000 entries/s (settling 0.75-2 us
+# per step); their shapes come from the harmonic factors h2..h7 alone: the
+# Fourier series of a square (odd, 1/k), a sawtooth (alternating, 1/k), a
+# triangle (odd, alternating, 1/k^2), a pulse train (all equal).
+# ---------------------------------------------------------------------------
+_SG_OFF = {"on": False}
+_DAC_OFF = {"on": False}
+_DAC_PINSEL = {1: 1, 2: 3}       # DACOUT1 = RA1 = AD5AN1, DACOUT2 = RA8 = AD5AN3
+
+
+def _tri_setup(unit, low, high, slp, ksps):
+    """A triangle on one DAC, read on its own pin; the other DAC off."""
+    return {
+        "acquisition": {"mode": "custom", "ksps": ksps, "core": 5, "pinsel": _DAC_PINSEL[unit], "samc": 0},
+        "view": {"dac_source": unit},
+        "siggen": _SG_OFF,
+        "dac": {str(unit): {"on": True, "low": low, "high": high, "slpdat": slp, "force": True},
+                str(3 - unit): {"on": "auto" if unit == 1 else False}},
+        "trigger": {"on": True, "level": (low + high) // 2, "slope": "rising", "hyst": 16},
+        "fake": {"source": f"dac{unit}"},
+    }
+
+
+def _sg_setup(h, f0=2000.0, n=1000, play=200000, decay=0.0, dac=2, ksps=1000, trig=True,
+              trig_level=2150):
+    """The signal generator on one DAC, read on its pin; the DAC cards off
+    ('auto' for DAC2) - an 'on' there would replace the generator."""
+    return {
+        "acquisition": {"mode": "custom", "ksps": ksps, "core": 5, "pinsel": _DAC_PINSEL[dac], "samc": 0},
+        "view": {"dac_source": dac},
+        "siggen": {"on": True, "dac": dac, "n": n, "play_hz": play, "f0": f0,
+                   "h": [float(h.get(k, 0.0)) for k in range(2, 8)],
+                   "decay": decay, "amp": 1.0, "lo": 800, "hi": 3500, "snap": True, "force": True},
+        "dac": {"1": _DAC_OFF, "2": {"on": "auto"}},
+        "trigger": {"on": trig, "level": trig_level, "slope": "rising", "hyst": 32},
+        "fake": {"source": "sine"},
+    }
+
+
+def _gz_setup(f0, filt="off"):
+    """A Goertzel check (02.10.2026, sigproc.c): a pure sine from the
+    generator on DAC2, read on RA8 at 400 kSPS - fs/16 = 25 kHz, fs/8 =
+    50 kHz - with the Goertzel on and the filter as given. 2000 entries at
+    1 MHz: f0 snaps to 500 Hz steps, so 25 kHz is exact; the board measured
+    the filters and the Goertzel this way (HARDWARE-LOG 02.10.2026), 1 MHz
+    being above the 200 000 entries/s the other setups keep to, but 40
+    entries a period at 25 kHz."""
+    cfg = _sg_setup({}, f0=f0, n=2000, play=1000000, ksps=400, trig=True)
+    cfg["sigproc"] = {"filter": filt, "gz": True, "thr": 100}
+    return cfg
+
+
+SETUPS = {
+    "tri_test": ("DAC2 triangle - firmware test signal (test input, 8 MSPS)", {
+        "acquisition": {"mode": "test", "ksps": 8000},
+        "siggen": _SG_OFF,
+        "dac": {"1": _DAC_OFF, "2": {"on": "auto"}},
+        "trigger": {"on": False},
+        "fake": {"source": "dac2"},
+    }),
+    "tri_slow": ("DAC2 triangle - slow, 0x400..0xE00, SLPDAT 1, 4.9 kHz (1 MSPS)",
+                 _tri_setup(2, 0x400, 0xE00, 1, 1000)),
+    "tri_35k": ("DAC2 triangle - 0x400..0xF00, SLPDAT 8, 35 kHz (8 MSPS)",
+                _tri_setup(2, 0x400, 0xF00, 8, 8000)),
+    "tri_fast": ("DAC2 triangle - small and fast, 512 codes, SLPDAT 16, 390 kHz (8 MSPS)",
+                 _tri_setup(2, 0x700, 0x900, 16, 8000)),
+    "tri_dac1": ("DAC1 triangle - RA1, 0x400..0xE00, SLPDAT 4, 19.5 kHz (4 MSPS)",
+                 _tri_setup(1, 0x400, 0xE00, 4, 4000)),
+    "sg_sine": ("generator - sine 2 kHz on DAC2 (1 MSPS)", _sg_setup({})),
+    "gz_fs16": ("Goertzel check - sine at fs/16 (25 kHz at 400 kSPS): expect DETECTED",
+                _gz_setup(25000.0)),
+    "gz_fs8": ("Goertzel check - sine at fs/8 (50 kHz at 400 kSPS): expect not detected",
+               _gz_setup(50000.0)),
+    # 3 kHz beside fs/16 = 7.7 bins of fs/1024 at 400 kSPS: the Goertzel
+    # (no window) still sees a side lobe of about 3.5 % - ~47 LSB, below the
+    # threshold of 100. 26 kHz (2.6 bins) was the first choice and read 167 LSB
+    # on the board - detected (HARDWARE-LOG 02.10.2026).
+    "gz_near": ("Goertzel check - sine at 28 kHz, 3 kHz beside fs/16: expect not detected",
+                _gz_setup(28000.0)),
+    "gz_hp": ("Goertzel check - fs/16 with the high-pass on: plot shows it at 5 %, "
+              "the Goertzel (before the filter) DETECTED", _gz_setup(25000.0, "hp")),
+    "sg_loop": ("generator - 1 kHz + 3rd harmonic 0.3 (the loop preset)",
+                _sg_setup({3: 0.3}, f0=1000.0, n=1000, play=100000)),
+    "sg_square": ("generator - square-like, odd harmonics 1/k, 2 kHz",
+                  _sg_setup({3: 1 / 3, 5: 1 / 5, 7: 1 / 7})),
+    "sg_saw": ("generator - sawtooth-like, harmonics +-1/k, 2 kHz",
+               _sg_setup({2: -1 / 2, 3: 1 / 3, 4: -1 / 4, 5: 1 / 5, 6: -1 / 6, 7: 1 / 7})),
+    "sg_tri": ("generator - triangle from harmonics, odd +-1/k^2, 2 kHz",
+               _sg_setup({3: -1 / 9, 5: 1 / 25, 7: -1 / 49})),
+    "sg_pulse": ("generator - pulse train, h2..h7 = 1, 2 kHz",
+                 _sg_setup({k: 1.0 for k in range(2, 8)})),
+    "sg_decay": ("generator - damped 2 kHz, decay 300/s, 10 ms table (100 kSPS)",
+                 _sg_setup({}, n=2000, decay=300.0, ksps=100, trig=False)),
+    # 50 kHz, h2..h4, played at the generator's 1 MHz maximum (20 entries a
+    # period, 5 at h4); decay 5000/s leaves 0.7 % after 1 ms, so the first
+    # half of the 2 ms table holds the whole decay and the second is quiet.
+    # 500 kSPS: one grab (1024) spans the table, the triggered window (512
+    # samples = 1 ms) the decay; level 3200 is only crossed near the start.
+    "sg_decay50k": ("generator - 50 kHz + h2/h3/h4, decaying to zero within 1 ms (500 kSPS)",
+                    _sg_setup({2: 0.3, 3: 0.2, 4: 0.1}, f0=50000.0, n=2000, play=1000000,
+                              decay=5000.0, ksps=500, trig_level=3200)),
+    "sg_dac1": ("generator - sine 5 kHz on DAC1 / RA1 (1 MSPS)",
+                _sg_setup({}, f0=5000.0, dac=1)),
+}
+if gui_app:
+    SETUPS.update(gui_app.setups(_sg_setup))
+
+# Every setup that does not name the signal processing switches it off
+# (02.10.2026): a filter or the Goertzel left on from a Goertzel check would
+# otherwise change what the next setup shows (a filtered triangle fails its
+# grid check).
+for _name, _cfg in SETUPS.values():
+    _cfg.setdefault("sigproc", {"filter": "off", "gz": False,
+                                **(gui_app.SIGPROC_OFF if gui_app else {})})
+SETUP_FROM_FILE = "__file__"
+
+
+def settings_merge(base, over):
+    """`over` wins, key by key, one level deep per section - a file that
+    carries only half a section keeps the defaults for the other half."""
+    out = {}
+    for key, val in base.items():
+        if isinstance(val, dict) and isinstance(over.get(key), dict):
+            out[key] = settings_merge(val, over[key])
+        else:
+            out[key] = over.get(key, val)
+    for key, val in over.items():
+        out.setdefault(key, val)
+    return out
+
+
+def settings_standard():
+    """The standard settings: adc_gui_defaults.json, or the built-in copy of
+    it if that file is missing or broken. (settings, message)."""
+    try:
+        with open(DEFAULTS_FILE, "r", encoding="utf-8") as fh:
+            return settings_merge(SETTINGS_DEFAULTS, json.load(fh)), \
+                f"standard: {os.path.basename(DEFAULTS_FILE)}"
+    except (OSError, ValueError) as exc:
+        return json.loads(json.dumps(SETTINGS_DEFAULTS)), \
+            f"standard: built-in ({os.path.basename(DEFAULTS_FILE)}: {exc})"
+
+
+def settings_read(path):
+    """(settings, message): the standard, then `path` on top of it. A
+    missing `path` is not an error - it is the first start, and the
+    standard is the answer."""
+    std, std_msg = settings_standard()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            got = json.load(fh)
+    except FileNotFoundError:
+        return std, f"{std_msg}; {os.path.basename(path)} not there yet"
+    except (OSError, ValueError) as exc:
+        return std, f"{std_msg}; {os.path.basename(path)}: {exc}"
+    return settings_merge(std, got), f"{std_msg} + {os.path.basename(path)}"
+
+
+def settings_write(path, data):
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+    except OSError as exc:
+        return f"could not write {path}: {exc}"
+    return f"saved {os.path.basename(path)}"
+
+
+def settings_write_key(path, section, key, value):
+    """Write ONE value into the settings file and leave everything else in
+    it as it is: the file as it stands (or the standard, the first time),
+    that key changed, written back. For the folded tiles, which are kept at
+    every fold, while every other value still waits for "save"."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data, _msg = settings_standard()
+    data.setdefault(section, {})[key] = value
+    return settings_write(path, data)
+
+
+BOARD_DEFAULT = "EV74H48A"
+BOARD_OPTIONS = {key: b["title"] for key, b in BOARDS.items()}
+
+PORT_RE = re.compile(r"R[A-H]\d{1,2}")
+ADC_IN_RE = re.compile(r"AD([1-5])AN(\d{1,2})")
+ADC_NEG_RE = re.compile(r"AD([1-5])ANN(\d{1,2})")
+
+
+class Pin:
+    """One package pin, exactly as the data sheet's table lists it."""
+
+    __slots__ = ("n", "functions", "port", "adc", "dac", "kind")
+
+    def __init__(self, n, functions):
+        toks = [t for t in functions.split("/") if t]
+        self.n = n
+        self.functions = toks
+        self.port = next((t for t in reversed(toks) if PORT_RE.fullmatch(t)), None)
+        self.adc = [t for t in toks if ADC_IN_RE.fullmatch(t) or ADC_NEG_RE.fullmatch(t)]
+        self.dac = [t for t in toks if t.startswith("DACOUT")]
+        if self.port:
+            self.kind = "io"
+        elif toks[0] in ("VSS", "AVSS", "SWVSS"):
+            self.kind = "gnd"
+        elif toks[0] in ("VDD", "AVDD", "VDDCORE", "SWVDD", "LX", "VBAT"):
+            self.kind = "pwr"
+        elif toks[0] == "NC":
+            self.kind = "nc"
+        else:
+            self.kind = "special"
+
+
+class Package:
+    """A device package: its pins, and which pin each (core, PINSEL) reads.
+    Positive inputs only -- ADnANNm is the negative input of a differential
+    pair (NINSEL), not what PINSEL selects."""
+
+    def __init__(self, module):
+        self.per_side = module.PINS_PER_SIDE
+        self.pins = [Pin(n, module.PIN_FUNCTIONS[n]) for n in sorted(module.PIN_FUNCTIONS)]
+        self.count = len(self.pins)
+        self.adc_pin = {}
+        for pin in self.pins:
+            for fn in pin.adc:
+                m = ADC_IN_RE.fullmatch(fn)
+                if m:
+                    self.adc_pin[(int(m.group(1)), int(m.group(2)))] = pin
+
+    def by_number(self, n):
+        return self.pins[n - 1] if 1 <= n <= self.count else None
+
+    def channels(self, core):
+        """PINSEL values this package brings out for `core`, plus the two
+        internal ones every core has."""
+        got = sorted(ps for (c, ps) in self.adc_pin if c == core)
+        return got + [ps for ps in sorted(INTERNAL_INPUTS) if ps not in got]
+
+
+PACKAGES = {128: Package(pins128), 64: Package(pins64)}
+
+# PINSEL values that stay inside the chip on every core (Table 16-2).
+INTERNAL_INPUTS = {
+    6: "internal 15/16 x VDD reference, the self-test input - no pin",
+    7: "internal UREF line - no pin, and the way a DAC reaches any core "
+       "without a wire",
+}
+
+# UREF: one reference line for the whole chip, and AN7 of every core samples
+# it (Table 16-2, "ADC n UREF input"). UREFCON has a single INSEL field -
+# one instance at 0x3B20, one SFR - which picks what sits on the line:
+# 1 AVDD/2, 2 VDD/2, 3 VDDcore, 4 bandgap, 5 temperature, 6..13 DAC1..DAC8,
+# 14 AVSS, 15 AVDD. DAC1 is 6, DAC2 is 7, and because the line is shared
+# only one DAC can be on it at a time. UREFOUTEN would also drive it onto a
+# pin; the internal path does not need that.
+UREF_INSEL_OF_DAC = {1: 6, 2: 7}
+UREF_CHANNEL = 7
+UREF_NOTE = ("one line for the whole chip, so only one DAC at a time; "
+             "measured on core 3 so far, the other four follow from Table 16-2")
+
+
+# Board-level notes the documents do not spell out but this project knows.
+BOARD_NOTES = {
+    ("EV74H48A", 3, 5): "the example's default measurement input",
+    ("EV74H48A", 5, 3): "DACOUT2 is on this pin: ADC5 reads DAC2 back with no wire (phase 2 of the boot tests)",
+    ("EV17P63A", 5, 3): "DACOUT2 is on this pin: ADC5 reads DAC2 back with no wire (phase 2 of the boot tests)",
+    ("EV17P63A", 1, 0): "the Nano profile's default measurement input (board.h)",
+}
+
+
+def package_of(board_key):
+    return PACKAGES[BOARDS[board_key]["pin_count"]]
+
+
+def channel_pin(board_key, core, pinsel):
+    """The package pin (core, PINSEL) reads on this board's device, or None
+    for an internal input and for a pair the package does not bring out."""
+    return package_of(board_key).adc_pin.get((core, pinsel))
+
+
+def channel_site(board_key, core, pinsel):
+    """Where the channel comes out on the board: (kind, label, detail).
+    kind is 'connector', 'edge', 'onboard', 'internal' or 'none'."""
+    board = BOARDS[board_key]
+    if pinsel in INTERNAL_INPUTS:
+        return ("internal", INTERNAL_INPUTS[pinsel], "")
+    pin = channel_pin(board_key, core, pinsel)
+    if pin is None:
+        return ("none", f"AD{core}AN{pinsel} is not brought out in the {board['package']} package", "")
+    for name, socket in board.get("connectors", {}).items():
+        for socket_pin, entry in sorted(socket.items()):
+            if entry["dev"] == pin.n:
+                sig = f" ({entry['sig']})" if entry["sig"] else ""
+                return ("connector", f"{name} pin {socket_pin}{sig}", f"device pin {pin.n} · {pin.port}")
+    for side, row in board.get("edge_rows", {}).items():
+        for pad in row:
+            if pad["dev"] == pin.n:
+                return ("edge", f"{side} edge row, pad {pad['pos']} ({pad['label']})",
+                        f"device pin {pin.n} · {pin.port}")
+    if pin.n in board.get("onboard", {}):
+        return ("onboard", board["onboard"][pin.n], f"device pin {pin.n} · {pin.port}")
+    return ("none", f"device pin {pin.n} ({pin.port}) is not brought out on this board", "")
+
+
+# The two DACs with an output buffer, and the ADC input that shares each
+# pin - the only two channels a DAC can reach without a wire (dac.h).
+DAC_UNITS = (1, 2)
+DAC_OPTIONS = {0: "no DAC", 1: "DAC1 · RA1", 2: "DAC2 · RA8"}
+
+
+def dac_pin(board_key, unit):
+    """The package pin DACOUTn drives, from the pin table itself."""
+    if unit not in DAC_UNITS:
+        return None
+    want = f"DACOUT{unit}"
+    for pin in package_of(board_key).pins:
+        if want in pin.functions:
+            return pin
+    return None
+
+
+def dac_channels(board_key, unit):
+    """(core, PINSEL) pairs that read the DAC's own pin - no wire needed."""
+    pin = dac_pin(board_key, unit)
+    if pin is None:
+        return []
+    pkg = package_of(board_key)
+    return [key for key, p in pkg.adc_pin.items() if p.n == pin.n]
+
+
+def wire_hint(board_key, core, pinsel, unit):
+    """What it takes to get this DAC into this ADC channel:
+    (needed, headline, detail). `needed` is False for the two routes that
+    need no wire at all - the DAC's own pin, and the internal UREF line."""
+    if unit not in DAC_UNITS:
+        return (False, "", "")
+    dpin = dac_pin(board_key, unit)
+    apin = channel_pin(board_key, core, pinsel)
+    if pinsel == UREF_CHANNEL:
+        return (False,
+                f"internal: UREF carries DAC{unit}, read as AN7 - no pin, no wire, any core",
+                f"UREFCON.INSEL = {UREF_INSEL_OF_DAC[unit]} puts DAC{unit} on the line; {UREF_NOTE}")
+    if dpin is None:
+        return (True, f"DACOUT{unit} is not brought out in this package", "")
+    if apin is None:
+        why = "the self-test reference" if pinsel == 6 else "not brought out"
+        return (True, f"AD{core}AN{pinsel} is {why} - a wire cannot reach it",
+                "for a DAC signal without a wire, pick channel AN7: UREF reaches every core")
+    if apin.n == dpin.n:
+        return (False, f"no wire needed: DAC{unit} drives pin {dpin.n} ({dpin.port}), "
+                       f"which is AD{core}AN{pinsel} itself", "")
+    dsite = channel_site_of_pin(board_key, dpin)
+    asite = channel_site_of_pin(board_key, apin)
+    return (True, f"wire {dsite} -> {asite}",
+            f"DAC{unit} out on pin {dpin.n} ({dpin.port}), ADC in on pin {apin.n} ({apin.port})"
+            "  -  or pick channel AN7 and take the internal UREF line instead, no wire")
+
+
+def channel_site_of_pin(board_key, pin):
+    """Where a device pin comes out on the board, as one short phrase."""
+    board = BOARDS[board_key]
+    for name, socket in board.get("connectors", {}).items():
+        for socket_pin, entry in sorted(socket.items()):
+            if entry["dev"] == pin.n:
+                sig = f" {entry['sig']}" if entry["sig"] else ""
+                return f"{name} pin {socket_pin}{sig}"
+    for side, row in board.get("edge_rows", {}).items():
+        for pad in row:
+            if pad["dev"] == pin.n:
+                return f"{side} row pad {pad['pos']} ({pad['label']})"
+    if pin.n in board.get("onboard", {}):
+        return board["onboard"][pin.n]
+    return f"pin {pin.n} ({pin.port}), not brought out"
+
+
+def channel_pin_info(board_key, core, pinsel):
+    kind, label, detail = channel_site(board_key, core, pinsel)
+    note = BOARD_NOTES.get((board_key, core, pinsel))
+    text = label if not detail else f"{detail} → {label}"
+    return text + (f" — {note}" if note else "")
+
+
+# ---------------------------------------------------------------------------
+# The package drawing
+#
+# The chip as the data sheet's pin diagram shows it: pin 1 at the marked
+# corner, numbering counterclockwise. The selected channel's pin is lit and
+# called out by number and port name, the other inputs of the same core are
+# dimmed cyan, so the drawing answers "where do I connect the signal" at a
+# glance. `full=True` labels every pin.
+# ---------------------------------------------------------------------------
+CHIP_VIEW, CHIP_BODY, CHIP_PINLEN, CHIP_PINW = 1000.0, 640.0, 26.0, 9.0
+CHIP_OFF = (CHIP_VIEW - CHIP_BODY) / 2.0
+
+# Mirrors the GUI palette in main_gui (ACCENT / ACCENT2 / DIM).
+CHIP_COL = {
+    "body": "#0f172a", "edge": "#1f2937", "body_text": "#64748b",
+    "io": "#475569", "nc": "#233045", "gnd": "#334155", "pwr": "#9f4b4b",
+    "core": "#0e7490", "sel": "#22d3ee", "dac": "#a78bfa",
+    "label": "#94a3b8", "label_sel": "#e2e8f0", "board": "#16202f",
+}
+
+
+def _pin_geometry(n, per_side):
+    """(x, y, w, h) of the pin's rectangle, (label x, y, rotation, anchor),
+    and the point on the body edge a callout should point at."""
+    pitch = CHIP_BODY / (per_side + 1)
+    i, side = (n - 1) % per_side, (n - 1) // per_side
+    span = (per_side - 1) * pitch
+    along = CHIP_OFF + (CHIP_BODY - span) / 2.0 + i * pitch
+    far = CHIP_OFF + CHIP_BODY
+    back = far - (along - CHIP_OFF)          # sides 2 and 3 run backwards
+    w = min(CHIP_PINW, pitch * 0.55)
+    if side == 0:                            # left side, downwards
+        return ((CHIP_OFF - CHIP_PINLEN, along - w / 2, CHIP_PINLEN, w),
+                (CHIP_OFF - CHIP_PINLEN - 6, along, 0, "end"), (CHIP_OFF, along))
+    if side == 1:                            # bottom, to the right
+        return ((along - w / 2, far, w, CHIP_PINLEN),
+                (along, far + CHIP_PINLEN + 6, 90, "start"), (along, far))
+    if side == 2:                            # right side, upwards
+        return ((far, back - w / 2, CHIP_PINLEN, w),
+                (far + CHIP_PINLEN + 6, back, 0, "start"), (far, back))
+    return ((back - w / 2, CHIP_OFF - CHIP_PINLEN, w, CHIP_PINLEN),
+            (back, CHIP_OFF - CHIP_PINLEN - 6, -90, "start"), (back, CHIP_OFF))
+
+
+def _pin_colour(pin, core, selected_n):
+    if pin.n == selected_n:
+        return CHIP_COL["sel"]
+    if any(ADC_IN_RE.fullmatch(f) and int(f[2]) == core for f in pin.adc):
+        return CHIP_COL["core"]
+    if pin.dac:
+        return CHIP_COL["dac"]
+    return CHIP_COL.get(pin.kind, CHIP_COL["io"])
+
+
+def _svg_open(view_w, view_h, label):
+    return (f'<svg viewBox="0 0 {view_w:.0f} {view_h:.0f}" role="img" aria-label="{label}" '
+            'style="width:100%;height:auto;display:block;'
+            'font-family:ui-monospace,Consolas,monospace">')
+
+
+def _text(x, y, s, fill, size, anchor="middle", weight=False, rot=None, baseline="middle"):
+    w = ' font-weight="600"' if weight else ''
+    r = f' transform="rotate({rot} {x:.1f} {y:.1f})"' if rot else ''
+    return (f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="{anchor}" dominant-baseline="{baseline}" '
+            f'fill="{fill}" font-size="{size}"{w}{r}>{s}</text>')
+
+
+def chip_svg(board_key, core, pinsel, full=False, dac_unit=0, dac_on=False):
+    pkg = package_of(board_key)
+    board = BOARDS[board_key]
+    sel_pin = channel_pin(board_key, core, pinsel)
+    sel_n = sel_pin.n if sel_pin else None
+    dpin = dac_pin(board_key, dac_unit)
+    dac_n = dpin.n if dpin else None
+    out = [_svg_open(CHIP_VIEW, CHIP_VIEW,
+                     f"{board['package']} pinout, AD{core}AN{pinsel} highlighted")]
+    out.append(f'<rect x="{CHIP_OFF}" y="{CHIP_OFF}" width="{CHIP_BODY}" height="{CHIP_BODY}" '
+               f'rx="10" fill="{CHIP_COL["body"]}" stroke="{CHIP_COL["edge"]}" stroke-width="2"/>')
+    out.append(f'<circle cx="{CHIP_OFF + 34}" cy="{CHIP_OFF + 34}" r="10" fill="none" '
+               f'stroke="{CHIP_COL["body_text"]}" stroke-width="2"/>')
+    for pin in pkg.pins:
+        (x, y, w, h), (lx, ly, rot, anchor), _ = _pin_geometry(pin.n, pkg.per_side)
+        colour = _pin_colour(pin, core, sel_n)
+        extra = f' stroke="{CHIP_COL["sel"]}" stroke-width="3"' if pin.n == sel_n else ''
+        if pin.n == dac_n and pin.n != sel_n:
+            colour = CHIP_COL["dac"]
+            extra = f' stroke="{CHIP_COL["dac"]}" stroke-width="3"'
+        out.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" rx="1.5" '
+                   f'fill="{colour}"{extra}><title>pin {pin.n}: {"/".join(pin.functions)}</title></rect>')
+        if not (full or pin.n in (sel_n, dac_n) or (pin.n - 1) % pkg.per_side == 0):
+            continue
+        is_sel = pin.n == sel_n
+        is_dac = pin.n == dac_n and not is_sel
+        size = 13 if (is_sel or is_dac) else (9.5 if pkg.count > 64 else 12)
+        fill = CHIP_COL["label_sel"] if is_sel else (CHIP_COL["dac"] if is_dac else CHIP_COL["label"])
+        out.append(_text(lx, ly, f'{pin.n} {pin.port or pin.functions[0]}',
+                         fill, size, anchor, is_sel or is_dac, rot))
+    out.append(_text(500, 452, board["device"], CHIP_COL["body_text"], 24, weight=True))
+    out.append(_text(500, 480, f'{board["package"]} · 5 × 12-bit ADC', CHIP_COL["body_text"], 15))
+    if sel_pin is not None:
+        (_, _, _, _), _, (ex, ey) = _pin_geometry(sel_pin.n, pkg.per_side)
+        cy = 300.0 if ey < CHIP_VIEW / 2 else 640.0
+        out.append(f'<line x1="{ex:.1f}" y1="{ey:.1f}" x2="500" y2="{cy:.0f}" '
+                   f'stroke="{CHIP_COL["sel"]}" stroke-width="2"/>')
+        out.append(f'<rect x="270" y="{cy - 24:.0f}" width="460" height="52" rx="6" '
+                   f'fill="{CHIP_COL["body"]}" stroke="{CHIP_COL["sel"]}" stroke-width="2"/>')
+        out.append(_text(500, cy, f'AD{core}AN{pinsel} = pin {sel_pin.n} · {sel_pin.port}',
+                         CHIP_COL["sel"], 19, weight=True))
+        out.append(_text(500, cy + 19, "/".join(sel_pin.functions), CHIP_COL["label"], 11))
+    else:
+        why = INTERNAL_INPUTS.get(pinsel, "not brought out in this package")
+        out.append(_text(500, 570, f'AD{core}AN{pinsel}: {why}', CHIP_COL["label"], 16))
+    if dpin is not None:
+        (_, _, _, _), _, (dx, dy) = _pin_geometry(dpin.n, pkg.per_side)
+        needed, head, _ = wire_hint(board_key, core, pinsel, dac_unit)
+        if needed and sel_pin is not None:
+            # the wire, drawn as the dashed link it would be on the bench
+            (_, _, _, _), _, (ax, ay) = _pin_geometry(sel_pin.n, pkg.per_side)
+            out.append(f'<line x1="{dx:.1f}" y1="{dy:.1f}" x2="{ax:.1f}" y2="{ay:.1f}" '
+                       f'stroke="{CHIP_COL["dac"]}" stroke-width="2" stroke-dasharray="7 5"/>')
+        cy = 360.0 if dy < CHIP_VIEW / 2 else 700.0
+        out.append(f'<line x1="{dx:.1f}" y1="{dy:.1f}" x2="500" y2="{cy:.0f}" '
+                   f'stroke="{CHIP_COL["dac"]}" stroke-width="1.5" stroke-dasharray="4 4"/>')
+        out.append(f'<rect x="300" y="{cy - 17:.0f}" width="400" height="34" rx="6" '
+                   f'fill="{CHIP_COL["body"]}" stroke="{CHIP_COL["dac"]}" stroke-width="2"/>')
+        out.append(_text(500, cy, f'DAC{dac_unit} ({"on" if dac_on else "off"}) = pin {dpin.n} · {dpin.port}',
+                         CHIP_COL["dac"], 15, weight=True))
+    out.append('</svg>')
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# The board drawing
+#
+# Not a photograph: the connectors a signal can actually be reached on,
+# drawn with their real pin order, plus the on-board things an ADC pin can
+# be tied to (potentiometer, touch pads, buttons). The pad carrying the
+# selected channel is lit; if the channel only reaches an on-board part,
+# that part is lit instead, which is the answer "you cannot wire to it".
+# ---------------------------------------------------------------------------
+BOARD_VIEW_W, BOARD_VIEW_H = 1000.0, 640.0
+
+
+def _pad(out, x, y, w, h, fill, stroke=None, title=None, rx=2):
+    s = f' stroke="{stroke}" stroke-width="3"' if stroke else ''
+    t = f'<title>{title}</title>' if title else ''
+    out.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" rx="{rx}" '
+               f'fill="{fill}"{s}>{t}</rect>')
+
+
+dac_hit = []
+
+
+def _draw_socket(out, name, socket, x0, y0, cols, rows, sel_dev, pkg, vertical, dac_dev=None):
+    """One connector: `cols` x `rows` pads in its own pin order. mikroBUS
+    counts 1..8 down the left column and 16..9 down the right one; the
+    XPRO header counts odd numbers along one row and even along the other."""
+    pw, ph, gap = (48, 20, 4) if not vertical else (66, 19, 5)
+    out.append(_text(x0, y0 - 12, name, CHIP_COL["label"], 12, anchor="start", weight=True))
+    hit = None
+    for idx in range(cols * rows):
+        if vertical:                       # mikroBUS: two columns of 8
+            c, r = divmod(idx, rows)
+            pin = r + 1 if c == 0 else 16 - r
+        else:                              # XPRO: two rows of 10
+            r, c = divmod(idx, cols)
+            pin = 2 * c + 1 + r
+        x = x0 + c * (pw + gap)
+        y = y0 + r * (ph + gap)
+        entry = socket.get(pin)
+        dev = entry["dev"] if entry else None
+        port = pkg.by_number(dev).port if dev else None
+        is_sel = dev is not None and dev == sel_dev
+        is_dac = dev is not None and dev == dac_dev and not is_sel
+        if is_sel:
+            hit = (x + pw / 2, y + ph / 2, pin)
+        if is_dac:
+            dac_hit.append((x + pw / 2, y + ph / 2))
+        fill = (CHIP_COL["sel"] if is_sel else CHIP_COL["dac"] if is_dac
+                else (CHIP_COL["io"] if dev else CHIP_COL["nc"]))
+        _pad(out, x, y, pw, ph, fill,
+             CHIP_COL["sel"] if is_sel else (CHIP_COL["dac"] if is_dac else None),
+             f'{name} pin {pin}' + (f' = {port} (device pin {dev})' if dev else ' - power or not on the device'))
+        label = f'{pin} {port}' if port else str(pin)
+        out.append(_text(x + pw / 2, y + ph / 2, label,
+                         CHIP_COL["body"] if (is_sel or is_dac) else CHIP_COL["label"],
+                         9.5 if port else 9, weight=is_sel or is_dac))
+    return hit
+
+
+def _draw_edge_row(out, side, row, x0, y0, pw, sel_dev, pkg, dac_dev=None):
+    gap = 2.0
+    hit = None
+    for pad in row:
+        x = x0 + (pad["pos"] - 1) * (pw + gap)
+        dev = pad["dev"]
+        is_sel = dev is not None and dev == sel_dev
+        is_dac = dev is not None and dev == dac_dev and not is_sel
+        if is_sel:
+            hit = (x + pw / 2, y0 + 11, pad["pos"])
+        if is_dac:
+            dac_hit.append((x + pw / 2, y0 + 11))
+        fill = (CHIP_COL["sel"] if is_sel else CHIP_COL["dac"] if is_dac
+                else (CHIP_COL["io"] if dev else CHIP_COL["nc"]))
+        _pad(out, x, y0, pw, 22, fill,
+             CHIP_COL["sel"] if is_sel else (CHIP_COL["dac"] if is_dac else None),
+             f'{side} row pad {pad["pos"]}: {pad["label"]}'
+             + (f' (device pin {dev})' if dev else ''))
+        out.append(_text(x + pw / 2, y0 + 11, pad["label"].replace("CDC ", ""),
+                         CHIP_COL["body"] if (is_sel or is_dac) else CHIP_COL["label"],
+                         7.5, weight=is_sel or is_dac, rot=-90))
+    return hit
+
+
+def board_svg(board_key, core, pinsel, dac_unit=0, dac_on=False):
+    board = BOARDS[board_key]
+    pkg = package_of(board_key)
+    pin = channel_pin(board_key, core, pinsel)
+    sel_dev = pin.n if pin else None
+    dpin = dac_pin(board_key, dac_unit)
+    dac_dev = dpin.n if dpin else None
+    kind, label, detail = channel_site(board_key, core, pinsel)
+    out = [_svg_open(BOARD_VIEW_W, BOARD_VIEW_H, f"{board_key} board, AD{core}AN{pinsel} highlighted")]
+    out.append(f'<rect x="8" y="8" width="{BOARD_VIEW_W - 16}" height="{BOARD_VIEW_H - 16}" rx="14" '
+               f'fill="{CHIP_COL["board"]}" stroke="{CHIP_COL["edge"]}" stroke-width="2"/>')
+    out.append(_text(28, 36, board["title"], CHIP_COL["body_text"], 17, anchor="start", weight=True))
+    hit = None
+    del dac_hit[:]
+    if board_key == "EV74H48A":
+        conn = board["connectors"]
+        hit = _draw_socket(out, "mikroBUS A", conn["mikroBUS A"], 40, 90, 2, 8, sel_dev, pkg, True, dac_dev) or hit
+        hit = _draw_socket(out, "mikroBUS B", conn["mikroBUS B"], 210, 90, 2, 8, sel_dev, pkg, True, dac_dev) or hit
+        hit = _draw_socket(out, "XPRO1", conn["XPRO1"], 420, 90, 10, 2, sel_dev, pkg, False, dac_dev) or hit
+        hit = _draw_socket(out, "XPRO2", conn["XPRO2"], 420, 190, 10, 2, sel_dev, pkg, False, dac_dev) or hit
+        # on-board parts an ADC pin can be tied to
+        out.append(_text(40, 330, "on board", CHIP_COL["label"], 12, anchor="start", weight=True))
+        items = sorted(board["onboard"].items(), key=lambda kv: kv[1])
+        x, y = 40, 344
+        for dev, what in items:
+            p = pkg.by_number(dev)
+            if p is None or not p.adc:
+                continue                    # only the ones an ADC can read
+            w = 168
+            is_sel = dev == sel_dev
+            is_dac = dev == dac_dev and not is_sel
+            if is_sel:
+                hit = (x + w / 2, y + 13, None)
+            if is_dac:
+                dac_hit.append((x + w / 2, y + 13))
+            _pad(out, x, y, w, 26,
+                 CHIP_COL["sel"] if is_sel else (CHIP_COL["dac"] if is_dac else CHIP_COL["io"]),
+                 CHIP_COL["sel"] if is_sel else (CHIP_COL["dac"] if is_dac else None),
+                 f'{what} = {p.port} (device pin {dev})', rx=6)
+            out.append(_text(x + w / 2, y + 13, f'{what} · {p.port}',
+                             CHIP_COL["body"] if (is_sel or is_dac) else CHIP_COL["label"],
+                             9.5, weight=is_sel or is_dac))
+            x += w + 8
+            if x + w > BOARD_VIEW_W - 40:
+                x, y = 40, y + 34
+    else:
+        rows = board["edge_rows"]
+        pw = (BOARD_VIEW_W - 200) / 28 - 2
+        # the PCB itself, with the two castellated rows on its long edges
+        _pad(out, 60, 96, BOARD_VIEW_W - 130, 268, CHIP_COL["body"], None, None, rx=10)
+        _pad(out, 60, 120, 52, 132, CHIP_COL["edge"], None, "USB Type-C, on-board debugger", rx=6)
+        out.append(_text(86, 186, "USB", CHIP_COL["body_text"], 11))
+        out.append(_text(126, 112, "left edge row", CHIP_COL["label"], 11, anchor="start", weight=True))
+        hit = _draw_edge_row(out, "left", rows["left"], 126, 122, pw, sel_dev, pkg, dac_dev) or hit
+        out.append(_text(126, 300, "right edge row", CHIP_COL["label"], 11, anchor="start", weight=True))
+        hit = _draw_edge_row(out, "right", rows["right"], 126, 310, pw, sel_dev, pkg, dac_dev) or hit
+        # what sits between the two rows
+        _pad(out, 430, 196, 170, 62, CHIP_COL["edge"], None, board["device"], rx=6)
+        out.append(_text(515, 219, board["device"][:9], CHIP_COL["body_text"], 12))
+        out.append(_text(515, 236, board["device"][9:], CHIP_COL["body_text"], 12))
+        for dev, what in sorted(board.get("onboard", {}).items()):
+            pin_o = pkg.by_number(dev)
+            x = 640 if "LED" in what else 760
+            is_sel = dev == sel_dev
+            _pad(out, x, 206, 108, 24, CHIP_COL["sel"] if is_sel else CHIP_COL["edge"],
+                 CHIP_COL["sel"] if is_sel else None,
+                 f'{what} = {pin_o.port if pin_o else "?"} (device pin {dev})', rx=6)
+            out.append(_text(x + 54, 218, what.split(" (")[0],
+                             CHIP_COL["body"] if is_sel else CHIP_COL["body_text"], 9))
+        out.append(_text(126, 344, "pad 1 is the USB end, and these names are on the silkscreen",
+                         CHIP_COL["body_text"], 11, anchor="start"))
+    # the verdict, and a leader to the lit pad
+    cy = BOARD_VIEW_H - 74
+    if hit is not None:
+        out.append(f'<line x1="{hit[0]:.1f}" y1="{hit[1]:.1f}" x2="500" y2="{cy:.0f}" '
+                   f'stroke="{CHIP_COL["sel"]}" stroke-width="2"/>')
+    box_fill = CHIP_COL["board"]
+    out.append(f'<rect x="150" y="{cy - 24:.0f}" width="700" height="52" rx="6" fill="{box_fill}" '
+               f'stroke="{CHIP_COL["sel"] if hit else CHIP_COL["edge"]}" stroke-width="2"/>')
+    out.append(_text(500, cy, f'AD{core}AN{pinsel} → {label}',
+                     CHIP_COL["sel"] if hit else CHIP_COL["label"], 17, weight=True))
+    out.append(_text(500, cy + 19, detail or ("nothing to wire to" if kind != "connector" else ""),
+                     CHIP_COL["label"], 11))
+    if dpin is not None:
+        needed, head, sub = wire_hint(board_key, core, pinsel, dac_unit)
+        if needed and dac_hit and hit is not None:
+            out.append(f'<line x1="{dac_hit[0][0]:.1f}" y1="{dac_hit[0][1]:.1f}" '
+                       f'x2="{hit[0]:.1f}" y2="{hit[1]:.1f}" stroke="{CHIP_COL["dac"]}" '
+                       'stroke-width="2.5" stroke-dasharray="8 5"/>')
+        out.append(f'<rect x="150" y="{cy + 34:.0f}" width="700" height="38" rx="6" '
+                   f'fill="{CHIP_COL["board"]}" stroke="{CHIP_COL["dac"]}" stroke-width="2"/>')
+        out.append(_text(500, cy + 48, f'DAC{dac_unit} ({"on" if dac_on else "off"}): {head}',
+                         CHIP_COL["dac"], 14, weight=True))
+        if sub:
+            out.append(_text(500, cy + 63, sub, CHIP_COL["label"], 10))
+    out.append('</svg>')
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# DAC2 triangle wave (dac.c): DACOUT2 = RA8 = AD5AN3. CLKGEN7 (its clock) is
+# PLL1 undivided, always 320 MHz, no divider register exists (clock.c:
+# clock_dac_hz() returns ADC_CLK_HZ outright) -- unlike CLKGEN6, so no
+# separate GUI control is needed for it.
+# ---------------------------------------------------------------------------
+# capture.h's SAMPLES_PER_HALF_MAX ('buf' takes 16..this, even): 1024 - two
+# ping-pong pairs in the 8 KB since 01.10.2026 (2048 for one pair the same
+# morning). Only the default before connecting: the field takes the board's
+# own maximum from 'buf' then.
+BUF_HALF_MAX = 1024
+CPU_HZ = 200e6       # CLKGEN1 on PLL2 (clock.h), the CPU's clock once clock_init() ran
+DAC_CLK_HZ = 400e6   # CLKGEN7 on the PLL1 VCO divider (clock.c, 25.09.2026; was 320e6, below the DAC's spec)
+
+
+DAC_CODE_MIN_GUI, DAC_CODE_MAX_GUI = 0x0CD, 0xF32   # dac.h's DAC_CODE_MIN/MAX
+
+
+def dac_period_ns_of(low: int, high: int, slp: int) -> float:
+    """Mirrors dac.c's dac_period_ns(): two slopes of (high-low)*16 DAC
+    clocks each, so a full triangle period is (high-low)*32 DAC clocks."""
+    if slp <= 0 or high <= low:
+        return 0.0
+    clocks = (high - low) * 32
+    return clocks * 1e9 / (DAC_CLK_HZ * slp)
+
+
+# ---------------------------------------------------------------------------
+# The chain stream's triangle (chaintest.c: triangle_for(), dac.h): the
+# range is not part of the "stream grab" frame (only slpdat and the DAC
+# clock are, docs/PLAN-BINARY-TRANSFER.md), because it is not a free
+# choice -- triangle_for() always picks the widest range these two fixed
+# limits (dac.h) and slpdat allow, with 32 codes of margin inside that.
+# Reproducing the same arithmetic here, from slpdat alone, gives the exact
+# model slope length the firmware's own tri_eval() call is judged against
+# (chaintest.c stage5's "ratio_x1000"), without having to also transmit
+# low/high.
+# ---------------------------------------------------------------------------
+CHAIN_DAC_CODE_MIN = 0x0CD
+CHAIN_DAC_CODE_MAX = 0xF32
+CHAIN_TRI_LOW = 0x400    # acquisition.c's TRI_LOW (29.09.2026, run 20: the lower end clipped)
+
+
+def chain_triangle_range(slp: int):
+    return CHAIN_TRI_LOW, CHAIN_DAC_CODE_MAX - slp - 32
+
+
+def chain_model_slope_samples(slp: int, dac_hz: float, ksps: float) -> float:
+    """Mirrors dac_slope_samples_x1000()/1000 (dac.c) for the chain
+    triangle's range: one slope's length in samples, at the rate and DAC
+    clock a 'stream grab' frame reports."""
+    if slp <= 0 or dac_hz <= 0 or ksps <= 0:
+        return 0.0
+    low, high = chain_triangle_range(slp)
+    if high <= low:
+        return 0.0
+    return (high - low) * 32.0 * (ksps * 1e3) / (slp * dac_hz)
+
+
+def probe_grab(target) -> bool:
+    """Does this target's 'stream' understand the 'grab' sub-command? Ask
+    'help' once rather than trying 'stream grab' itself and guessing at a
+    NAK's cause."""
+    try:
+        ok, lines = target.cmd("help")
+    except Exception:
+        return False
+    return ok and any(("stream" in l) and ("grab" in l) for l in lines)
+
+
+def _parse_buf(lines) -> int:
+    """cli.c's 'buf' reply, 'samples per half: <h>' -> the TOTAL 2*h, or None.
+    (Until 29.09.2026 this looked for 'buf: <n>', a line only FakeTarget ever
+    sent - against the board it never matched and the GUI assumed 2048.)"""
+    for l in lines:
+        m = re.match(r"\s*samples per half:\s*(\d+)", l)
+        if m:
+            return 2 * int(m.group(1))
+    return None
+
+
+def _parse_buf_max(lines):
+    """cli.c's 'buf' reply, 'maximum: <h>' (samples per half) -> h, or None.
+    The firmware's own SAMPLES_PER_HALF_MAX: 1024 until 01.10.2026, 2048
+    since - a board with an older image refuses anything above its own."""
+    for l in lines:
+        m = re.match(r"\s*maximum:\s*(\d+)", l)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def query_buf_max(target) -> int:
+    """The board's samples-per-half maximum from 'buf'; 1024 (the older
+    images' value) when the reply does not carry it."""
+    try:
+        ok, lines = target.cmd("buf")
+    except Exception:
+        ok, lines = False, []
+    h = _parse_buf_max(lines) if ok else None
+    return h if h else 1024
+
+
+def query_buf(target) -> int:
+    """Ask 'buf' (no argument) for the total, currently configured ping-pong
+    buffer size. Falls back to the legacy fixed 2048 (1024-sample halves) for
+    a board or firmware build that does not have the 'buf' command yet -
+    which is what those builds had; since 01.10.2026 the maximum is 4096."""
+    try:
+        ok, lines = target.cmd("buf")
+    except Exception:
+        ok, lines = False, []
+    n = _parse_buf(lines) if ok else None
+    return n if n is not None else 2048
+
+
+class FakeTarget:
+    """Answers like cli.c would, for the triggered chain only - 'stream
+    on/off/grab', 'dac', 'buf', 'version', 'help'. The back-to-back
+    commands this tool no longer sends ('pll', 'samc', 'core', 'input',
+    'clk', 'status', 'snap', 'rate', 'dump', 'blk') are not answered here
+    either. Used with --fake and --selftest.
+
+    'stream on <ksps>' (the test form): core 5, PINSEL 3 (RA8), the DAC2
+    test triangle as the signal - grab frames carry the SAME triangle
+    tools/eval_chain.py's synth() and the firmware's own chain test use, so
+    a PASS/FAIL verdict here means the same thing it means in a 'chain all'
+    log.
+    'stream on <ksps> <core> <pinsel> [<samc>]' (the custom form): that
+    input, the DAC left alone (the 'dac' command drives it if wanted) -
+    the stand-in plays a sine with harmonics and noise instead, at the
+    configured level, so SNR/THD/harmonics have something to show; grab
+    frames carry slp=0, exactly as chain_stream_on_input() reports for a
+    non-test signal.
+    """
+
+    # What board.h's BOARD_NAME says for each profile - the fake answers
+    # 'version' with it exactly as the firmware does ("[build] board: ..."),
+    # so that the GUI's board detection is exercised without a board.
+    FAKE_BOARD_NAMES = {
+        "EV74H48A": "EV74H48A, dsPIC33AK512MPS512 GP DIM",
+        "EV17P63A": "EV17P63A, dsPIC33AK512MPS506 Curiosity Nano",
+    }
+
+    def __init__(self, signal_khz: float = 100.0, amplitude: float = 1500.0,
+                 noise_std: float = 6.0, harm2_amp: float = 150.0, harm3_amp: float = 0.0,
+                 on_log=None, board: str = "EV74H48A"):
+        self.on_log = on_log  # optional callable(str): the console transcript
+        self.board = board if board in self.FAKE_BOARD_NAMES else "EV74H48A"
+        self.fake_source = None                    # see FAKE_SOURCES; None = what the input reads
+        # "sigproc ..." (cli.c, 02.10.2026): the filter at fs/8 (0 off, 1 lp,
+        # 2 hp, 3 bp - the GRAB frame's proc=), the Goertzel at fs/16 and
+        # its threshold, and the Goertzel's last result
+        self.sp_filter = 0
+        self.sp_gz = False
+        self.sp_thr = 100
+        self.sp_last_gz = None
+        self.sp_app = gui_app.FakeApp() if gui_app else None   # the application's part
+        self.port = "fake"
+        # Both DACs, as dac.c has them - only ever touched by the 'dac'
+        # command, never by 'stream on' itself (the test form's own
+        # internal DAC2 triangle is modelled separately below, independent
+        # of this dict, exactly as chain_stream_on()'s dac2_level_start()
+        # is independent of the 'dac' command in the firmware).
+        self.dac = {1: {"on": False, "low": 0x100, "high": 0xF00, "slp": 8},
+                    2: {"on": False, "low": 0x100, "high": 0xF00, "slp": 8}}
+        self.buf_size = 4096                      # total ping-pong buffer, 'buf'
+        self.buf_half_max = BUF_HALF_MAX          # 1024 plays an image from before 01.10.2026
+        self.signal_khz = signal_khz               # custom-input sine, kHz
+        self.amplitude = amplitude                 # fundamental peak, ADC counts
+        self.noise_std = noise_std                 # noise, ADC counts (sets the SNR)
+        self.harm2_amp = harm2_amp                 # 2nd harmonic peak, ADC counts
+        self.harm3_amp = harm3_amp                 # 3rd harmonic peak, ADC counts
+        self.t0 = None                             # wall-clock anchor, lazy
+        self.rng = np.random.default_rng(1)
+        # The chain stream ("stream on/off/grab", chaintest.c).
+        self.chain_on = False
+        self.chain_ksps = 0
+        self.chain_core, self.chain_pinsel, self.chain_samc = 5, 3, 0
+        self.chain_test = True                     # DAC2 triangle (True) or the configured input (False)
+        # A 'dac 2 ...' while a test-input stream runs reprograms the very
+        # DAC the firmware's triangle_for() had set up: from then on RA8
+        # carries that, until the next 'stream on' sets its own again.
+        self.chain_dac2_user = False
+        self.chain_ready_half = 0                  # alternates like ready_half in capture.c
+        self.chain_grabs = 0
+        self.grab_fault = None                     # None, "drop", "dup", "overrun", "missed"
+        # The signal generator ("siggen", siggen.c): parameters as the
+        # firmware's defaults (tab_wave_gen.py's, DAC range 205..3890), and
+        # the table it plays - computed by wavegen_model, as the firmware
+        # computes it with lib/wavegen.
+        self.sg = dict(f0=10000.0, h=[0.2, 0.4, 0.1, 0.0, 0.0, 0.0], decay=1000.0, amp=1.0,
+                       lo=205, hi=3890)
+        self.sg_text = dict(f0="10000", h2="0.2", h3="0.4", h4="0.1", h5="0", h6="0", h7="0",
+                            decay="1000", amp="1")
+        self.sg_on = False
+        self.sg_dac = 0
+        self.sg_n = 0
+        self.sg_play = 0
+        self.sg_play_actual = 0
+        self.sg_snap = False
+        self.sg_force = False
+        self.sg_pace = 0
+        self.sg_f0_used = 0.0
+        self.sg_table = []
+        self.sg_t0 = None
+
+    def _fake_load_pm(self) -> int:
+        """The GRAB header's load= as the board reports it (02.10.2026):
+        a filter costs about 63 CPU cycles per sample at 200 MHz, the
+        Goertzel a few more, the service alone next to nothing."""
+        per_sample = ((63.0 if self.sp_filter else 0.3) + (7.0 if self.sp_gz else 0.0)
+                      + (self.sp_app.load_cycles() if self.sp_app else 0.0))
+        return int(per_sample * self.chain_ksps * 1e3 / CPU_HZ * 1000)
+
+    def _chain_slpdat(self) -> int:
+        """triangle_for()'s SLOPE_TARGET=128-samples-per-slope search, for
+        the rate the stand-in's chain is "on" at -- same formula as
+        chain_model_slope_samples(), solved the other way around."""
+        rate = self.chain_ksps * 1000
+        f = DAC_CLK_HZ
+        full = CHAIN_DAC_CODE_MAX - 32 - CHAIN_TRI_LOW
+        s = 1
+        while (s + 64) < full:
+            span = full - s
+            samples = span * 32 * rate / (s * f) if (s * f) else 0.0
+            if samples <= 128:
+                break
+            s += 1
+        return s
+
+    def close(self):
+        pass
+
+    def _log(self, line: str):
+        if self.on_log:
+            try:
+                self.on_log(line)
+            except Exception:
+                pass
+
+    def _actual_ksps(self, want: int) -> int:
+        """Mirrors chaintest.c's period_for()/ksps_of(): the nearest
+        160 MHz / N (CLKGEN13, g_trig_hz), not a free number - and the
+        SAME value both 'stream'/'stream on' and every 'stream grab'
+        report from then on."""
+        trig_hz = 160_000_000
+        n = max(4, round(trig_hz / 1000.0 / max(1, want)))
+        return round(trig_hz / 1000.0 / n)
+
+    def _custom_wave_samples(self, n: int) -> np.ndarray:
+        """A window of the configured sine (plus harmonics and noise) at
+        the chain's actual rate, as of *now* - not simply the next n
+        samples after the previous call: two grabs close together in
+        wall-clock time overlap almost completely, the same idea the old
+        back-to-back stand-in modelled for a continuously running signal."""
+        fs = self.chain_ksps * 1e3
+        if self.t0 is None:
+            self.t0 = time.time()
+        end_idx = (time.time() - self.t0) * fs
+        start_idx = max(end_idx - n, 0.0)
+        t = (start_idx + np.arange(n)) / fs
+        f = self.signal_khz * 1e3
+        v = (2048 + self.amplitude * np.sin(2 * np.pi * f * t)
+             + self.harm2_amp * np.sin(2 * np.pi * 2 * f * t + 0.7)
+             + self.harm3_amp * np.sin(2 * np.pi * 3 * f * t + 1.3))
+        v += self.rng.normal(0, self.noise_std, n)
+        return np.clip(np.round(v), 0, 4095).astype(int)
+
+    # What the stand-in plays, chosen on the "fake target signal" tile, on
+    # either input: "sine" (its parameters there) or a DAC's triangle
+    # ("dac1", "dac2"). With the test input "dac2" is what RA8 really
+    # carries - the firmware's triangle, or the DAC2 tile's once applied;
+    # "sine" and "dac1" there are a stand-in's liberty (a generator on RA8),
+    # not something the board can do without a wire. None: the input's own
+    # signal (test: DAC2, custom: the sine).
+    FAKE_SOURCES = ("sine", "dac1", "dac2")
+
+    def _custom_input_samples(self, n: int) -> np.ndarray:
+        """What a custom input reads: the configured sine, or a DAC's
+        triangle from its tile's low/high/SLPDAT - near 0 with a little
+        noise while that DAC is off, as a DAC pin reads then."""
+        if self.fake_source not in ("dac1", "dac2"):     # "sine" or None
+            return self._custom_wave_samples(n)
+        return self._dac_samples(1 if self.fake_source == "dac1" else 2, n)
+
+    def _dac_samples(self, unit: int, n: int) -> np.ndarray:
+        """What DACOUTn's pin reads: the triangle from low/high/SLPDAT,
+        near 0 with a little noise while the DAC is off."""
+        d = self.dac[unit]
+        if not d["on"]:
+            v = 20 + self.rng.normal(0, self.noise_std, n)
+            return np.clip(np.round(v), 0, 4095).astype(int)
+        low, high, slp = d["low"], d["high"], max(1, d["slp"])
+        fs = self.chain_ksps * 1e3
+        # one slope = (high - low) * 32 / (SLPDAT * F_DAC), Equation 18-4
+        slope_s = (high - low) * 32.0 / (slp * DAC_CLK_HZ)
+        slope_n = max(slope_s * fs, 1.0)
+        if self.t0 is None:
+            self.t0 = time.time()
+        start = ((time.time() - self.t0) * fs) % (2 * slope_n)
+        ph = np.mod(start + np.arange(n), 2 * slope_n)
+        v = np.where(ph < slope_n, low + (high - low) * ph / slope_n,
+                     high - (high - low) * (ph - slope_n) / slope_n)
+        v = v + self.rng.normal(0, self.noise_std, n)
+        return np.clip(np.round(v), 0, 4095).astype(int)
+
+    # ---- the signal generator (siggen.c / cli.c's cmd_siggen_fn()) ----
+    SG_PARAMS = ("f0", "h2", "h3", "h4", "h5", "h6", "h7", "decay", "amp", "lo", "hi")
+    SG_USAGE = ("usage: siggen set <f0|h2..h7|decay|amp|lo|hi> <value> | siggen on <dac 1|2> "
+                "<n 2..8192> <play_hz 100..1000000> [snap] [force] [oc] | siggen off | siggen regs | siggen")
+    # the pin each DAC's output buffer drives, as core 5 reads it (dac.h:
+    # DACOUT1 = RA1 = AD5AN1, DACOUT2 = RA8 = AD5AN3, on both boards)
+    SG_PIN = {1: (5, 1), 2: (5, 3)}
+
+    def _siggen_on_input(self) -> bool:
+        return self.sg_on and (self.chain_core, self.chain_pinsel) == self.SG_PIN[self.sg_dac]
+
+    def _siggen_samples(self, n: int) -> np.ndarray:
+        """The table as the ADC reads it back: held per entry at the real
+        play rate (zero-order hold), through the DAC's settling (a first-
+        order low-pass, 300 ns - Table 40-42's 750 ns typical to 1 %), with
+        the table's position following wall-clock time like the sine's."""
+        fs = self.chain_ksps * 1e3
+        if self.sg_t0 is None:
+            self.sg_t0 = time.time()
+        start = ((time.time() - self.sg_t0) * self.sg_play_actual) % max(1, self.sg_n)
+        v = wavegen_model.playback(self.sg_table, self.sg_play_actual, fs, n,
+                                   start_entry=start, tau_s=300e-9)
+        v = v + self.rng.normal(0, self.noise_std, n)
+        return np.clip(np.round(v), 0, 4095).astype(int)
+
+    def _siggen_status(self):
+        def dec(key):
+            return self.sg_text[key]
+        f0u = self.sg_f0_used if self.sg_on else 0.0
+        return [f"on: {int(self.sg_on)}", f"dac: {self.sg_dac if self.sg_on else 0}",
+                f"n: {self.sg_n}", f"play_hz: {self.sg_play}",
+                f"play_hz_actual: {self.sg_play_actual if self.sg_on else 0}",
+                f"pace: {self.sg_pace}", f"f0: {dec('f0')}", f"f0_used: {f0u:.3f}".rstrip("0").rstrip("."),
+                *[f"h{k}: {dec('h' + str(k))}" for k in range(2, 8)],
+                f"decay: {dec('decay')}", f"amp: {dec('amp')}",
+                f"lo: {self.sg['lo']}", f"hi: {self.sg['hi']}",
+                f"snap: {int(self.sg_snap)}", f"force: {int(self.sg_force)}",
+                f"table_min: {min(self.sg_table) if self.sg_on else 0}",
+                f"table_max: {max(self.sg_table) if self.sg_on else 0}",
+                f"dma2_stat: 0x{0x30 if self.sg_on else 0:08X}", f"dma2_on: {int(self.sg_on)}",
+                f"transfers_per_s: {self.sg_play_actual if self.sg_on else 0}",
+                f"sccp2_flags: {3 if self.sg_on else 0}", "window_gap: 0"]
+
+    def _siggen(self, args):
+        if not args:
+            return True, self._siggen_status()
+        if args[0] == "set" and len(args) == 3:
+            name, text = args[1], args[2]
+            if not re.fullmatch(r"-?(\d+\.?\d{0,6}|\.\d{1,6})", text) or len(text.split(".")[0].lstrip("-")) > 12:
+                return False, [self.SG_USAGE]
+            v = float(text)
+            if name not in self.SG_PARAMS:
+                return False, ["siggen: no such parameter (f0 h2..h7 decay amp lo hi)"]
+            ok = {"f0": 0 < v <= 1e6, "decay": 0 <= v <= 1e9, "amp": 0 < v <= 1,
+                  "lo": v == int(v) and 0 <= v <= 4095, "hi": v == int(v) and 0 <= v <= 4095}.get(
+                name, -100 <= v <= 100)
+            if not ok:
+                return False, ["siggen: value out of range"]
+            if name in ("lo", "hi"):
+                self.sg[name] = int(v)
+            elif name in ("f0", "decay", "amp"):
+                self.sg[name] = v
+            else:
+                self.sg["h"][int(name[1]) - 2] = v
+            if name not in ("lo", "hi"):
+                self.sg_text[name] = text
+            return True, [f"{name}: {text}"]
+        if args[0] == "off" and len(args) == 1:
+            self.sg_on = False
+            self.sg_dac = 0
+            return True, ["siggen: off"]
+        if args[0] == "regs" and len(args) == 1:
+            return True, ["[regs] dma1 (fake target)", "[regs] sccp2 (fake target)"]
+        if args[0] == "on" and 4 <= len(args) <= 7:
+            try:
+                dac, n, hz = int(args[1]), int(args[2]), int(args[3])
+            except ValueError:
+                return False, [self.SG_USAGE]
+            flags = set(args[4:])
+            if not flags <= {"snap", "force", "oc"} or dac not in (1, 2) or not (2 <= n <= 8192) \
+                    or not (100 <= hz <= 1_000_000):
+                return False, [self.SG_USAGE]
+            self.sg_on = False
+            if self.chain_on and self.chain_test and dac == 2:
+                return False, ["siggen: routing refused: resource or DAC in use", "route_err: 11"]
+            lo, hi = self.sg["lo"], self.sg["hi"]
+            if hi > 4095 or ("force" not in flags and (lo < 205 or hi > 3890)):
+                return False, ["siggen: lo/hi outside 205..3890 (p1417) - add force"]
+            real = wavegen_model.sccp2_rate(hz)
+            f0 = self.sg["f0"]
+            f0u = wavegen_model.snap_hz(f0, n, real) if "snap" in flags else f0
+            if not (0 < f0 < real / 2) or lo >= hi or not (0 < self.sg["amp"] <= 1):
+                return False, ["siggen: wavegen refused the parameters", "wavegen_err: 3"]
+            try:
+                table = wavegen_model.wavegen(n, real, f0u, self.sg["h"], self.sg["decay"],
+                                              self.sg["amp"], lo, hi)
+            except ZeroDivisionError:
+                return False, ["siggen: wavegen refused the parameters", "wavegen_err: 7"]
+            self.dac[dac]["on"] = False                  # the DAC is the generator's now
+            self.sg_on, self.sg_dac, self.sg_n, self.sg_play = True, dac, n, hz
+            self.sg_play_actual, self.sg_f0_used, self.sg_table = real, f0u, table
+            self.sg_snap, self.sg_force, self.sg_pace = "snap" in flags, "force" in flags, int("oc" in flags)
+            return True, self._siggen_status()
+        return False, [self.SG_USAGE]
+
+    def _board_limit_counters(self):
+        """A simplified model of the board's own limits (the last hardware
+        run, HARDWARE-LOG.md): mild overruns from about 10 MSPS, missed
+        halves from about 16 MSPS. Guidance only, exactly like the UI text
+        under the rate field - not a claim about the exact thresholds, and
+        not exercised by anything but this stand-in."""
+        ov = 1 if self.chain_ksps > 10000 else 0
+        missed = 2 if self.chain_ksps > 16000 else 0
+        return ov, missed
+
+    def cmd(self, line: str, timeout: float = 5.0):
+        """Logs the traffic like Target.cmd() does, then answers like cli.c
+        would (_cmd_impl)."""
+        self._log(f"> {line}")
+        ok, out = self._cmd_impl(line, timeout)
+        for l in out:
+            self._log(f"< {l}")
+        self._log(f"< {'[ACK]' if ok else '[NAK]'}")
+        return ok, out
+
+    def _cmd_impl(self, line: str, timeout: float = 5.0):
+        parts = line.split()
+        if not parts:
+            return True, []
+        c, args = parts[0], parts[1:]
+        usage_stream = ["usage: stream on <ksps 1..40000> [<core 1..5> <pinsel 0..15> "
+                        "[<samc 0..31>]] | stream off | stream grab | stream"]
+        try:
+            if c == "sigproc":
+                # cli.c's cmd_sigproc_fn() (02.10.2026): the filter at fs/8 and
+                # the Goertzel at fs/16; grab() runs both on the stand-in's
+                # samples the way sigproc.c does (fake_filter(), fake_goertzel())
+                names = {"off": 0, "on": 1, "lp": 1, "hp": 2, "bp": 3}
+                if len(args) == 1 and args[0] in names:
+                    self.sp_filter = names[args[0]]
+                elif len(args) == 2 and args[0] == "gz" and args[1] in ("on", "off"):
+                    self.sp_gz = args[1] == "on"
+                    if self.sp_gz:
+                        self.sp_last_gz = None
+                elif (len(args) == 3 and args[:2] == ["gz", "thr"] and args[2].isdigit()
+                      and 1 <= int(args[2]) <= 4095):
+                    self.sp_thr = int(args[2])
+                elif args:
+                    # cli.c hands what it does not know to the application
+                    # (sigproc_app_cmd(), console.h)
+                    r = self.sp_app.command(args, self.chain_ksps * 1e3) if self.sp_app else None
+                    if r is None:
+                        return False, ["usage: sigproc [lp|hp|bp|off|on] | gz on|off | gz thr <lsb>"]
+                    if not r[0]:
+                        return r
+                on = bool(self.sp_filter) or self.sp_gz or bool(self.sp_app and self.sp_app.active)
+                lines = [f"sigproc: {'on' if on else 'off'}",
+                         f"filter: {['off', 'lp', 'hp', 'bp'][self.sp_filter]}",
+                         f"goertzel: {'on' if self.sp_gz else 'off'}", f"gz_thr: {self.sp_thr}"]
+                if self.sp_gz and self.sp_last_gz:
+                    g = self.sp_last_gz
+                    lines += [f"gz_amp: {g['amp']}", f"gz_rms: {g['rms']}",
+                              f"gz_share_pm: {g['share_pm']}", f"gz_detected: {g['detected']}"]
+                if self.sp_app:
+                    lines += self.sp_app.status_lines(self.chain_ksps * 1e3)
+                return True, lines + ["rx_held_lost: 0"]
+            if c == "dac":
+                usage = ["usage: dac <1|2> <on|off> [low] [high] [slpdat] [force]"]
+                if len(args) < 2 or args[0] not in ("1", "2"):
+                    return False, usage
+                unit = int(args[0])
+                d = self.dac[unit]
+                if self.sg_on and self.sg_dac == unit:   # siggen_release_dac() (cli.c)
+                    self.sg_on = False
+                    self.sg_dac = 0
+                if args[1].startswith("off"):
+                    d["on"] = False
+                    if unit == 2 and self.chain_on and self.chain_test:
+                        self.chain_dac2_user = True
+                    return True, [f"dac: {unit}", "off"]
+                if not args[1].startswith("on"):
+                    return False, usage
+                force = len(args) > 2 and args[-1] == "force"
+                if force:
+                    args = args[:-1]
+                low = int(args[2], 0) if len(args) > 2 else 0x100
+                high = int(args[3], 0) if len(args) > 3 else 0xF00
+                slp = int(args[4], 0) if len(args) > 4 else 8
+                if not (0 <= low <= 4095) or not (0 <= high <= 4095) or                         not ((0 if force else 1) <= slp <= (65535 if force else 255)) or                         (not force and high <= low):
+                    return False, usage
+                if not force and low < DAC_CODE_MIN_GUI + slp:
+                    return False, [f"dac: refused - low must be >= 0xCD + slpdat = {DAC_CODE_MIN_GUI + slp} "
+                                   "(p1422, Example 18-3 note 1); append 'force' to write it anyway"]
+                if not force and high > DAC_CODE_MAX_GUI - slp:
+                    return False, [f"dac: refused - high must be <= 0xF32 - slpdat = {DAC_CODE_MAX_GUI - slp} "
+                                   "(p1422, Example 18-3 note 1); append 'force' to write it anyway"]
+                d.update(on=True, low=low, high=high, slp=slp)
+                if unit == 2 and self.chain_on and self.chain_test:
+                    self.chain_dac2_user = True
+                return True, [f"dac: {unit}", "RA1" if unit == 1 else "RA8",
+                              f"low: {low}", f"high: {high}", f"slpdat: {slp}",
+                              f"period ns: {round(dac_period_ns_of(low, high, slp))}"] +                     ([("forced (within the datasheet's limits anyway)"
+                       if DAC_CODE_MIN_GUI + slp <= low < high <= DAC_CODE_MAX_GUI - slp
+                       else "forced - OUTSIDE the datasheet's limits (p1422)")] if force else [])
+            if c == "buf":
+                # cli.c's cmd_buf_fn(): the argument is samples PER HALF,
+                # 16..2048 even, refused while the chain streams.
+                if args:
+                    h = int(args[0])
+                    if h < 16 or h > self.buf_half_max:
+                        return False, [f"usage: buf [samples per half 16..{self.buf_half_max}, even]  "
+                                       "(stop first; the next start uses the new size)"]
+                    if h % 2 or self.chain_on:
+                        return False, ["buf: stop the stream first, and give an even number"]
+                    self.buf_size = 2 * h
+                return True, [f"samples per half: {self.buf_size // 2}", f"maximum: {self.buf_half_max}"]
+            if c == "siggen":
+                return self._siggen(args)
+            if c == "version":
+                return True, ["[build] adc_dma_40msps (fake target, synthetic signal)",
+                              "[build] board: " + self.FAKE_BOARD_NAMES[self.board]]
+            if c == "help":
+                return True, [
+                    "commands: dac buf version stream siggen",
+                    "stream on <ksps> [core pinsel [samc]] | off | grab - the chain streaming",
+                ]
+            if c == "stream":
+                if args and args[0] == "on":
+                    rest = args[1:]
+                    if len(rest) not in (1, 3, 4) or not rest[0].isdigit():
+                        return False, usage_stream
+                    ksps = int(rest[0])
+                    if not (1 <= ksps <= 40000):
+                        return False, usage_stream
+                    if len(rest) == 1:
+                        if self.sg_on and self.sg_dac == 2:
+                            return False, ["stream: DAC2 plays the signal generator - 'siggen off', "
+                                           "or 'stream on <ksps> 5 3' to read it"]
+                        core, pinsel, samc, test = 5, 3, 0, True
+                    else:
+                        if not (rest[1].isdigit() and rest[2].isdigit()):
+                            return False, usage_stream
+                        core, pinsel = int(rest[1]), int(rest[2])
+                        samc = int(rest[3]) if len(rest) == 4 and rest[3].isdigit() else 0
+                        if not (1 <= core <= 5) or not (0 <= pinsel <= 15) or not (0 <= samc <= 31):
+                            return False, usage_stream
+                        test = False
+                    self.chain_on = True
+                    self.chain_ksps = self._actual_ksps(ksps)
+                    self.chain_core, self.chain_pinsel, self.chain_samc = core, pinsel, samc
+                    self.chain_test = test
+                    self.chain_dac2_user = False       # triangle_for() owns DAC2 again
+                    self.chain_ready_half = 0
+                    self.chain_grabs = 0
+                    return True, [f"stream: on - {self.chain_ksps} ksps"
+                                  + ("" if test else f"  core {core} pinsel {pinsel} samc {samc}")]
+                if args and args[0] == "off":
+                    self.chain_on = False
+                    self.chain_dac2_user = False
+                    self.chain_core, self.chain_pinsel, self.chain_samc, self.chain_test = 5, 3, 0, True
+                    return True, ["stream: off, boot configuration restored"]
+                if args and args[0] == "grab":
+                    return False, ["usage: use target.grab(), not cmd('stream grab') - binary framing"]
+                if args:
+                    return False, usage_stream
+                if not self.chain_on:
+                    return True, ["stream: off"]
+                return True, [f"stream: on - {self.chain_ksps} ksps",
+                              f"core: {self.chain_core}", f"pinsel: {self.chain_pinsel}",
+                              f"grabs: {self.chain_grabs}"]
+        except (ValueError, IndexError):
+            return False, ["usage error"]
+        return False, ["unknown command"]
+
+    def grab(self, timeout: float = 10.0, corrupt_payload: bool = False):
+        """Builds the identical frame bytes cmd_stream_grab() (cli.c) would
+        send for one halt/transfer/restart cycle, then decodes them with
+        parse_grab_frame() -- the same function Target.grab() uses for a
+        real board. n=0 (NAK) if the stream is not on, mirroring
+        chain_stream_grab_begin() returning false. The test form's window
+        is eval_chain.synth()'s triangle, with grab_fault injecting exactly
+        the faults tri_eval() is built to catch (see chaintest.c's own host
+        test of the evaluator); the custom form's window is the configured
+        sine, with slp=0 in the frame, exactly as chain_stream_on_input()
+        reports for a non-test signal. Only the ASCII framing goes to the
+        console transcript (on_log); the sample bytes themselves are not
+        logged."""
+        self._log("> stream grab")
+        if not self.chain_on:
+            header_line = "GRAB n=0 from=0 ksps=0 ov=0 late=0 missed=0 halves=0 xfer=0 slp=0 dachz=0\r\n"
+            self._log(f"< {header_line.rstrip()}")
+            crc = crc16_ccitt_false(b"")
+            self._log(f"< CRC {crc:04X}")
+            self._log("< [NAK]")
+            tail = f"\r\nCRC {crc:04X}\r\n> ".encode("ascii") + NAK
+            return parse_grab_frame(header_line, b"", tail)
+
+        self.chain_grabs += 1
+        # since 01.10.2026 a grab is a whole ping-pong pair (ping + pong,
+        # buf_size samples), pairs A and B in turn - the stream moves on to
+        # the other pair instead of halting (capture.c, capture_pair_freeze())
+        n = self.buf_size
+        frm = self.chain_ready_half * n
+        self.chain_ready_half ^= 1
+        ov, missed = self._board_limit_counters()
+        if self.chain_test:
+            slp = self._chain_slpdat()
+            # DAC_CLK_HZ both drives the synthetic samples and is reported
+            # as "dachz", so the GUI's model-vs-measured ratio comes out
+            # near 1.0 on a fault-free cycle -- the point of a stand-in,
+            # not a claim about which PLL output the real chain's CLKGEN7
+            # runs from (the frame carries the real board's actual
+            # clock_dac_hz() there).
+            if self.fake_source == "sine":
+                v = self._custom_wave_samples(n)
+            elif self.fake_source == "dac1":
+                v = self._dac_samples(1, n)
+            elif self.chain_dac2_user:
+                # the frame still reports triangle_for()'s slp, as
+                # s_slpdat does on the board - only RA8 changed
+                v = self._dac_samples(2, n)
+            else:
+                slope_samples = max(1.0, chain_model_slope_samples(slp, DAC_CLK_HZ, self.chain_ksps))
+                drop = n // 2 if self.grab_fault == "drop" else None
+                dup = n // 2 if self.grab_fault == "dup" else None
+                v = chain_synth(n, slope_samples,
+                                phase=float(self.chain_grabs * 7 % int(2 * slope_samples) or 1),
+                                drop=drop, dup=dup, seed=self.chain_grabs)
+        else:
+            slp = 0
+            v = (self._siggen_samples(n) if self._siggen_on_input()
+                 else self._custom_input_samples(n))
+        gz_txt = ""
+        if self.sp_gz:                     # on the input, before the filter (sigproc.c)
+            self.sp_last_gz = fake_goertzel(v, self.sp_thr)
+            g = self.sp_last_gz
+            gz_txt = f" gz={g['amp']} gzs={g['share_pm']} gzd={g['detected']}"
+        # the application's fields (gui_link_app_fields()), on the input
+        app_txt = self.sp_app.header_fields(v, self.chain_ksps * 1e3) if self.sp_app else ""
+        if self.sp_filter:
+            v = fake_filter(v, self.sp_filter)
+        if self.grab_fault == "overrun":
+            ov = max(ov, 3)
+        if self.grab_fault == "missed":
+            missed = max(missed, 2)
+        header_line = (f"GRAB n={n} from={frm} ksps={self.chain_ksps} ov={ov} late=0 "
+                        f"missed={missed} halves=2 xfer={2 * n} slp={slp} dachz={int(DAC_CLK_HZ)} "
+                        f"proc={self.sp_filter} "
+                        f"load={self._fake_load_pm()}{gz_txt}{app_txt}\r\n")
+        self._log(f"< {header_line.rstrip()}")
+        payload = np.asarray(v, dtype="<u2").tobytes()
+        self._log(f"< [binary payload, {len(payload)} bytes, not shown]")
+        crc = crc16_ccitt_false(payload)
+        if corrupt_payload and payload:
+            payload = bytes([payload[0] ^ 0xFF]) + payload[1:]
+        self._log(f"< CRC {crc:04X}")
+        self._log("< [ACK]")
+        tail = f"\r\nCRC {crc:04X}\r\n> ".encode("ascii") + ACK
+        return parse_grab_frame(header_line, payload, tail)
+
+
+SP_FILTERS = {"off": "off", "lp": "low-pass, -3 dB at fs/8", "hp": "high-pass, -3 dB at fs/8",
+              "bp": "band-pass at fs/8, one octave"}
+_SP_SECTIONS = {}
+
+
+def fake_filter(v, kind: int):
+    """sigproc.c's filter on the stand-in's samples: the same two biquads
+    (tools/sigproc_design.py), settled on the first sample like a gap on the
+    board, high- and band-pass around mid-scale, clamped to 0..4095."""
+    name = {1: "lp", 2: "hp", 3: "bp"}[kind]
+    if name not in _SP_SECTIONS:
+        _SP_SECTIONS[name] = (sigproc_design.lp_hp(name) if name != "bp" else sigproc_design.bp())
+    b0, b1, b2 = sigproc_design.NUM[name]
+    out = [float(u) for u in v]
+    for g, a1, a2 in _SP_SECTIONS[name]:
+        x1 = x2 = out[0]
+        y1 = y2 = g * (b0 + b1 + b2) / (1.0 + a1 + a2) * out[0]      # settled
+        res = []
+        for u in out:
+            y = g * (b0 * u + b1 * x1 + b2 * x2) - a1 * y1 - a2 * y2
+            x2, x1, y2, y1 = x1, u, y1, y
+            res.append(y)
+        out = res
+    offset = 0.0 if kind == 1 else 2048.0
+    return np.clip(np.round(np.asarray(out) + offset), 0, 4095).astype(int)
+
+
+def fake_goertzel(v, thr: int):
+    """sigproc.c's Goertzel at fs/16 on the stand-in's samples: amplitude,
+    rms around the mean, the tone's share of the power, detected."""
+    x = np.asarray(v, dtype=float)
+    d = x - x.mean()
+    n = len(d)
+    amp = 2.0 * abs(np.sum(d * np.exp(-2j * np.pi * np.arange(n) / 16.0))) / n
+    var = float(np.mean(d * d))
+    share = amp * amp * 0.5 / var if var > 0 else 0.0
+    a = int(round(amp))
+    return dict(amp=a, rms=int(round(math.sqrt(var))), share_pm=min(1000, int(round(share * 1000))),
+                detected=1 if a >= thr else 0)
+
+
+def spectrum(samples: np.ndarray, fs_hz: float):
+    """Hann-windowed magnitude spectrum in dB relative to full scale (4096 pk-pk).
+    Returns (freq_hz, db)."""
+    n = len(samples)
+    if n < 8 or not math.isfinite(fs_hz):
+        return np.zeros(0), np.zeros(0)
+    x = samples.astype(float) - samples.mean()
+    w = np.hanning(n)
+    spec = np.abs(np.fft.rfft(x * w)) * 2.0 / (w.sum())
+    db = 20 * np.log10(np.maximum(spec, 1e-3) / 2048.0)
+    f = np.fft.rfftfreq(n, d=1.0 / fs_hz)
+    return f, db
+
+
+def analyze_spectrum(f: np.ndarray, db: np.ndarray, n_harmonics: int = 5, exclude_bins: int = 2) -> dict:
+    """Signal-quality read-out for the FFT panel: the fundamental (highest
+    bin, DC excluded), each harmonic 2..n_harmonics with its own frequency
+    and level, SNR (fundamental vs. the median of everything that is
+    neither DC, the fundamental nor one of its harmonics) and THD (the
+    harmonics' combined power against the fundamental's)."""
+    n = len(db)
+    if n < 8:
+        return {}
+    mask = np.ones(n, dtype=bool)
+    mask[:exclude_bins] = False  # DC and its skirt
+    fund_bin = int(np.argmax(np.where(mask, db, -np.inf)))
+    fund_freq, fund_db = float(f[fund_bin]), float(db[fund_bin])
+
+    def exclude_around(bin_idx):
+        lo, hi = max(0, bin_idx - exclude_bins), min(n, bin_idx + exclude_bins + 1)
+        mask[lo:hi] = False
+
+    exclude_around(fund_bin)
+    df = f[1] - f[0] if n > 1 else 1.0
+    harmonics = []
+    harmonic_power = 0.0
+    for k in range(2, n_harmonics + 1):
+        hbin = int(round(fund_freq * k / df))
+        if hbin >= n:
+            break
+        h_freq, h_db = float(f[hbin]), float(db[hbin])
+        harmonics.append(dict(k=k, freq=h_freq, db=h_db, rel_db=h_db - fund_db))
+        harmonic_power += 10 ** (h_db / 10.0)
+        exclude_around(hbin)
+    noise_db = float(np.median(db[mask])) if mask.any() else float(db.min())
+    fund_power = 10 ** (fund_db / 10.0)
+    thd_pct = 100.0 * math.sqrt(harmonic_power / fund_power) if fund_power > 0 else float("nan")
+    return dict(fund_freq=fund_freq, fund_db=fund_db, noise_db=noise_db,
+                snr_db=fund_db - noise_db, thd_pct=thd_pct, harmonics=harmonics)
+
+
+def selftest() -> int:
+    ok_all = True
+    t = FakeTarget(signal_khz=250.0, amplitude=1500.0)
+
+    # ---- 'stream grab' before 'stream on': refused, exactly what
+    # chain_stream_grab_begin() returning false produces on the board. ----
+    assert probe_grab(t), "fake target's help must advertise 'stream' and 'grab'"
+    ok, samples, meta = t.grab()
+    ok_no_stream = (not ok) and len(samples) == 0 and "error" in meta
+    ok_all &= ok_no_stream
+    print("grab without 'stream on' refused:", "PASS" if ok_no_stream else "FAIL", "-", meta.get("error"))
+
+    # ---- the test form: 'stream on <ksps>' - core 5, RA8, DAC2 triangle ----
+    ok, lines = t.cmd("stream on 8000")
+    assert ok, ("stream on", lines)
+    ok, samples, meta = t.grab()
+    r = chain_tri_eval([int(v) for v in samples])
+    ok_grab = (ok and len(samples) == t.buf_size and meta["from_"] == 0
+              and meta["slpdat"] > 0 and chain_grid_ok(r))
+    ok_all &= ok_grab
+    print(f"grab (test triangle): {len(samples)} samples, from {meta['from_']}, "
+          f"slp {meta['slpdat']}, slip {r['slip']:.3f} -> {'PASS' if ok_grab else 'FAIL'}")
+
+    # The frame's own 'ksps' is the actual rate (the nearest 160 MHz / N,
+    # chaintest.c's ksps_of()) - the FFT must use it as fs, not the number
+    # typed at 'stream on'.
+    ok_fs = abs(meta["ksps"] - 8000) < 200
+    ok_all &= ok_fs
+    f, db = spectrum(np.asarray(samples), meta["ksps"] * 1e3)
+    print(f"grab actual rate: {meta['ksps']} ksps (asked for 8000), used as FFT fs ->",
+          "PASS" if ok_fs else "FAIL")
+
+    # The grabs alternate between the two ping-pong pairs like capture.c's
+    # pair moves - the second grab must be the OTHER pair (from = one pair).
+    ok2, samples2, meta2 = t.grab()
+    ok_from = ok2 and meta2["from_"] == t.buf_size and meta2["from_"] > 0
+    ok_all &= ok_from
+    print(f"grab #2 from={meta2['from_']} (> 0, the other pair):", "PASS" if ok_from else "FAIL")
+
+    # A lost/repeated sample must fail the SAME grid check the firmware's
+    # own tri_eval() uses - the fake target injects exactly what
+    # chaintest.c's host test of the evaluator injects.
+    # One window holds only about eight slopes, and a fault in the first or
+    # last one cannot be enclosed by four turning points (see tri_eval), so
+    # a single grab is caught or missed depending on where the fault lands.
+    # Judged over eight grabs at different phases: most faulty windows must
+    # fail, and no clean one may (the host test of the evaluator: no false
+    # alarm, 96-100 % found in 2048-sample windows).
+    caught = 0
+    for _ in range(8):
+        t.grab_fault = "drop"
+        ok3, samples3, meta3 = t.grab()
+        caught += ok3 and not chain_grid_ok(chain_tri_eval([int(v) for v in samples3]))
+    t.grab_fault = None
+    false_alarms = 0
+    for _ in range(8):
+        ok3, samples3, meta3 = t.grab()
+        false_alarms += ok3 and not chain_grid_ok(chain_tri_eval([int(v) for v in samples3]))
+    ok_fault = caught >= 5 and false_alarms == 0
+    ok_all &= ok_fault
+    print(f"grab with a lost sample: caught in {caught} of 8 windows, false alarms in "
+          f"{false_alarms} of 8 clean ones ->", "PASS" if ok_fault else "FAIL")
+
+    # ---- test input: 'dac 2 on' replaces the firmware's triangle on RA8
+    # ---- until the next 'stream on' ----
+    t.cmd("stream on 8000")
+    t.cmd("dac 2 on 256 1500 8")
+    okt, st, mt = t.grab()
+    hi_user = int(np.max(st)) if okt else 0
+    t.cmd("stream on 8000")
+    okt2, st2, _m = t.grab()
+    hi_fw = int(np.max(st2)) if okt2 else 0
+    ok_tdac = abs(hi_user - 1500) < 60 and mt.get("slpdat", 0) > 0 and hi_fw > 3000
+    ok_all &= ok_tdac
+    print(f"test input: 'dac 2 on 256 1500 8' -> max {hi_user} (slp in frame {mt.get('slpdat')}), "
+          f"next 'stream on' -> firmware triangle, max {hi_fw}:", "PASS" if ok_tdac else "FAIL")
+
+    # ---- the fake's "DAC2 triangle" source follows the DAC2 tile ----
+    ok, _ = t.cmd("stream on 8000 5 3 0")
+    t.fake_source = "dac2"
+    t.cmd("dac 2 on 256 1000 39")
+    okd, sd, _m = t.grab()
+    hi_on = int(np.max(sd)) if okd else 0
+    t.cmd("dac 2 on 256 3000 39")
+    okd2, sd2, _m = t.grab()
+    hi_on2 = int(np.max(sd2)) if okd2 else 0
+    ok_r, ln_r = t.cmd("dac 2 on 32 3840 20")
+    ok_f, ln_f = t.cmd("dac 2 on 32 3840 20 force")
+    ok_force = (not ok_r and "low must be >= 0xCD + slpdat = 225" in " ".join(ln_r)
+                and ok_f and "OUTSIDE" in " ".join(ln_f))
+    ok_all &= ok_force
+    print(f"dac force: low 32 refused without it, taken with it ({ln_f[-1:]}):",
+          "PASS" if ok_force else f"FAIL {ln_r} {ln_f}")
+    t.cmd("dac 2 off")
+    okd3, sd3, _m = t.grab()
+    hi_off = int(np.max(sd3)) if okd3 else 9999
+    t.fake_source = "sine"
+    ok_dac = abs(hi_on - 1000) < 60 and abs(hi_on2 - 3000) < 60 and hi_off < 120
+    ok_all &= ok_dac
+    print(f"fake source 'DAC2 triangle' follows the DAC2 tile: high 1000 -> max {hi_on}, high 3000 -> "
+          f"max {hi_on2}, off -> max {hi_off}:", "PASS" if ok_dac else "FAIL")
+
+    # ---- 'buf': samples per half, refused while streaming (cli.c) ----
+    ok_b1, _ = t.cmd("buf 64")                          # the chain still streams here
+    t.cmd("stream off")
+    ok_b2, ln_b2 = t.cmd("buf 64")
+    t.cmd("stream on 8000")
+    okg, sg, _m = t.grab()
+    # a grab is a whole ping-pong pair since 01.10.2026: both halves, 128
+    ok_buf = (not ok_b1 and ok_b2 and _parse_buf(ln_b2) == 128 and okg and len(sg) == 128)
+    ok_all &= ok_buf
+    # the board's own maximum is read from 'buf': an image with another
+    # maximum (2048 per half, the one-pair image of 01.10.2026 morning) is
+    # offered exactly that, the current one BUF_HALF_MAX
+    t_old = FakeTarget(noise_std=3.0)
+    t_old.buf_half_max, t_old.buf_size = 2048, 4096
+    ok_max = query_buf_max(t_old) == 2048 and query_buf_max(FakeTarget()) == BUF_HALF_MAX
+    ok_all &= ok_max
+    print(f"buf maximum read from the board (other image 2048, current {BUF_HALF_MAX}):",
+          "PASS" if ok_max else "FAIL")
+    print(f"buf 64: refused while streaming, taken after stop -> total {_parse_buf(ln_b2)}, "
+          f"grab n={len(sg) if okg else '-'}:", "PASS" if ok_buf else "FAIL")
+    t.cmd("stream off")
+    t.cmd(f"buf {BUF_HALF_MAX}")
+
+    # ---- the custom form: 'stream on <ksps> <core> <pinsel> [<samc>]' ----
+    ok, lines = t.cmd("stream on 5000 3 5 0")
+    assert ok, ("stream on (custom input)", lines)
+    ok, samples, meta = t.grab()
+    ok_custom = ok and meta["slpdat"] == 0 and len(samples) == t.buf_size
+    ok_all &= ok_custom
+    print(f"grab (custom input, core 3 pin 5): slp={meta['slpdat']} (expect 0) ->",
+          "PASS" if ok_custom else "FAIL")
+
+    # ---- 'sigproc ...' (02.10.2026): proc= names the filter, gz= the Goertzel ----
+    ok_on, _ = t.cmd("sigproc on")
+    okp1, _, meta_p1 = t.grab()
+    ok_hp, _ = t.cmd("sigproc hp")
+    okp2, s_hp, meta_p2 = t.grab()
+    ok_gz, _ = t.cmd("sigproc gz on")
+    okg, _, meta_g = t.grab()
+    ok_off, _ = t.cmd("sigproc off")
+    ok_goff, _ = t.cmd("sigproc gz off")
+    okp0, _, meta_p0 = t.grab()
+    ok_bad, _ = t.cmd("sigproc maybe")
+    ok_sp = (ok_on and okp1 and meta_p1.get("proc") == 1 and ok_hp and okp2 and meta_p2.get("proc") == 2
+             and abs(float(np.mean(s_hp)) - 2048.0) < 100.0
+             and ok_gz and okg and isinstance(meta_g.get("gz"), dict)
+             and ok_off and ok_goff and okp0 and meta_p0.get("proc") == 0 and meta_p0.get("gz") is None
+             and not ok_bad)
+    ok_all &= ok_sp
+    print(f"sigproc lp/hp/gz/off: proc={meta_p1.get('proc')},{meta_p2.get('proc')},{meta_p0.get('proc')} "
+          f"hp mean {float(np.mean(s_hp)):.0f}, gz={meta_g.get('gz')}, a bad argument refused ->",
+          "PASS" if ok_sp else "FAIL")
+    # the Goertzel check setups (02.10.2026), played through the stand-in the
+    # way do_setup() sends them: generator on DAC2, custom input RA8, 400 kSPS
+    gz_res = {}
+    for key, want in (("gz_fs16", 1), ("gz_fs8", 0), ("gz_near", 0), ("gz_hp", 1)):
+        cfg = SETUPS[key][1]
+        sg, acq, sp = cfg["siggen"], cfg["acquisition"], cfg["sigproc"]
+        t.cmd("stream off")
+        for line in siggen_commands(dict(sg, play=sg["play_hz"], h={k: sg["h"][k - 2] for k in range(2, 8)})):
+            t.cmd(line)
+        t.cmd(f"stream on {acq['ksps']} {acq['core']} {acq['pinsel']}")
+        t.cmd(f"sigproc {sp['filter']}")
+        t.cmd("sigproc gz on")
+        okg, s_g, meta_g = t.grab()
+        gz = meta_g.get("gz") or {}
+        gz_res[key] = (gz.get("detected"), gz.get("amp"), meta_g.get("proc"))
+        t.cmd("sigproc off")
+        t.cmd("sigproc gz off")
+        t.cmd("siggen off")
+        t.cmd("stream off")
+    t.cmd("stream on 5000 3 5 0")          # the custom stream the steps below expect
+    ok_gzs = (gz_res["gz_fs16"][0] == 1 and gz_res["gz_fs8"][0] == 0 and gz_res["gz_near"][0] == 0
+              and gz_res["gz_hp"][0] == 1 and gz_res["gz_hp"][2] == 2
+              and all(cfg.get("sigproc") for _, cfg in SETUPS.values()))
+    ok_all &= ok_gzs
+    print(f"Goertzel check setups on the stand-in (detected, amp, proc): {gz_res} ->",
+          "PASS" if ok_gzs else "FAIL")
+    # the application's own checks (gui_app.py), through the same stand-in
+    if gui_app:
+        ok_all &= gui_app.selftest(t, SETUPS, siggen_commands)
+    # the stand-in's processing against the firmware's design: a tone at
+    # fs/16 is found, one at fs/8 not; the band-pass passes fs/8 whole
+    tn = np.arange(1024)
+    tone16 = 2000 + 800 * np.sin(2 * np.pi * tn / 16 + 0.7)
+    tone8 = 2000 + 800 * np.sin(2 * np.pi * tn / 8 + 0.7)
+    g16, g8 = fake_goertzel(np.round(tone16), 100), fake_goertzel(np.round(tone8), 100)
+    bp8 = fake_filter(np.round(tone8), 3)[256:]
+    ok_fp = (798 <= g16["amp"] <= 802 and g16["detected"] == 1 and g8["amp"] <= 2 and g8["detected"] == 0
+             and abs((bp8.max() - bp8.min()) / 2 - 800) < 10)
+    ok_all &= ok_fp
+    print(f"fake Goertzel/filter: fs/16 amp {g16['amp']}, fs/8 amp {g8['amp']}, band-pass at fs/8 "
+          f"{(bp8.max() - bp8.min()) / 2:.0f} of 800 ->", "PASS" if ok_fp else "FAIL")
+    f2, db2 = spectrum(np.asarray(samples), meta["ksps"] * 1e3)
+    metrics = analyze_spectrum(f2, db2)
+    ok_peak = bool(metrics) and abs(metrics["fund_freq"] - 250e3) < meta["ksps"] * 1e3 / len(samples)
+    ok_all &= ok_peak
+    print(f"grab (custom input) FFT peak {metrics.get('fund_freq', 0)/1e3:.1f} kHz (expect 250.0) ->",
+          "PASS" if ok_peak else "FAIL")
+
+    # A damaged frame must be reported, never silently accepted.
+    ok4, _, meta4 = t.grab(corrupt_payload=True)
+    ok_grab_corrupt = (not ok4) and "CRC mismatch" in meta4.get("error", "")
+    ok_all &= ok_grab_corrupt
+    print("grab corruption caught:", "PASS" if ok_grab_corrupt else "FAIL", "-", meta4.get("error"))
+
+    # A truncated frame (fewer payload bytes than the header promises) is
+    # exactly what a Ctrl+C or a disconnect mid-transfer looks like on the
+    # wire (docs/PLAN-BINARY-TRANSFER.md's Ctrl+C risk) - parse_grab_frame()
+    # is the function both Target.grab() and FakeTarget.grab() decode
+    # through, so exercising it directly proves the check without needing
+    # to fake a real interruption.
+    header = "GRAB n=64 from=0 ksps=8000 ov=0 late=0 missed=0 halves=2 xfer=128 slp=8 dachz=320000000\r\n"
+    short_payload = b"\x00\x00" * 30                      # 60 of the 128 bytes promised
+    ok5, _, meta5 = parse_grab_frame(header, short_payload, b"\r\nCRC 0000\r\n> " + ACK)
+    ok_truncated = (not ok5) and "short block" in meta5.get("error", "")
+    ok_all &= ok_truncated
+    print("grab truncated frame caught:", "PASS" if ok_truncated else "FAIL", "-", meta5.get("error"))
+
+    # Target.grab() itself, against a serial stub that never delivers a
+    # byte: the SAME bounded-wait code a real disconnected or wedged board
+    # would hit, without opening a port. TimeoutError, not a hang.
+    class _NullSerial:
+        def read(self, n=1):
+            return b""
+
+        def write(self, data):
+            return len(data)
+
+        def reset_input_buffer(self):
+            pass
+
+    tt = Target.__new__(Target)   # bypass __init__: no real port is opened
+    tt.ser = _NullSerial()
+    tt.on_log = None
+    tt.port = "null (selftest)"
+    try:
+        tt.grab(timeout=0.05)
+        ok_timeout = False
+    except TimeoutError:
+        ok_timeout = True
+    ok_all &= ok_timeout
+    print("grab timeout (no bytes at all) caught:", "PASS" if ok_timeout else "FAIL")
+
+    ok_all &= crc16_ccitt_false(b"123456789") == 0x29B1
+
+    # The standard file and the built-in copy of it must say the same - the
+    # example's part of it: gui_app.py's own defaults are not in the file
+    # (it is the same with and without gui_app.py), settings_merge() adds
+    # them from the built-in copy.
+    try:
+        with open(DEFAULTS_FILE, "r", encoding="utf-8") as fh:
+            std_file = json.load(fh)
+        generic = json.loads(json.dumps(SETTINGS_DEFAULTS))
+        for _k in (gui_app.SIGPROC_DEFAULTS if gui_app else {}):
+            generic["sigproc"].pop(_k, None)
+        ok_std = std_file == generic
+    except (OSError, ValueError):
+        ok_std = False
+    ok_all &= ok_std
+    print(f"standard settings file {os.path.basename(DEFAULTS_FILE)} == built-in defaults:",
+          "PASS" if ok_std else "FAIL")
+
+    # Board detection from the 'version' reply, both profiles, as the
+    # firmware prints it and as the fake does.
+    ok_nano = detect_board(FakeTarget(board="EV17P63A").cmd("version")[1]) == "EV17P63A"
+    ok_plat = detect_board(["[build] board: EV74H48A, dsPIC33AK512MPS512 GP DIM"]) == "EV74H48A"
+    ok_none = detect_board(["[build] adc_dma_40msps"]) is None
+    ok_all &= ok_nano and ok_plat and ok_none
+    print("board detection from 'version' (Nano, Platform, none):",
+          "PASS" if (ok_nano and ok_plat and ok_none) else "FAIL")
+
+    # ---- "remote" connection choice: a bench_client tunnel (tools/remote.py),
+    # against the fixture tests/host/test_remote.py uses too
+    # (tests/host/fake_bench_client.py) - never the real bench_client.py or a
+    # real relay/agent. Connect, one 'stream grab' cycle over the tunnel,
+    # disconnect - the same three steps do_connect()/do_connect() (again, to
+    # disconnect) drive from the page, done here without NiceGUI. ----
+    import tempfile
+    fake_bench_client = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "..", "tests", "host", "fake_bench_client.py")
+    with tempfile.TemporaryDirectory() as tmp:
+        hexpath = os.path.join(tmp, "A-EV74H48A-abc1234.hex")
+        with open(hexpath, "wb") as f:
+            f.write(b":10000000FF\n")
+        bench = remote.RemoteBench(bench_client=fake_bench_client,
+                                   env=dict(os.environ, FAKE_BENCH_STATE_DIR=os.path.join(tmp, "state")))
+        with bench:
+            flash_code, _ = bench.flash(hexpath, after=1)
+            url = bench.open_tunnel()
+            t = Target(url)
+            ok_v, _ = t.cmd("version")
+            ok_on, _ = t.cmd("stream on 8000")
+            ok_grab, samples, meta = t.grab()
+            t.close()
+            proc = bench._proc
+        ok_remote = flash_code == 0 and ok_v and ok_on and ok_grab and len(samples) > 0
+        ok_all &= ok_remote
+        print("remote: flash + tunnel + connect + one stream grab cycle:",
+              "PASS" if ok_remote else "FAIL", f"- samples={len(samples)} meta={meta}")
+        ok_closed = proc.poll() is not None
+        ok_all &= ok_closed
+        print("remote: disconnect (close_tunnel) ends the tunnel subprocess:",
+              "PASS" if ok_closed else "FAIL")
+
+    # ---- TRG.4: trigger mode of the time plot (tools/trigger.py) ----
+    # A sine of known phase: the crossing found is the expected one to
+    # within one sample (the interpolated one much closer).
+    period, phase = 37.3, 1.0
+    sine = [int(round(2048 + 1500 * math.sin(2 * math.pi * i / period + phase))) for i in range(1024)]
+    want = (2 * math.pi - phase) / (2 * math.pi) * period      # first rising zero after the trough
+    hit = find_trigger(sine, 2048, RISING, 16)
+    ok_trg_sine = hit is not None and abs(hit[0] - want) <= 1.0 and abs(hit[0] - 1 + hit[1] - want) < 0.1
+    fhit = find_trigger(sine, 2048, FALLING, 16)
+    want_f = want - period / 2 if want - period / 2 > 0 else want + period / 2
+    ok_trg_sine &= fhit is not None and abs(fhit[0] - 1 + fhit[1] - want_f) < 0.1
+    ok_all &= ok_trg_sine
+    print(f"trigger: sine of known phase, crossing expected at {want:.2f}, found "
+          f"{hit and hit[0] - 1 + hit[1]:.2f} (falling {want_f:.2f} / {fhit and fhit[0] - 1 + fhit[1]:.2f}) ->",
+          "PASS" if ok_trg_sine else "FAIL")
+
+    # Two FakeTarget grabs at different phases (its sine follows wall-clock
+    # time): the triggered windows agree around the crossing to within the
+    # noise, the untriggered ones do not.
+    tf = FakeTarget(signal_khz=25.0, amplitude=1500.0)
+    tf.cmd("stream on 8000 3 5 0")
+    wins, raws = [], []
+    for _ in range(2):
+        okg, sg, _m = tf.grab()
+        sg = [int(v) for v in sg]
+        L = len(sg) // 2
+        k, fr, found = trigger_window(sg, 2048, RISING, 16, L)
+        x0 = k - 1 + fr
+        xs = np.arange(k, k + L) - x0
+        wins.append((found, np.interp(np.arange(1, L - 1), xs, sg[k:k + L])))
+        raws.append(np.asarray(sg[:L], float))
+        time.sleep(0.013)
+    rms_trg = float(np.sqrt(np.mean((wins[0][1] - wins[1][1]) ** 2)))
+    rms_raw = float(np.sqrt(np.mean((raws[0] - raws[1]) ** 2)))
+    ok_trg_fake = wins[0][0] and wins[1][0] and rms_trg < 4 * tf.noise_std and rms_raw > 10 * rms_trg
+    ok_all &= ok_trg_fake
+    print(f"trigger: two fake grabs at different phases, rms difference triggered {rms_trg:.1f} "
+          f"vs untriggered {rms_raw:.1f} counts (noise {tf.noise_std}) ->", "PASS" if ok_trg_fake else "FAIL")
+
+    # A noisy slow slope: the hysteresis makes it exactly one crossing,
+    # without it the noise fires several times.
+    rng = np.random.default_rng(1)
+    ramp = [int(v) for v in np.round(1000 + np.arange(2000) + rng.normal(0, 4, 2000))]
+    n_hyst = len(list(find_triggers(ramp, 2048, RISING, 16)))
+    n_bare = len(list(find_triggers(ramp, 2048, RISING, 0)))
+    ok_trg_hyst = n_hyst == 1 and n_bare > 1
+    ok_all &= ok_trg_hyst
+    print(f"trigger: noisy slow slope, {n_hyst} crossing with hysteresis 16, {n_bare} without ->",
+          "PASS" if ok_trg_hyst else "FAIL")
+
+    # A level outside the signal: "no trigger", the untriggered start shown.
+    ok_trg_none = trigger_window(sine, 4000, RISING, 16) == (0, 0.0, False)
+    ok_all &= ok_trg_none
+    print("trigger: level outside the signal -> 'no trigger', window from 0:", "PASS" if ok_trg_none else "FAIL")
+
+    # The triangle verdict is the same with the trigger on and off: the
+    # evaluation keeps the full, unrotated half.
+    tt = FakeTarget()
+    tt.cmd("stream on 8000")
+    _ok, st, _m = tt.grab()
+    st = [int(v) for v in st]
+    before = chain_tri_eval(list(st))
+    copy = list(st)
+    trigger_window(st, 2048, RISING, 16)
+    after = chain_tri_eval(st)
+    ok_trg_tri = st == copy and before == after and chain_grid_ok(before) == chain_grid_ok(after)
+    ok_all &= ok_trg_tri
+    print("trigger: triangle verdict identical with the trigger on and off:", "PASS" if ok_trg_tri else "FAIL")
+
+    # ---- SG.7: the signal generator ----
+    # wavegen_model.py against the committed reference vectors (each file's
+    # first line is the command that made it)
+    import csv
+    import shlex
+    import glob as _glob
+    vec_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "ref", "vectors")
+    n_vec, ok_vec = 0, True
+    for fpath in sorted(_glob.glob(os.path.join(vec_dir, "wavegen_*.csv"))):
+        with open(fpath, encoding="utf-8") as fh:
+            argv = shlex.split(fh.readline()[2:].split(" # ")[0])
+            rows = [int(r["value"]) for r in csv.DictReader(fh)]
+        a = dict(zip(argv[::1], argv[1::1]))
+        harm = [float(x) for x in argv[argv.index("--harm") + 1:argv.index("--harm") + 7]]
+        tab = wavegen_model.wavegen(int(a["--n"]), float(a["--play-hz"]), float(a["--f0"]), harm,
+                                    float(a["--decay"]), float(a["--amplitude"]),
+                                    int(a["--out-min"]), int(a["--out-max"]))
+        ok_vec &= tab == rows
+        n_vec += 1
+    ok_vec &= n_vec >= 3
+    ok_all &= ok_vec
+    print(f"siggen: wavegen_model.py reproduces {n_vec} tests/ref vectors exactly:",
+          "PASS" if ok_vec else "FAIL")
+
+    # the console lines the card sends, and the stand-in's replies
+    sgp = dict(on=True, dac=2, n=1000, play=100000, f0=1000.0, h={2: 0.0, 3: 0.3, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0},
+               decay=0.0, amp=1.0, lo=800, hi=3500, snap=True, force=True)
+    lines, bad = siggen_plan(sgp)
+    ts = FakeTarget(noise_std=3.0)
+    ok_sg = bad is None and lines[-1] == "siggen on 2 1000 100000 snap force"
+    reply = []
+    for x in lines:
+        ok_x, reply = ts.cmd(x)
+        ok_sg &= ok_x
+    st = parse_kv(reply)
+    ok_sg &= (st.get("on") == "1" and st.get("play_hz_actual") == "100000" and st.get("f0_used") == "1000"
+              and st.get("h3") == "0.3" and st.get("table_min") == "800" and st.get("table_max") == "3500")
+    ok_off, off_reply = ts.cmd("siggen off")
+    ok_sg &= ok_off and off_reply == ["siggen: off"] and parse_kv(ts.cmd("siggen")[1]).get("on") == "0"
+    ok_all &= ok_sg
+    print("siggen: set/on/off against the stand-in, status parsed:", "PASS" if ok_sg else "FAIL",
+          f"- {lines[-1]!r}, play {st.get('play_hz_actual')}, f0_used {st.get('f0_used')}")
+
+    # every ready-made setup: merges onto the standard, its generator lines
+    # fit the console, its triangle has a period, its input reads its DAC
+    ok_su = True
+    for _key, (_name, _ov) in SETUPS.items():
+        _c = settings_merge(SETTINGS_DEFAULTS, _ov)
+        _sg = _c["siggen"]
+        _sp = dict(on=_sg["on"], dac=_sg["dac"], n=_sg["n"], play=_sg["play_hz"], f0=_sg["f0"],
+                   h={k: _sg["h"][k - 2] for k in range(2, 8)}, decay=_sg["decay"], amp=_sg["amp"],
+                   lo=_sg["lo"], hi=_sg["hi"], snap=_sg["snap"], force=_sg["force"])
+        _good = siggen_plan(_sp)[1] is None and 1 <= _c["acquisition"]["ksps"] <= 40000
+        if _c["acquisition"]["mode"] == "custom":
+            _src = _sg["dac"] if _sg["on"] else _c["view"]["dac_source"]
+            _good &= (_c["acquisition"]["core"], _c["acquisition"]["pinsel"]) == (5, _DAC_PINSEL[_src])
+        for _u in ("1", "2"):
+            _d = _c["dac"][_u]
+            if _d["on"] is True:
+                _good &= dac_period_ns_of(_d["low"], _d["high"], _d["slpdat"]) > 0
+                _good &= not (_sg["on"] and str(_sg["dac"]) == _u)
+        if not _good:
+            print(f"  setup {_key!r} inconsistent")
+        ok_su &= _good
+    ok_all &= ok_su
+    print(f"setups: {len(SETUPS)} ready-made setups consistent:", "PASS" if ok_su else "FAIL")
+
+    # a line the console cannot hold is refused by the sender, not cut
+    long_p = dict(sgp, h={**sgp["h"], 2: 1e60})
+    _, bad_long = siggen_plan(long_p)
+    ok_long = bad_long is not None and len(bad_long) > CMD_LINE_MAX
+    ok_all &= ok_long
+    print(f"siggen: a {len(bad_long or '')}-character line is refused by the sender (limit {CMD_LINE_MAX}):",
+          "PASS" if ok_long else "FAIL")
+
+    # the loop: generator on DAC2, the chain reading RA8 as a custom input
+    for x in lines:
+        ts.cmd(x)
+    ts.cmd("stream on 1000 5 3")
+    _okg, sgs, sgm = ts.grab()
+    tab = ts.sg_table
+    lp = wavegen_model.align(sgs, tab, ts.sg_play_actual, sgm["ksps"] * 1e3)
+    wrong = wavegen_model.wavegen(1000, ts.sg_play_actual, ts.sg_f0_used, [0, 0.1, 0, 0, 0, 0], 0.0, 1.0, 800, 3500)
+    lw = wavegen_model.align(sgs, wrong, ts.sg_play_actual, sgm["ksps"] * 1e3)
+    hf = harmonic_factors(sgs, sgm["ksps"] * 1e3, ts.sg_f0_used)
+    ok_loop = (lp["rms"] < 3 * ts.noise_std and abs(lp["gain"] - 1) < 0.02 and lw["rms"] > 10 * lp["rms"]
+               and abs(hf[3] - 0.3) < 0.02 and hf[2] < 0.02)
+    ok_all &= ok_loop
+    print(f"siggen: loop through the stand-in matches the table (rms {lp['rms']:.1f} LSB, gain "
+          f"{lp['gain']:.3f}, h3 measured {hf[3]:.3f} for 0.3, h2 {hf[2]:.3f}); h3 0.1 instead of 0.3 "
+          f"fails visibly (rms {lw['rms']:.1f}):",
+          "PASS" if ok_loop else "FAIL")
+    # ... and the alignment finds a known start entry (the delay) - modulo
+    # one signal period, 100 entries here: a table of whole periods (snap)
+    # looks the same from any of them
+    known = wavegen_model.playback(tab, 100000, 1e6, 1024, start_entry=417.3)
+    la = wavegen_model.align(known, tab, 100000, 1e6)
+    d = (la["entry"] - 417.3) % 100.0
+    ok_delay = min(d, 100.0 - d) < 0.15 and la["rms"] < 1.0
+    ok_all &= ok_delay
+    print(f"siggen: alignment recovers a start at entry 417.3 -> {la['entry']:.2f}, the same modulo "
+          f"the 100-entry period (rms {la['rms']:.2f}):", "PASS" if ok_delay else "FAIL")
+    # the test form is refused while the generator plays on DAC2
+    ok_conf = not ts.cmd("stream on 1000")[0]
+    ok_all &= ok_conf
+    print("siggen: 'stream on <ksps>' (DAC2 triangle) refused while the generator is on DAC2:",
+          "PASS" if ok_conf else "FAIL")
+
+    # "documentation": the real docs/ARCHITECTURE.md, both diagrams linked
+    # through the static route, each image file present next to it
+    doc_md, doc_imgs = architecture_markdown()
+    ok_doc = (doc_md.startswith("# ") and len(doc_imgs) >= 2
+              and all(os.path.exists(os.path.join(DOCS_DIR, i)) for i in doc_imgs)
+              and all(f"]({DOCS_URL}/{i}?v=" in doc_md for i in doc_imgs))
+    ok_all &= ok_doc
+    print("documentation: ARCHITECTURE.md read, its diagrams routed to", DOCS_URL + ":",
+          "PASS" if ok_doc else "FAIL", f"- images={doc_imgs}")
+
+    print("selftest", "PASS" if ok_all else "FAIL")
+    return 0 if ok_all else 1
+
+
+# ---------------------------------------------------------------------------
+# The GUI
+# ---------------------------------------------------------------------------
+# The DAC loopback both boards have: DAC2 drives DACOUT2 = RA8, which is
+# AD5AN3 on the 128-pin MPS512 and on the Nano's 64-pin MPS506 alike, so
+# ADC core 5 / PINSEL 3 reads the DAC with no wire. The test input
+# ("stream on <ksps>") is exactly this route with the firmware's triangle.
+LOOPBACK = {"core": 5, "pinsel": 3, "samc": 0, "dac": 2}
+
+
+# cmd_parser.c: a byte is taken while lineLen + 1 < CMD_PARSER_LINE_MAX_LEN
+# (64), so a line holds at most 63 characters - the sender refuses a longer
+# one rather than let the parser cut it (SG.7).
+CMD_LINE_MAX = 63
+
+
+def siggen_commands(p):
+    """The console lines that set the generator up as the card says (SG.4:
+    one parameter per line), then 'siggen on ...' or 'siggen off'. `p` is a
+    dict: on, dac, n, play, f0, h (dict 2..7), decay, amp, lo, hi, snap,
+    force. Values go out as plain decimals with at most six places - what
+    fmt_parse_dec() takes."""
+    def dec(v):
+        s = f"{float(v):.6f}".rstrip("0").rstrip(".")
+        return "0" if s in ("", "-0") else s
+    lines = [f"siggen set f0 {dec(p['f0'])}"]
+    lines += [f"siggen set h{k} {dec(p['h'][k])}" for k in range(2, 8)]
+    lines += [f"siggen set decay {dec(p['decay'])}", f"siggen set amp {dec(p['amp'])}",
+              f"siggen set lo {int(p['lo'])}", f"siggen set hi {int(p['hi'])}"]
+    if p["on"]:
+        lines.append(f"siggen on {int(p['dac'])} {int(p['n'])} {int(p['play'])}"
+                     + (" snap" if p["snap"] else "") + (" force" if p["force"] else ""))
+    else:
+        lines.append("siggen off")
+    return lines
+
+
+def harmonic_factors(samples, fs_hz, f0_hz, k_max=7):
+    """Amplitude of the k-th harmonic over the fundamental, k = 2..k_max,
+    by one least-squares fit of sin/cos at every k x f0 plus an offset over
+    the window - robust down to a single period of f0 in the window, where
+    an FFT has no bins to separate them. {k: factor}; 0.0 when f0 is not
+    in the window at all."""
+    s = np.asarray(samples, float)
+    t = np.arange(len(s)) / fs_hz
+    cols = [np.ones_like(t)]
+    for k in range(1, k_max + 1):
+        w = 2 * np.pi * k * f0_hz * t
+        cols += [np.sin(w), np.cos(w)]
+    A = np.vstack(cols).T
+    c, *_ = np.linalg.lstsq(A, s, rcond=None)
+    amp = {k: float(np.hypot(c[2 * k - 1], c[2 * k])) for k in range(1, k_max + 1)}
+    return {k: (amp[k] / amp[1] if amp[1] > 0 else 0.0) for k in range(2, k_max + 1)}
+
+
+def siggen_plan(p):
+    """siggen_commands(p) and the first line the console could not take
+    whole (None when every line fits): the sender refuses the set rather
+    than let the parser cut a line and act on its first 63 characters."""
+    lines = siggen_commands(p)
+    too_long = [x for x in lines if len(x) > CMD_LINE_MAX]
+    return lines, (too_long[0] if too_long else None)
+
+
+def parse_kv(lines):
+    """'key: value' reply lines as a dict of strings."""
+    out = {}
+    for x in lines:
+        if ": " in x:
+            k, v = x.split(": ", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def detect_board(lines):
+    """The board profile a 'version' reply names ("[build] board: EV17P63A,
+    ..." - board.h's BOARD_NAME, printed by diag_report_build()), or None
+    if it names none this tool knows."""
+    for line in lines or []:
+        m = re.search(r"board:\s*(EV[0-9A-Z]+)", line)
+        if m and m.group(1) in BOARDS:
+            return m.group(1)
+    return None
+
+
+def main_gui(args):
+    from nicegui import app, ui, run
+
+    # One command at a time on the serial port: the live loop runs its
+    # commands in worker threads, and without this they could interleave
+    # on the same port. acq_active: the (mode, ksps, core, pinsel, samc)
+    # the board is currently streaming - None until 'stream on' succeeds,
+    # and cleared by 'stream off' or by a failed grab, so the next cycle
+    # knows to send 'stream on' again.
+    port_lock = asyncio.Lock()
+
+    async def port_cmd(t, line):
+        """t.cmd(line) off the event loop. run.io_bound() returns None, not
+        the (ok, lines) pair, when its task is cancelled or the app is
+        stopping (NiceGUI 3.x) - reported here as not sent."""
+        res = await run.io_bound(t.cmd, line)
+        return res if res is not None else (False, ["not sent (cancelled)"])
+    state = dict(target=None, live=False, busy=False, cycles=0, grabs=0,
+                 acq_active=None, test_dac2=None, live_t0=None, buf_size=2 * BUF_HALF_MAX,
+                 settings_path=args.settings, remote_bench=None)
+
+    def ports():
+        try:
+            from serial.tools import list_ports
+            return [p.device for p in list_ports.comports()]
+        except Exception:
+            return []
+
+    # ---- look: dark, one accent colour, rounded cards ----
+    ACCENT, ACCENT2, DIM = "#22d3ee", "#a78bfa", "#94a3b8"
+    ui.colors(primary=ACCENT, secondary=ACCENT2, accent=ACCENT, dark="#0b1220", positive="#34d399", negative="#f87171")
+    ui.add_head_html("""<style>
+      body { background: #0b1220; }
+      .q-card { background: #111827 !important; border: 1px solid #1f2937; }
+      .q-field__label, .q-field__native, .q-field__control { color: #e5e7eb; }
+      .card-title { color: #94a3b8; font-size: 0.75rem; letter-spacing: .12em; text-transform: uppercase; }
+      .mono { font-family: ui-monospace, Consolas, monospace; }
+      /* Tooltips readable, and switchable off from the header ("tooltips").
+         !important because some tooltips carry an inline font-size. */
+      .q-tooltip { font-size: 18px !important; line-height: 1.45 !important;
+                   max-width: 38rem !important; padding: 10px 14px !important; }
+      body.no-tips .q-tooltip { display: none !important; }
+      /* The "documentation" dialog: ARCHITECTURE.md rendered as markdown.
+         The diagrams carry their own background, so they stay readable. */
+      /* The whole window's width (owner's request, 28.09.2026): the
+         markdown element's own prose width limit is lifted, the diagrams
+         scale to the full width. */
+      .arch-doc, .arch-doc .nicegui-markdown, .arch-doc .nicegui-markdown * { max-width: none !important; }
+      .arch-doc { color: #e5e7eb; line-height: 1.6; font-size: 1.05rem; }
+      .arch-doc img { width: 100%; height: auto; border-radius: 8px; margin: 8px 0 4px; }
+      .arch-doc h1 { font-size: 1.6rem; font-weight: 600; margin: 0 0 .5rem; }
+      .arch-doc h2 { font-size: 1.2rem; font-weight: 600; margin: 1.6rem 0 .4rem; color: #22d3ee; }
+      .arch-doc code { font-family: ui-monospace, Consolas, monospace; font-size: .9em;
+                       background: #1f2937; padding: 1px 5px; border-radius: 4px; }
+      .arch-doc table { border-collapse: collapse; margin: .5rem 0; }
+      .arch-doc th, .arch-doc td { border: 1px solid #334155; padding: 4px 10px; text-align: left; }
+      .arch-doc th { background: #1f2937; }
+      /* Collapsible tiles: a click on a tile's title folds everything below
+         the title (its first child) away; the arrow says which state. */
+      .tile .card-title { cursor: pointer; user-select: none; }
+      .tile .card-title::before { content: "▾ "; color: #64748b; }
+      .tile.collapsed .card-title::before { content: "▸ "; }
+      .tile.collapsed > :not(:first-child) { display: none !important; }
+      /* Chips readable: 14 px, and the neutral ones (color grey-8 - a value
+         without a verdict) light instead of dark grey on the dark cards.
+         Chips with a verdict keep their colour: positive / negative. */
+      .q-chip { font-size: 14px !important; }
+      .q-chip--dense { height: auto !important; padding: 3px 10px !important; }
+      .q-chip.text-grey-8 { color: #cbd5e1 !important; }
+    </style>
+    <script>
+      // Fold / unfold a tile on a click on its title. The state is the
+      // GUI's (settings file, view.collapsed): each fold is reported to
+      // Python, and Python calls adcApplyCollapsed() after a settings load.
+      (function () {
+        function titleOf(tile) { const t = tile.querySelector(".card-title"); return t ? t.textContent.trim() : ""; }
+        window.adcApplyCollapsed = function (titles) {
+          const want = new Set(titles);
+          document.querySelectorAll(".tile").forEach(function (tile) {
+            tile.classList.toggle("collapsed", want.has(titleOf(tile)));
+          });
+          setTimeout(function () { window.dispatchEvent(new Event("resize")); }, 50);
+        };
+        document.addEventListener("click", function (ev) {
+          const title = ev.target.closest(".card-title");
+          if (!title) return;
+          const tile = title.closest(".tile");
+          if (!tile) return;
+          const folded = tile.classList.toggle("collapsed");
+          if (typeof emitEvent === "function") emitEvent("tile_fold", { title: titleOf(tile), folded: folded });
+          if (!folded) setTimeout(function () { window.dispatchEvent(new Event("resize")); }, 50);
+        });
+      })();
+    </script>""")
+
+    def chart(title, x_name, y_name, y_min, y_max, colour, second_x_name=None):
+        """`second_x_name` adds a top x-axis on the same grid (samples and
+        time together for the time-signal chart); both axes span the same
+        pixel width, so their tick positions line up as long as their
+        min/max are kept proportional."""
+        x_axes = [{"type": "value", "name": x_name, "min": 0, "nameTextStyle": {"color": DIM},
+                   "axisLine": {"lineStyle": {"color": "#374151"}}, "axisLabel": {"color": DIM},
+                   "splitLine": {"lineStyle": {"color": "#1f2937"}}}]
+        grid_top = 44
+        if second_x_name is not None:
+            x_axes.append({"type": "value", "name": second_x_name, "min": 0, "position": "top",
+                           "nameTextStyle": {"color": DIM}, "axisLine": {"lineStyle": {"color": "#374151"}},
+                           "axisLabel": {"color": DIM}, "splitLine": {"show": False}})
+            grid_top = 74
+        return ui.echart({
+            "backgroundColor": "transparent",
+            "animation": False,
+            "title": {"text": title, "left": 16, "top": 8,
+                      "textStyle": {"color": "#e5e7eb", "fontSize": 14, "fontWeight": "normal"}},
+            "grid": {"left": 64, "right": 24, "top": grid_top, "bottom": 44},
+            "tooltip": {"trigger": "axis", "backgroundColor": "#1f2937", "borderColor": "#374151",
+                        "textStyle": {"color": "#e5e7eb", "fontSize": 16}},
+            "xAxis": x_axes,
+            "yAxis": {"type": "value", "name": y_name, "min": y_min, "max": y_max,
+                      "nameTextStyle": {"color": DIM}, "axisLine": {"lineStyle": {"color": "#374151"}},
+                      "axisLabel": {"color": DIM}, "splitLine": {"lineStyle": {"color": "#1f2937"}}},
+            "series": [{"type": "line", "showSymbol": False, "data": [], "smooth": False, "xAxisIndex": 0,
+                        "lineStyle": {"width": 1.5, "color": colour},
+                        "areaStyle": {"color": {"type": "linear", "x": 0, "y": 0, "x2": 0, "y2": 1,
+                                                "colorStops": [{"offset": 0, "color": colour + "66"},
+                                                               {"offset": 1, "color": colour + "00"}]}}}],
+        }, theme="dark").classes("w-full h-80 rounded-xl")
+
+    # ---- header ----
+    with ui.header().classes("items-center gap-4 px-6").style("background: #0f172a; border-bottom: 1px solid #1f2937"):
+        ui.icon("show_chart", size="md").classes("text-cyan-400")
+        with ui.column().classes("gap-0"):
+            ui.label("dsPIC33A ADC / DMA").classes("text-lg font-medium leading-tight")
+            ui.label("triggered chain · capture · plot · FFT").classes("text-xs text-slate-400 leading-tight")
+        ui.space()
+        doc_btn = ui.button("documentation", icon="menu_book").props("flat").classes("text-slate-200")
+        doc_btn.tooltip("the firmware's architecture: docs/ARCHITECTURE.md with its block diagrams, "
+                        "read from the repository at every click")
+        # Every control on this page explains itself in a tooltip; this
+        # switches them all off (a CSS class on <body>, see the style above).
+        tips_cb = ui.checkbox("tooltips", value=True).classes("text-slate-300")
+
+        def set_tooltips(on):
+            if on:
+                ui.query("body").classes(remove="no-tips")
+            else:
+                ui.query("body").classes(add="no-tips")
+        tips_cb.on_value_change(lambda e: set_tooltips(bool(e.value)))
+        port_sel = ui.select(options=["fake", "remote"] + ports(),
+                             value=(args.port or ("remote" if args.remote else None)
+                                    or ("fake" if args.fake else None)),
+                             label="port").classes("w-44").props("dense outlined")
+        bench_client_in = ui.input(
+            "bench_client.py path",
+            value=args.bench_client or os.environ.get("BENCH_CLIENT", remote.DEFAULT_BENCH_CLIENT),
+        ).classes("w-72").props("dense outlined")
+        bench_client_hint = ui.label("no flashing here - bench_client does that") \
+            .classes("text-xs text-slate-400")
+        bench_client_in.set_visibility(port_sel.value == "remote")
+        bench_client_hint.set_visibility(port_sel.value == "remote")
+        port_sel.on_value_change(
+            lambda e: (bench_client_in.set_visibility(e.value == "remote"),
+                       bench_client_hint.set_visibility(e.value == "remote")))
+        conn_btn = ui.button("connect", icon="usb").props("unelevated")
+        conn_chip = ui.chip("not connected", icon="link_off", color="grey-8").props("outline")
+        # "remote": one chip per link the connection needs - relay, bench
+        # agent, the agent's console port, a board answering on it - so a
+        # failed connect says WHICH link is missing (remote.py's
+        # RemoteBench.check()/check_board()); the tooltip carries the detail.
+        with ui.row().classes("gap-1 items-center") as remote_row:
+            remote_chips = {}
+            for _name in ("relay", "bench agent", "console port", "board"):
+                with ui.chip(_name, icon="radio_button_unchecked", color="grey-8") \
+                        .props("outline dense") as _c:
+                    _tip = ui.tooltip("not checked yet")
+                remote_chips[_name] = (_c, _tip)
+        remote_row.set_visibility(False)
+
+        def show_step(step):
+            chip, tip = remote_chips[step["name"]]
+            if step["ok"] is None:
+                chip.icon = "radio_button_unchecked"
+                chip.props("color=grey-8")
+                tip.text = step.get("detail") or "not checked - an earlier link failed"
+            else:
+                chip.icon = "check_circle" if step["ok"] else "cancel"
+                chip.props("color=positive" if step["ok"] else "color=negative")
+                tip.text = step["detail"]
+
+        def reset_steps():
+            for _n in remote_chips:
+                show_step(dict(name=_n, ok=None, detail="not checked yet"))
+
+    # ---- documentation dialog (header button) ----
+    app.add_static_files(DOCS_URL, DOCS_DIR)
+    with ui.dialog().props("maximized") as doc_dlg, ui.card().classes("w-full p-6"):
+        with ui.row().classes("w-full items-center"):
+            ui.label("documentation · docs/ARCHITECTURE.md").classes("card-title")
+            ui.space()
+            ui.button(icon="close", on_click=doc_dlg.close).props("flat round dense")
+        doc_box = ui.column().classes("w-full arch-doc")
+
+    def show_docs():
+        text, _ = architecture_markdown()
+        doc_box.clear()
+        with doc_box:
+            ui.markdown(text).classes("w-full")
+        doc_dlg.open()
+    doc_btn.on_click(lambda e: show_docs())
+
+    with ui.row().classes("w-full p-4 gap-4 items-start no-wrap"):
+        # ---- left: settings ----
+        with ui.column().classes("gap-4").style("width: 22rem; min-width: 22rem"):
+            with ui.card().classes("tile w-full rounded-xl p-4 gap-2"):
+                ui.label("settings file").classes("card-title")
+                settings_path_lbl = ui.label().classes("text-xs text-slate-400 mono break-all")
+                with ui.row().classes("w-full gap-2"):
+                    save_btn = ui.button("save", icon="save").props("unelevated dense").classes("flex-grow")
+                    save_as_btn = ui.button("save as", icon="save_as").props("outline dense").classes("flex-grow")
+                    std_btn = ui.button("standard", icon="restart_alt").props("outline dense").classes("flex-grow")
+                setup_sel = ui.select({k: v[0] for k, v in SETUPS.items()} | {SETUP_FROM_FILE: "from a file ..."},
+                                      value=None, label="setup").props("dense outlined").classes("w-full")
+                settings_msg_lbl = ui.label().classes("text-xs text-slate-400 mono")
+
+            with ui.card().classes("tile w-full rounded-xl p-4 gap-2"):
+                ui.label("acquisition · triggered chain").classes("card-title")
+                rate_in = ui.number("rate, kSPS (1..40000)", value=8000, min=1, max=40000,
+                                    step=100, format="%d").props("dense outlined")
+                rate_hint_lbl = ui.label().classes("text-xs mono")
+                input_mode_sel = ui.select(
+                    {"test": "RA8 / DAC2 test triangle (core 5, pin 3)", "custom": "custom input"},
+                    value="test", label="input").props("dense outlined")
+                with ui.row().classes("w-full gap-2"):
+                    core_sel = ui.select({n: f"ADC{n}" for n in range(1, 6)}, value=3,
+                                         label="core (1..5)").props("dense outlined").classes("flex-grow")
+                    input_in = ui.number("PINSEL (this core's pins; 6 = internal ref, 7 = UREF)", value=5, min=0, max=15,
+                                         step=1, format="%d").props("dense outlined").classes("flex-grow")
+                channel_info_lbl = ui.label().classes("text-xs text-slate-400")
+                samc_in = ui.number("SAMC · sample time (0..31)", value=0, min=0, max=31, step=1, format="%d").props("dense outlined")
+                interval_in = ui.number("grab interval, ms", value=500, min=50, max=5000, step=50, format="%d").props("dense outlined")
+                # TRG: display-only trigger - a change takes effect with the
+                # next grab, the stream itself is not touched
+                with ui.row().classes("w-full gap-2 items-center"):
+                    trig_cb = ui.checkbox("trigger", value=False)
+                    trig_level_in = ui.number("level (0..4095)", value=2048, min=0, max=4095, step=16,
+                                              format="%d").props("dense outlined").classes("flex-grow")
+                with ui.row().classes("w-full gap-2"):
+                    trig_slope_sel = ui.select({RISING: "rising edge", FALLING: "falling edge"},
+                                               value=RISING, label="edge").props("dense outlined")                         .classes("flex-grow")
+                    trig_hyst_in = ui.number("hysteresis, LSB", value=16, min=0, max=2048, step=1,
+                                             format="%d").props("dense outlined").classes("flex-grow")
+                with ui.row().classes("w-full gap-2"):
+                    single_btn = ui.button("single", icon="camera").props("unelevated").classes("flex-grow")
+                    live_btn = ui.button("live", icon="play_arrow").props("unelevated").classes("flex-grow")
+
+            # 02.10.2026: the firmware's signal processing (sigproc.c) - one
+            # filter at fs/8 on every half, in place, and a Goertzel detector
+            # for a tone at fs/16 on the input; both off after a board reset
+            with ui.card().classes("tile w-full rounded-xl p-4 gap-2"):
+                ui.label("signal processing").classes("card-title")
+                sp_filter_sel = ui.select(SP_FILTERS, value="off",
+                                          label="filter (4th-order Butterworth, in the firmware)"
+                                          ).props("dense outlined").classes("w-full")
+                with ui.row().classes("w-full gap-2 items-center"):
+                    sp_gz_cb = ui.checkbox("Goertzel at fs/16", value=False)
+                    sp_thr_in = ui.number("threshold, LSB", value=100, min=1, max=4095, step=10,
+                                          format="%d").props("dense outlined").classes("flex-grow")
+                sp_gz_chip = ui.chip("fs/16: Goertzel off", color="grey-8").props("dense outline")
+                # the application's rows (gui_app.py), if it has any
+                app_card = gui_app.Card(ui) if gui_app else None
+                sigproc_lbl = ui.label("").classes("text-xs text-slate-400")
+
+            with ui.card().classes("tile w-full rounded-xl p-4 gap-2"):
+                ui.label("fake target signal").classes("card-title")
+                fake_src_sel = ui.select({"sine": "sine generator (parameters below)",
+                                          "dac2": "DAC2 triangle (RA8)",
+                                          "dac1": "DAC1 triangle (DAC1 tile)"},
+                                         value="dac2", label="signal").props("dense outlined")
+                with ui.column().classes("w-full gap-2") as sine_box:
+                    sig_in = ui.number("frequency, kHz", value=100.0, min=0.1, max=20000.0, step=10).props("dense outlined")
+                    amp_in = ui.number("amplitude, counts (pk)", value=1500.0, min=0.0, max=2000.0, step=50).props("dense outlined")
+                    noise_in = ui.number("noise, counts (std dev, sets SNR)", value=6.0, min=0.0, max=500.0, step=1).props("dense outlined")
+                    harm2_in = ui.number("2nd harmonic, counts (pk)", value=150.0, min=0.0, max=1000.0, step=10).props("dense outlined")
+                    harm3_in = ui.number("3rd harmonic, counts (pk)", value=0.0, min=0.0, max=1000.0, step=10).props("dense outlined")
+                fake_dac_lbl = ui.label().classes("text-xs text-slate-400")
+
+                def on_fake_source(e=None):
+                    src = fake_src_sel.value or "sine"
+                    sine_box.set_visibility(src == "sine")
+                    fake_dac_lbl.text = (
+                        "" if src == "sine" else
+                        "test input: the firmware's triangle, or the DAC2 tile's once applied; "
+                        "custom input: the DAC2 tile (off: near 0)" if src == "dac2" else
+                        "the DAC1 tile's low / high / SLPDAT and on/off (off: near 0)")
+                fake_src_sel.on_value_change(on_fake_source)
+                on_fake_source()
+
+            # One card per DAC. Both units are the same hardware with
+            # different registers (dac.c), and each has its own output pin:
+            # DAC1 on RA1, DAC2 on RA8. Either can feed an ADC channel -
+            # its own pin without a wire, any other pin with one, which is
+            # what the board tile spells out. Switched on here, they are
+            # applied automatically whenever the chain runs with a custom
+            # (non-test) input.
+            dac_ui = {}
+            for _unit, _pin_name in ((1, "RA1"), (2, "RA8")):
+                with ui.card().classes("tile w-full rounded-xl p-4 gap-2"):
+                    ui.label(f"dac{_unit} · triangle ({_pin_name})").classes("card-title")
+                    _on = ui.select(({"auto": "auto · the firmware's test triangle"} if _unit == 2 else {})
+                                    | {True: "on", False: "off"},
+                                    value="auto" if _unit == 2 else False,
+                                    label=f"dac{_unit}").props("dense outlined")
+                    with ui.row().classes("w-full gap-2"):
+                        _low = ui.number("low (0..4095)", value=0x100, min=0, max=4095, step=16,
+                                         format="%d").props("dense outlined").classes("flex-grow")
+                        _high = ui.number("high (0..4095, > low)", value=0xF00, min=0, max=4095,
+                                          step=16, format="%d").props("dense outlined").classes("flex-grow")
+                    _slp = ui.number("SLPDAT · slope (1..255, counts/DAC clock; 8 = 22 kHz)",
+                                     value=8, min=0, max=65535, step=1, format="%d").props("dense outlined")
+                    # 'force' (cli.c): the board writes low/high/SLPDAT as typed,
+                    # outside the datasheet's 0xCD+SLPDAT..0xF32-SLPDAT too.
+                    _force = ui.checkbox("force - write any value, ignore the datasheet's limits",
+                                         value=True).classes("text-amber-400")
+                    _freq = ui.label().classes("text-cyan-300 mono")
+                    _btn = ui.button(f"apply dac{_unit}", icon="graphic_eq").props("unelevated").classes("w-full")
+                    _msg = ui.label().classes("text-xs text-slate-400 mono")
+                    # Shown while the test input is chosen: 'stream on <ksps>'
+                    # starts DAC2's own triangle (chaintest.c triangle_for());
+                    # DAC2 switched on here replaces it right after, and again
+                    # after every 'stream on' (rate change).
+                    _note = ui.label(
+                        "test input: 'auto' = the firmware's own triangle, its slope chosen per "
+                        "rate; 'on' = this triangle on RA8; 'off' = DAC2 off, the channel quiet - "
+                        "kept across rate changes" if _unit == 2 else
+                        "test input reads DAC2 (RA8) - DAC1 on RA1 acts on a custom input "
+                        "(core 5 / AN1)").classes("text-xs text-amber-400")
+                    dac_ui[_unit] = {"on": _on, "low": _low, "high": _high, "slp": _slp, "force": _force,
+                                     "freq": _freq, "btn": _btn, "msg": _msg, "note": _note}
+
+            def dac_mode(unit):
+                """'on', 'off' or 'auto' (DAC2 only: the firmware's test triangle)."""
+                v = dac_ui[unit]["on"].value
+                return "auto" if v == "auto" else ("on" if v is True else "off")
+
+            # ---- the signal generator (SG.6): siggen.c plays a wavegen
+            # table through DMA channel 1 into a DAC, paced by SCCP2 ----
+            with ui.card().classes("tile w-full rounded-xl p-4 gap-2"):
+                ui.label("signal generator · table -> DMA2 -> DAC").classes("card-title")
+                with ui.row().classes("w-full gap-2"):
+                    sg_on_sel = ui.select({True: "on", False: "off"}, value=False,
+                                          label="generator").props("dense outlined").classes("flex-grow")
+                    sg_dac_sel = ui.select({1: "DAC1 (RA1)", 2: "DAC2 (RA8)"}, value=2,
+                                           label="output").props("dense outlined").classes("flex-grow")
+                with ui.row().classes("w-full gap-2"):
+                    sg_n_in = ui.number("n, table entries (2..8192)", value=5000, min=2, max=8192,
+                                        step=100, format="%d").props("dense outlined").classes("flex-grow")
+                    sg_play_in = ui.number("play rate, Hz (100..1000000)", value=500000, min=100,
+                                           max=1000000, step=1000, format="%d").props("dense outlined") \
+                        .classes("flex-grow")
+                sg_f0_in = ui.number("f0, Hz (< play rate / 2)", value=10000, min=0.001, max=500000,
+                                     step=100).props("dense outlined")
+                sg_h_in = {}
+                for _row in ((2, 3, 4), (5, 6, 7)):
+                    with ui.row().classes("w-full gap-2"):
+                        for _k in _row:
+                            sg_h_in[_k] = ui.number(f"h{_k} (x f0)", value={2: 0.2, 3: 0.4, 4: 0.1}.get(_k, 0.0),
+                                                    min=-100, max=100, step=0.05).props("dense outlined") \
+                                .classes("flex-grow").style("width: 5rem")
+                with ui.row().classes("w-full gap-2"):
+                    sg_decay_in = ui.number("decay, 1/s (0 = none)", value=1000, min=0, max=1e9,
+                                            step=100).props("dense outlined").classes("flex-grow")
+                    sg_amp_in = ui.number("amp (0..1]", value=1.0, min=0.000001, max=1.0,
+                                          step=0.05).props("dense outlined").classes("flex-grow")
+                with ui.row().classes("w-full gap-2"):
+                    sg_lo_in = ui.number("lo, DAC code", value=800, min=0, max=4095, step=16,
+                                         format="%d").props("dense outlined").classes("flex-grow")
+                    sg_hi_in = ui.number("hi, DAC code", value=3500, min=0, max=4095, step=16,
+                                         format="%d").props("dense outlined").classes("flex-grow")
+                with ui.row().classes("w-full gap-4"):
+                    sg_snap_cb = ui.checkbox("snap f0 to the table", value=True)
+                    sg_force_cb = ui.checkbox("force - any lo/hi", value=True).classes("text-amber-400")
+                with ui.row().classes("w-full gap-2"):
+                    sg_loop_btn = ui.button("loop preset", icon="loop").props("unelevated").classes("flex-grow")
+                    sg_apply_btn = ui.button("apply", icon="send").props("unelevated").classes("flex-grow")
+                sg_msg = ui.label("off").classes("text-xs text-slate-400 mono")
+                sg_preview = ui.echart({
+                    "backgroundColor": "transparent", "animation": False,
+                    "grid": {"left": 44, "right": 8, "top": 8, "bottom": 24},
+                    "xAxis": {"type": "value", "min": 0, "axisLabel": {"color": DIM, "fontSize": 10}},
+                    "yAxis": {"type": "value", "min": 0, "max": 4096, "axisLabel": {"color": DIM, "fontSize": 10},
+                              "splitLine": {"lineStyle": {"color": "#1f2937"}}},
+                    "series": [{"type": "line", "showSymbol": False, "data": [], "step": "start",
+                                "lineStyle": {"width": 1, "color": "#f472b6"}}],
+                }, theme="dark").classes("w-full h-32")
+
+            with ui.card().classes("tile w-full rounded-xl p-4 gap-2"):
+                ui.label("buffer").classes("card-title")
+                with ui.row().classes("w-full gap-2 items-end"):
+                    buf_in = ui.number(f"buffer size, total (32..{2 * BUF_HALF_MAX}, 'buf' = half of it)",
+                                       value=2 * BUF_HALF_MAX, min=32, max=2 * BUF_HALF_MAX, step=32,
+                                       format="%d").props("dense outlined").classes("flex-grow")
+                    buf_btn = ui.button("apply", icon="tune").props("unelevated dense")
+                buf_lbl = ui.label("buf: not queried yet").classes("text-xs text-slate-400 mono")
+
+        # ---- right: results ----
+        with ui.column().classes("flex-grow gap-4"):
+            # The grab line on a row of its own, the chips below it: its
+            # length changes from grab to grab, and sharing a row made that
+            # row wrap now and then, moving the charts below up and down.
+            cyc_lbl = ui.label("no grab yet").classes("text-slate-300 mono")
+            with ui.row().classes("w-full items-center gap-2 -mt-3"):
+                COUNTER_TIPS = {
+                    "overrun": "DMA overruns since the PREVIOUS grab, not a running total - a "
+                               "lower bound, as always: OVERRUN is one bit in DMA0STAT and the "
+                               "handler counts one per entry that found it set, so several losses "
+                               "between two entries still move it by one.",
+                    "late": "HALF and DONE both pending at once since the previous grab: the "
+                            "handler ran a whole half late.",
+                    "missed": "Halves the firmware's own main-loop processing skipped since the "
+                              "previous grab - this page's own halt/grab/restart cycle does not "
+                              "count against it.",
+                }
+                chips = {}
+                for _k in ("overrun", "late", "missed"):
+                    chips[_k] = ui.chip(f"{_k} –", color="grey-8").props("dense outline")
+                    with chips[_k]:
+                        ui.tooltip(COUNTER_TIPS[_k]).style("font-size: 14px; max-width: 24rem;")
+                rate_chip = ui.chip("actual rate –", color="grey-8").props("dense outline")
+                halves_chip = ui.chip("halves/xfer –", color="grey-8").props("dense outline")
+                load_chip = ui.chip("CPU load –", color="grey-8").props("dense outline")
+                trig_chip = ui.chip("trigger off", color="grey-8").props("dense outline")
+                loop_chip = ui.chip("loop –", color="grey-8").props("dense outline")
+                with loop_chip:
+                    ui.tooltip("The signal generator's loop (SG.6): when the chain reads the pin "
+                               "the generator drives (DAC2 = RA8 = core 5 / PINSEL 3, DAC1 = RA1 = "
+                               "core 5 / PINSEL 1), the table - played at the generator's actual rate, "
+                               "held per entry - is aligned to the grab by cross-correlation and fitted "
+                               "(gain, offset): the residual in LSB rms, the gain, and the table entry "
+                               "the window starts at. The fitted expectation is drawn over the time "
+                               "signal (pink). On the board the DAC's settling (0.75-2 us per step) "
+                               "adds to the residual at fast play rates, and the output does not go "
+                               "below about code 780.").style("font-size: 14px; max-width: 26rem;")
+                with trig_chip:
+                    ui.tooltip("Trigger mode of the time plot: 'trig @ k' = the level was crossed "
+                               "at sample k of the grabbed half and the plot starts there; 'no "
+                               "trigger' = not crossed in the searchable part, the plot shows the "
+                               "untriggered start (like an oscilloscope's auto mode)."
+                               ).style("font-size: 14px; max-width: 24rem;")
+                with rate_chip:
+                    ui.tooltip("The frame's own 'ksps' - the nearest 160 MHz / N (CLKGEN13) the "
+                               "chain actually runs at, not the number typed on the left. Used as "
+                               "fs for the time axis and the FFT.").style("font-size: 14px; max-width: 24rem;")
+                with halves_chip:
+                    ui.tooltip("Buffer halves completed and DMA transfers since the previous grab "
+                               "(chain_stream_grab_begin()'s per-cycle counters).")\
+                        .style("font-size: 14px; max-width: 24rem;")
+                with load_chip:
+                    ui.tooltip("The signal processing's share of the CPU since the previous grab: "
+                               "its mean time per buffer half over the time a half takes (the "
+                               "frame's load=, firmware since 02.10.2026). Under 70 % green, up "
+                               "to 100 % amber; above 100 % it cannot keep up and halves go "
+                               "unprocessed ('missed'). Near 0 with the processing off.")\
+                        .style("font-size: 14px; max-width: 24rem;")
+            with ui.card().classes("tile w-full rounded-xl p-2"):
+                ui.label("time signal").classes("card-title px-2 pt-1")
+                with ui.row().classes("w-full items-center gap-3 px-2"):
+                    vref_in = ui.number("reference voltage, V", value=3.3, min=0.1, max=5.5, step=0.05,
+                                        format="%.3f").props("dense outlined").style("width: 12rem")
+                    ui.label("ADC full scale (4096 counts) = this voltage; the right axis and the "
+                             "tooltip show volts from it").classes("text-xs text-slate-400")
+                # What this grab is: the signal source as the GUI set it up,
+                # and the window's own min..max - so a DAC change can be
+                # checked against the numbers, not only by eye.
+                sig_src_lbl = ui.label("source: -").classes("text-sm text-cyan-300 mono px-2")
+                time_chart = chart("", "sample", "ADC counts", 0, 4096, ACCENT, second_x_name="time")
+                # The right-hand axis in volts, on the same grid as the counts:
+                # both span 0..full scale, so their ticks describe the same heights.
+                time_chart.options["yAxis"] = [time_chart.options["yAxis"], {
+                    "type": "value", "min": 0, "max": 3.3, "position": "right",
+                    "axisLine": {"lineStyle": {"color": "#374151"}},
+                    "axisLabel": {"color": DIM, "formatter": "{value} V"},
+                    "splitLine": {"show": False}}]
+                # room for the volt labels on the right, the time axis name
+                # pinned to the top right end of its own (top) axis
+                time_chart.options["grid"]["right"] = 72
+                time_chart.options["xAxis"][1]["nameLocation"] = "end"
+                time_chart.options["xAxis"][1]["nameGap"] = 8
+                # with two y axes ECharts pulls an axis line "onZero" to the
+                # other axis' zero - the top time axis (and its name) would
+                # sit at the bottom, on top of "sample"
+                time_chart.options["xAxis"][1]["axisLine"]["onZero"] = False
+                # SG.6: the generator's table as the loop expects it, fitted
+                # to the grab - empty unless the chain reads the generator's pin
+                time_chart.options["series"].append({
+                    "type": "line", "showSymbol": False, "data": [], "xAxisIndex": 0,
+                    "name": "expected", "lineStyle": {"width": 1, "color": "#f472b6", "type": "dashed"}})
+            with ui.card().classes("tile w-full rounded-xl p-2"):
+                ui.label("spectrum · Hann window").classes("card-title px-2 pt-1")
+                fft_chart = chart("", "kHz", "dBFS", -100, 0, ACCENT2)
+            with ui.card().classes("tile w-full rounded-xl p-3"):
+                ui.label("signal evaluation").classes("card-title")
+                EVAL_TOOLTIPS = {
+                    "fundamental": "Frequency of the strongest spectral line (DC excluded) -- the detected signal frequency.",
+                    "level": "Amplitude of the fundamental, in dBFS (0 dB = full scale, 4096 ADC counts).",
+                    "noise floor": "Median spectrum level outside the fundamental and its harmonics, in dBFS.",
+                    "SNR": "Signal-to-noise ratio: fundamental level minus the noise floor, in dB. Higher is cleaner.",
+                    "THD": "Total harmonic distortion: combined power of harmonics 2..5 relative to the fundamental, in percent.",
+                    "H2": "2nd harmonic level relative to the fundamental, in dBc (dB below carrier).",
+                    "H3": "3rd harmonic level relative to the fundamental, in dBc.",
+                    "H4": "4th harmonic level relative to the fundamental, in dBc.",
+                    "H5": "5th harmonic level relative to the fundamental, in dBc.",
+                }
+                with ui.row().classes("w-full gap-2 flex-wrap"):
+                    eval_chips = {}
+                    for k in ("fundamental", "level", "noise floor", "SNR", "THD", "H2", "H3", "H4", "H5"):
+                        chip = ui.chip(f"{k} –", color="grey-8").props("dense outline")
+                        with chip:
+                            ui.tooltip(EVAL_TOOLTIPS[k]).style("font-size: 14px; max-width: 22rem;")
+                        eval_chips[k] = chip
+
+            # ---- the triangle verdict: only meaningful for the test input ----
+            with ui.card().classes("tile w-full rounded-xl p-3 gap-2") as triangle_card:
+                with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                    ui.label("triangle verdict · test input only").classes("card-title")
+                    triangle_verdict_chip = ui.chip("no grab yet", color="grey-8").props("dense outline")
+                ui.label(
+                    "Shown only when the grab's own frame says a test triangle was the signal "
+                    "(slp > 0 in the GRAB header) - a custom input's grab has nothing to judge "
+                    "against a model, and this card is hidden for it. Evaluated with the same "
+                    "tri_eval()/grid_ok() the firmware's own chain test uses (tools/eval_chain.py, "
+                    "imported, not re-implemented): a lost or repeated sample shifts a turning "
+                    "point off the grid by a whole sample and fails it."
+                ).classes("text-xs text-slate-400")
+                with ui.row().classes("w-full gap-2 flex-wrap"):
+                    TRIANGLE_TIPS = {
+                        "turning points": "Coarse peaks and troughs tri_eval() found in the window.",
+                        "up": "Complete rising slopes: count and mean length in samples.",
+                        "down": "Complete falling slopes: count and mean length in samples.",
+                        "slip": "The grid verdict's own number: a lost or repeated sample shifts "
+                                "later turning points by a whole sample: PASS needs it under 0.5.",
+                        "model": "Measured mean slope length over the model from slpdat and the "
+                                 "DAC clock the frame reports (chaintest.c triangle_for()) - near "
+                                 "1.0 on a clean grid.",
+                        "steps": "Lost (zero) or repeated (dbl) single-sample steps, only checked "
+                                 "once the slope is steep enough (>= 40 LSB/sample) to tell them "
+                                 "from DAC/DNL noise.",
+                    }
+                    triangle_chips = {}
+                    for _k in ("turning points", "up", "down", "slip", "model", "steps"):
+                        chip = ui.chip(f"{_k} –", color="grey-8").props("dense outline")
+                        with chip:
+                            ui.tooltip(TRIANGLE_TIPS[_k]).style("font-size: 14px; max-width: 22rem;")
+                        triangle_chips[_k] = chip
+
+            # ---- the package: where the selected channel physically is ----
+            # Full width, every pin labelled with its number and port name.
+            # The eval kit decides which device, and so which package, is
+            # drawn. Kit, core and channel are repeated on the board tile
+            # below and on the sidebar; all of them are the same selection.
+            board_ctrls, core_ctrls, chan_ctrls, dac_ctrls = [], [], [], []
+            # custom: the user's own input (core, pinsel, samc) - kept apart
+            # from the fields, which show the loopback while the test input
+            # is chosen; dac_custom: the signal source shown for it.
+            ui_state = {"board": BOARD_DEFAULT, "sync": False, "dac": 0, "mode": "test",
+                        "custom": None, "dac_custom": 0, "collapsed": set()}
+
+            def selection_row(tag):
+                """kit / core / channel, one row, for a tile header."""
+                board = ui.select(BOARD_OPTIONS, value=BOARD_DEFAULT, label="eval kit") \
+                    .props("dense outlined").style("min-width: 21rem")
+                core = ui.select({n: f"ADC{n}" for n in range(1, 6)}, value=3, label="core") \
+                    .props("dense outlined").style("min-width: 7.5rem")
+                chan = ui.select({}, label="channel (PINSEL)") \
+                    .props("dense outlined").style("min-width: 12rem")
+                dac = ui.select(DAC_OPTIONS, value=0, label="signal source") \
+                    .props("dense outlined").style("min-width: 10rem")
+                lbl = ui.label().classes("text-cyan-300 mono text-sm")
+                board_ctrls.append(board)
+                core_ctrls.append(core)
+                chan_ctrls.append(chan)
+                dac_ctrls.append(dac)
+                return lbl
+
+            with ui.card().classes("tile w-full rounded-xl p-3 gap-2"):
+                with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                    ui.label("chip · pinout").classes("card-title")
+                    chip_pin_lbl = selection_row("chip")
+                chip_html = ui.html("").classes("w-full").style("max-width: 1100px; margin: 0 auto")
+                ui.label("Cyan = the selected channel, dim cyan = the other inputs of that core, "
+                         "violet = DAC outputs, red = supply, grey = ground. Hover a pin for all "
+                         "its functions. Pin tables: data sheet DS70005591D, Table 11 for the "
+                         "TQFP-128 and Table 5 for the Nano's 64-pin part.").classes("text-xs text-slate-400")
+
+            # ---- the board: where that pin comes out on the kit ----------
+            with ui.card().classes("tile w-full rounded-xl p-3 gap-2"):
+                with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                    ui.label("board · where to wire it").classes("card-title")
+                    board_pin_lbl = selection_row("board")
+                board_html = ui.html("").classes("w-full").style("max-width: 1100px; margin: 0 auto")
+                board_note_lbl = ui.label().classes("text-xs text-slate-400")
+
+    # ---- console: the CLI traffic with the target (real or fake) ----
+    with ui.card().classes("tile w-full rounded-xl p-3 mx-4 mb-4"):
+        ui.label("console").classes("card-title")
+        console_log = ui.log(max_lines=1000).classes("w-full h-40").style(
+            "background: #0b1220; color: #a7f3d0; font-family: ui-monospace, Consolas, monospace; "
+            "font-size: 12px; white-space: pre;")
+
+    def push_log(line: str):
+        console_log.push(f"{time.strftime('%H:%M:%S')}  {line}")
+
+    # Board limits from the last hardware run (HARDWARE-LOG.md), shown as
+    # guidance only - the rate field does not enforce any of this.
+    def update_rate_hint():
+        try:
+            ksps = float(rate_in.value or 0)
+        except (TypeError, ValueError):
+            ksps = 0.0
+        if ksps <= 8000:
+            txt, cls = "the board ran clean to about 8 MSPS with the CPU processing", "text-cyan-300 mono"
+        elif ksps <= 10000:
+            txt, cls = "guidance: close to where the board showed occasional DMA overruns (~10 MSPS)", "text-amber-400 mono"
+        elif ksps <= 16000:
+            txt, cls = "guidance: occasional DMA overruns reported in this range (~10-16 MSPS)", "text-amber-400 mono"
+        elif ksps <= 20000:
+            txt, cls = "guidance: lost triggers reported from ~16 MSPS; the chain measured up to ~18-20 MSPS", "text-amber-400 mono"
+        else:
+            txt, cls = "guidance: above the ~18-20 MSPS the triggered chain has reached so far", "text-red-400 mono"
+        rate_hint_lbl.text = txt
+        rate_hint_lbl.classes(replace=cls)
+    rate_in.on_value_change(lambda e: update_rate_hint())
+    update_rate_hint()
+
+    # ---- tooltips ----------------------------------------------------
+    # Every control says what it is and what it changes on the board. The
+    # console command it maps to is named where there is one, so the page
+    # can be read next to cli.c and next to a terminal log.
+    TIPS = [
+        (port_sel, "Which console to talk to. 'fake' is the built-in stand-in: it answers the "
+                   "same commands and makes up a signal, so the page can be tried without a "
+                   "board. A COMx entry is the board's USB-UART at 115200 baud. 'remote' opens "
+                   "a bench_client tunnel (tools/remote.py) to a remote board instead - "
+                   "no flashing here, see the field next to it."),
+        (bench_client_in, "Path to bench_client.py (tools/remote.py), used "
+                          "only when 'port' above is 'remote'. Connect opens a tunnel through it "
+                          "and talks to the board over that; disconnect closes the tunnel. "
+                          "Programming the board is not done from here - "
+                          "bench_client.py's own 'flash' request does that."),
+        (conn_btn, "Open or close that port. Everything else on this page needs it: each control "
+                   "sends a console command and waits for the prompt before the next one."),
+        (conn_chip, "Connection state. It also shows the firmware's build line once connected, "
+                    "which carries the git revision it was built from."),
+        (save_btn, "Write every setting on this page back to the settings file named above."),
+        (save_as_btn, "Write the settings to a file you name, without changing which file the "
+                      "page started from."),
+        (setup_sel, "A ready-made setup: input, rate, DACs, signal generator and trigger in one "
+                    "choice - the DAC triangles read their own pin through a custom input, the "
+                    "generator setups play their table on DAC2 (or DAC1) into core 5. Applied at "
+                    "once, to the board too when connected; everything else stays. 'from a file "
+                    "...' reads a settings file you name (keys it lacks keep the standard)."),
+        (rate_in, "The chain's sample rate: 'stream on <ksps> ...' - the nearest 160 MHz / N "
+                  "(CLKGEN13) is what actually runs, and the frame's own 'ksps' (shown as 'actual "
+                  "rate' once a grab has come in) is what the charts use as fs. The label "
+                  "underneath is guidance from the last hardware run, not a limit."),
+        (input_mode_sel, "The chain's input. The test triangle is core 5 / PINSEL 3 (RA8) with "
+                         "the firmware's own DAC2 triangle started as the signal: 'stream on "
+                         "<ksps>'. Any other input leaves the DAC alone - switch a DAC on below "
+                         "if it should drive this pin - and sends 'stream on <ksps> <core> "
+                         "<pinsel> <samc>'."),
+        (core_sel, "ADC core (1..5), part of the chain's input when 'custom' is selected above - "
+                   "fixed at 5 for the test triangle. Also the core shown in the chip and board "
+                   "tiles below."),
+        (input_in, "PINSEL: the analog input of that core - fixed at 3 (RA8) for the test "
+                   "triangle. 6 is the internal 15/16 x VDD reference, 7 the internal UREF line. "
+                   "Only this core's package pins and those two are offered (the value snaps): "
+                   "since P11.4 the firmware's routing refuses a PINSEL the core cannot reach."),
+        (samc_in, "SAMC: how long the ADC samples before it converts, in steps of 2 x SAMC + 0.5 "
+                  "TAD. Part of 'stream on ... <samc>' for a custom input; fixed at 0 for the "
+                  "test triangle."),
+        (interval_in, "How often this page halts the chain for one grab, in milliseconds (plus "
+                      "however long the transfer itself takes at the current baud rate)."),
+        (sg_on_sel, "The signal generator (siggen.c): 'on' computes the table on the board "
+                    "(lib/wavegen, tab_wave_gen.py's formula) and plays it through DMA channel 1 "
+                    "into the chosen DAC, one entry per SCCP2 period - no CPU involved. A change "
+                    "goes to the board 0.8 s after the last one: every parameter as its own "
+                    "'siggen set' line (the console takes 63 characters), then 'siggen on'."),
+        (sg_dac_sel, "Which DAC plays the table: DAC1 drives RA1 (core 5 reads it as PINSEL 1), "
+                     "DAC2 drives RA8 (core 5 / PINSEL 3). DAC2 is also the test input's triangle - "
+                     "the board refuses the test input while the generator plays on DAC2 (use the "
+                     "loop preset: a custom input on RA8). A 'dac' command on the same DAC stops "
+                     "the generator."),
+        (sg_n_in, "Table size in entries (2..8192). The table plays cyclically: with 'snap' f0 "
+                  "is moved to a whole number of periods in it, so the wrap is seamless."),
+        (sg_play_in, "Play rate: entries per second (100 Hz..1 MHz). SCCP2 divides its 100 MHz "
+                     "clock by a whole number, so the actual rate the board reports can differ "
+                     "slightly; the DAC settles in 0.75-2 us per step, so above ~500 kHz the "
+                     "steps are not clean (Table 40-42)."),
+        (sg_f0_in, "Fundamental in Hz, below half the play rate."),
+        (sg_decay_in, "Envelope exp(-decay x t) over the table, 1/s: 0 = a steady tone, 1000 = "
+                      "tab_wave_gen.py's decaying pulse."),
+        (sg_amp_in, "Amplitude 0..1 of the range lo..hi the table is scaled to."),
+        (sg_lo_in, "Lowest table value (DAC code). The datasheet's range is 205..3890 (p1417, "
+                   "needs 'force' outside it); the board's DAC output did not follow below about "
+                   "code 780 (HARDWARE-LOG 29.09.2026), hence 800."),
+        (sg_hi_in, "Highest table value (DAC code)."),
+        (sg_snap_cb, "Move f0 to the nearest whole number of periods in the table (lib/wavegen's "
+                     "snap), so the table repeats without a jump."),
+        (sg_force_cb, "Let lo/hi outside the datasheet's 205..3890 through ('siggen on ... force')."),
+        (sg_loop_btn, "The loop: generator on DAC2 with a 1 kHz tone and a 3rd harmonic, and the "
+                      "chain on a custom input reading RA8 (core 5 / PINSEL 3). The time plot then "
+                      "draws the expected signal over the grab and the 'loop' chip says how well "
+                      "they match."),
+        (sg_apply_btn, "Send the card to the board now (it also goes by itself, 0.8 s after a change)."),
+        (sp_filter_sel, "The firmware's filter (src/core/sigproc.c, 'sigproc lp|hp|bp|off'): a "
+                        "4th-order Butterworth at fs/8 - low-pass, high-pass, or a band-pass one "
+                        "octave wide around fs/8. Every completed half is filtered in place and the "
+                        "grab shows the result; high- and band-pass are centred on mid-scale (2048). "
+                        "Follows the sample rate by itself. The triangle check is skipped while a "
+                        "filter is on. Off after every reset of the board."),
+        (sp_gz_cb, "A Goertzel detector in the firmware ('sigproc gz on|off'): the amplitude of a "
+                   "tone at exactly fs/16 in each half, measured on the input before the filter. "
+                   "Try the signal generator with f0 = fs/16."),
+        (sp_thr_in, "Detection threshold for the Goertzel, in LSB of the tone's amplitude "
+                    "('sigproc gz thr <lsb>')."),
+        (sp_gz_chip, "The Goertzel's result for the last half before the grab: the tone's amplitude, "
+                     "its share of the signal's power, detected or not."),
+        (trig_cb, "Trigger the time plot: show every grab from the point where the signal "
+                  "first crosses the level, so a periodic signal stands still. Display only - "
+                  "the stream, the FFT and the triangle verdict keep the whole half. The plot "
+                  "then shows half the grabbed window, and the crossing is searched only in the "
+                  "first half, so the window shown is always contiguous."),
+        (trig_level_in, "Trigger level in ADC counts (0..4095), drawn as a dashed line in the "
+                        "time plot."),
+        (trig_slope_sel, "Which edge fires: rising (from below the level to at/above it) or "
+                         "falling."),
+        (trig_hyst_in, "Hysteresis in LSB: the signal must first go this far beyond the level "
+                       "on the other side before a crossing counts - keeps ADC noise on a slow "
+                       "slope from firing early."),
+        (single_btn, "One grab: if the chain is not already streaming, start it first ('stream "
+                     "on'), take one 'stream grab', then stop it again ('stream off'). Disabled "
+                     "while LIVE is running - stop LIVE first."),
+        (live_btn, "Start the chain if it is not already running at this rate/input, then repeat "
+                   "'stream grab' at the interval above until stopped. A rate or input change "
+                   "while LIVE is running is picked up before the next grab. STOP sends 'stream "
+                   "off', which restores the boot configuration."),
+        (sig_in, "Frequency of the fake target's sine, in kHz - only used with --fake and a "
+                 "custom input. Only meaningful below half the sample rate - above that the FFT "
+                 "shows the alias, which is itself worth seeing."),
+        (amp_in, "Amplitude of the fake target's sine in ADC counts, peak. Full scale is 4096 "
+                 "counts, so 2048 is the largest undistorted swing around mid scale."),
+        (noise_in, "Gaussian noise the fake target adds, standard deviation in counts. This is "
+                   "what sets the SNR the evaluation row reports."),
+        (harm2_in, "Second harmonic the fake target adds, peak counts. Use it to see what the THD "
+                   "and H2 figures do with a known distortion."),
+        (harm3_in, "Third harmonic the fake target adds, peak counts."),
+        (buf_in, "Total size of the ping-pong buffer in samples; each half is half of it - and "
+                 "half of it is exactly what one 'stream grab' sends. Console: 'buf <n>'."),
+        (buf_btn, "Send the buffer size. A running stream is stopped for it (the firmware "
+                  "refuses 'buf' otherwise) and restarted with the new size at the next grab."),
+    ]
+    for _u, _c in sorted(dac_ui.items()):
+        _pin = "RA1" if _u == 1 else "RA8"
+        TIPS += [
+            (_c["on"], ("auto: with the test input, the firmware's own triangle, its slope "
+                        "chosen per rate. " if _u == 2 else "") +
+                       f"Switch DAC{_u} on or off. It drives pin {_pin} with a triangle in "
+                       "hardware, no CPU involved, and that pin is also an ADC input of core 5 - "
+                       "so the ADC can read it back with no wire. Applied automatically whenever "
+                       "the chain runs with a custom input, or directly with this button. "
+                       f"Console: 'dac {_u} on|off ...'."),
+            (_c["low"], "Lower end of the triangle, as a 12-bit DAC code. 0 is ground, 4095 is "
+                        "VDD, and the DAC's own limits keep the usable range a little inside that."),
+            (_c["high"], "Upper end of the triangle, as a 12-bit DAC code. Must be above the lower "
+                         "end. The difference is the swing the ADC should see."),
+            (_c["slp"], "SLPDAT: how many DAC codes the slope generator steps per DAC clock. "
+                        "Larger is faster, so the period shown below shrinks."),
+            (_c["force"], "Ticked: the board takes low, high and SLPDAT exactly as typed (any "
+                          "0..4095, SLPDAT 0..65535, even high <= low) - 'dac ... force'. Unticked: "
+                          "the datasheet's limits apply (low >= 0xCD + SLPDAT, high <= 0xF32 - "
+                          "SLPDAT, p1422) and the board refuses anything outside them."),
+            (_c["btn"], f"Send these settings to DAC{_u} right now. The line underneath is the "
+                        "board's own answer, including the period it computed."),
+        ]
+    for _sel in board_ctrls:
+        TIPS.append((_sel, "Which evaluation kit is in front of you. It picks the device and so "
+                           "the package drawn above, and it decides where a channel comes out: "
+                           "the EV74H48A has mikroBUS and XPLAINED PRO headers, the Nano two rows "
+                           "of edge pads."))
+    for _sel in core_ctrls:
+        TIPS.append((_sel, "ADC core, the same selection as in the acquisition card. Changing it "
+                           "here changes it everywhere and redraws both tiles."))
+    for _sel in chan_ctrls:
+        TIPS.append((_sel, "Analog input of that core, with the pin it sits on. Internal inputs "
+                           "are marked as such: they have no pin and cannot be wired to."))
+    for _sel in dac_ctrls:
+        TIPS.append((_sel, "Which DAC to show as the signal source. The drawings then light its "
+                           "pin, and say whether it reaches the selected channel by itself or "
+                           "what to wire to what."))
+    for _el, _text in TIPS:
+        _el.tooltip(_text)
+
+    # ---- settings: the whole page in one dict, and back ----
+    def settings_collect():
+        return {
+            "version": SETTINGS_VERSION,
+            "board": ui_state["board"],
+            "connection": {"port": port_sel.value or ""},
+            "view": {"dac_source": int(ui_state["dac_custom"] if ui_state["mode"] == "test"
+                                        else ui_state["dac"]),
+                     "tooltips": bool(tips_cb.value),
+                     "vref": float(vref_in.value or 3.3),
+                     "collapsed": sorted(ui_state["collapsed"])},
+            "acquisition": {
+                "mode": input_mode_sel.value or "test",
+                "ksps": int(rate_in.value or 8000),
+                "core": custom_input()[0], "pinsel": custom_input()[1],
+                "samc": custom_input()[2],
+                "interval_ms": int(interval_in.value or 500),
+            },
+            "siggen": {"on": bool(sg_on_sel.value), "dac": int(sg_dac_sel.value or 2),
+                       "n": int(sg_n_in.value or 5000), "play_hz": int(sg_play_in.value or 500000),
+                       "f0": float(sg_f0_in.value or 0.0),
+                       "h": [float(sg_h_in[k].value or 0.0) for k in range(2, 8)],
+                       "decay": float(sg_decay_in.value or 0.0), "amp": float(sg_amp_in.value or 0.0),
+                       "lo": int(sg_lo_in.value or 0), "hi": int(sg_hi_in.value or 0),
+                       "snap": bool(sg_snap_cb.value), "force": bool(sg_force_cb.value)},
+            "trigger": {"on": bool(trig_cb.value), "level": int(trig_level_in.value or 0),
+                        "slope": trig_slope_sel.value or RISING,
+                        "hyst": int(trig_hyst_in.value or 0)},
+            "sigproc": {"filter": sp_filter_sel.value or "off", "gz": bool(sp_gz_cb.value),
+                        "thr": int(sp_thr_in.value or 100),
+                        **(app_card.settings() if app_card else {})},
+            "buffer": {"size": int(buf_in.value or 2 * BUF_HALF_MAX)},
+            "dac": {str(u): {"on": dac_mode(u) if dac_mode(u) == "auto" else dac_mode(u) == "on",
+                             "low": int(c["low"].value or 0),
+                             "high": int(c["high"].value or 0), "slpdat": int(c["slp"].value or 0),
+                             "force": bool(c["force"].value)}
+                    for u, c in dac_ui.items()},
+            "fake": {"source": fake_src_sel.value or "dac2",
+                     "signal_khz": float(sig_in.value or 0.0),
+                     "amplitude": float(amp_in.value or 0.0), "noise": float(noise_in.value or 0.0),
+                     "harmonic2": float(harm2_in.value or 0.0),
+                     "harmonic3": float(harm3_in.value or 0.0)},
+        }
+
+    def settings_apply(cfg):
+        """Write a settings dict onto the controls. Anything out of range
+        for the current build is skipped rather than forced. Keys from an
+        older settings file (pll/sweep/capture/chain, before 25.09.2026)
+        are simply not read."""
+        if cfg.get("board") in BOARDS:
+            ui_state["board"] = cfg["board"]
+        ui_state["dac"] = int(cfg.get("view", {}).get("dac_source", 0))
+        ui_state["dac_custom"] = ui_state["dac"]
+        tips_cb.value = bool(cfg.get("view", {}).get("tooltips", True))
+        vref_in.value = float(cfg.get("view", {}).get("vref", 3.3))
+        ui_state["collapsed"] = set(cfg.get("view", {}).get("collapsed", []))
+        apply_collapsed()
+        port = cfg.get("connection", {}).get("port", "")
+        if port and not args.port and not args.fake and port in (port_sel.options or []):
+            port_sel.value = port
+        set_tooltips(bool(tips_cb.value))
+        acq = cfg.get("acquisition", {})
+        ui_state["mode"] = "custom"               # so that on_mode_change() below starts clean
+        # the mode first: setting it can run on_mode_change() at once, which
+        # keeps the fields as they are then - the file's input comes after
+        input_mode_sel.value = acq.get("mode") if acq.get("mode") in ("test", "custom") else "test"
+        ui_state["custom"] = (int(acq.get("core", 3)), int(acq.get("pinsel", 5)), int(acq.get("samc", 0)))
+        rate_in.value = int(acq.get("ksps", 8000))
+        core_sel.value, input_in.value, samc_in.value = ui_state["custom"]
+        interval_in.value = int(acq.get("interval_ms", 500))
+        sgc = cfg.get("siggen", {})
+        sg_on_sel.value = bool(sgc.get("on", False))
+        sg_dac_sel.value = int(sgc.get("dac", 2)) if int(sgc.get("dac", 2)) in (1, 2) else 2
+        sg_n_in.value = int(sgc.get("n", 5000))
+        sg_play_in.value = int(sgc.get("play_hz", 500000))
+        sg_f0_in.value = float(sgc.get("f0", 10000.0))
+        for _k, _v in zip(range(2, 8), (list(sgc.get("h", [])) + [0.0] * 6)[:6]):
+            sg_h_in[_k].value = float(_v)
+        sg_decay_in.value = float(sgc.get("decay", 1000.0))
+        sg_amp_in.value = float(sgc.get("amp", 1.0))
+        sg_lo_in.value = int(sgc.get("lo", 800))
+        sg_hi_in.value = int(sgc.get("hi", 3500))
+        sg_snap_cb.value = bool(sgc.get("snap", True))
+        sg_force_cb.value = bool(sgc.get("force", True))
+        trg = cfg.get("trigger", {})
+        trig_cb.value = bool(trg.get("on", False))
+        trig_level_in.value = int(trg.get("level", 2048))
+        trig_slope_sel.value = trg.get("slope") if trg.get("slope") in (RISING, FALLING) else RISING
+        trig_hyst_in.value = int(trg.get("hyst", 16))
+        spc = cfg.get("sigproc", {})
+        sp_filter_sel.value = spc.get("filter") if spc.get("filter") in SP_FILTERS else "off"
+        sp_gz_cb.value = bool(spc.get("gz", False))
+        sp_thr_in.value = int(spc.get("thr", 100))
+        if app_card:
+            app_card.load(spc)
+        buf_in.value = int(cfg.get("buffer", {}).get("size", 2 * BUF_HALF_MAX))
+        for unit, c in dac_ui.items():
+            d = cfg.get("dac", {}).get(str(unit), {})
+            on = d.get("on", "auto" if unit == 2 else False)
+            c["on"].value = "auto" if (on == "auto" and unit == 2) else bool(on is True)
+            c["low"].value = int(d.get("low", 0x100))
+            c["high"].value = int(d.get("high", 0xF00))
+            c["slp"].value = int(d.get("slpdat", 8))
+            c["force"].value = bool(d.get("force", True))
+        fake = cfg.get("fake", {})
+        fake_src_sel.value = fake.get("source", "dac2") if fake.get("source") in ("sine", "dac1", "dac2") \
+            else "dac2"
+        sig_in.value = float(fake.get("signal_khz", 100.0))
+        amp_in.value = float(fake.get("amplitude", 1500.0))
+        noise_in.value = float(fake.get("noise", 6.0))
+        harm2_in.value = float(fake.get("harmonic2", 150.0))
+        harm3_in.value = float(fake.get("harmonic3", 0.0))
+        update_dac_freq_label()
+        update_rate_hint()
+        on_mode_change()
+
+    # Folded tiles: the page's click handler reports each fold (event
+    # "tile_fold", title and state); the set lives here and in the settings
+    # file, and apply_collapsed() puts it back onto the page.
+    def on_tile_fold(e):
+        title, folded = e.args.get("title", ""), bool(e.args.get("folded"))
+        (ui_state["collapsed"].add if folded else ui_state["collapsed"].discard)(title)
+        # kept at once, without "save" - only this one key is written
+        settings_write_key(state["settings_path"], "view", "collapsed", sorted(ui_state["collapsed"]))
+    ui.on("tile_fold", on_tile_fold)
+
+    def collapsed_js():
+        return ("window.adcApplyCollapsed && window.adcApplyCollapsed(" +
+                json.dumps(sorted(ui_state["collapsed"])) + ")")
+
+    def apply_collapsed():
+        """Onto every page that is connected now. At start-up none is -
+        app.on_connect below then puts the state onto each page that opens.
+        (A run_javascript without a connected page leaves an un-awaited
+        response behind, a RuntimeWarning.)"""
+        for client in list(app.clients()):
+            if client.has_socket_connection:
+                client.run_javascript(collapsed_js())
+
+    app.on_connect(lambda client: client.run_javascript(collapsed_js()))
+
+    def show_settings_path():
+        settings_path_lbl.text = state["settings_path"]
+
+    def do_save(path=None):
+        path = path or state["settings_path"]
+        settings_msg_lbl.text = settings_write(path, settings_collect())
+        state["settings_path"] = path
+        show_settings_path()
+
+    def do_load(path):
+        cfg, msg = settings_read(path)
+        settings_apply(cfg)
+        state["settings_path"] = path
+        settings_msg_lbl.text = msg
+        show_settings_path()
+
+    def ask_path(title, action, button):
+        with ui.dialog() as dlg, ui.card().classes("rounded-xl p-4 gap-3").style("min-width: 28rem"):
+            ui.label(title).classes("card-title")
+            field = ui.input("file", value=state["settings_path"]).props("dense outlined").classes("w-full")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("cancel", on_click=dlg.close).props("flat")
+
+                def go():
+                    dlg.close()
+                    action(field.value.strip())
+                ui.button(button, on_click=go).props("unelevated")
+        dlg.open()
+
+    save_btn.on_click(lambda e: do_save())
+    save_as_btn.on_click(lambda e: ask_path("save settings as", do_save, "save"))
+
+    async def do_setup(e):
+        """The setup list: a ready-made setup laid over the page, or a file."""
+        key = e.value
+        if key is None:
+            return
+        if key == SETUP_FROM_FILE:
+            setup_sel.set_value(None)
+            ask_path("load settings from", do_load, "load")
+            return
+        name, overlay = SETUPS[key]
+        settings_apply(settings_merge(settings_collect(), overlay))
+        # settings_apply() set off the cards' own debounced senders; one
+        # ordered sequence instead: stream off, generator, DACs, a grab
+        for pend in list(dac_pending.values()) + list(sg_pending.values()):
+            if pend and not pend.done():
+                pend.cancel()
+        settings_msg_lbl.text = f"setup: {name}"
+        if not state["target"]:
+            return
+        while state["busy"]:
+            await asyncio.sleep(0.05)
+        await stop_stream()
+        await apply_siggen()
+        for u in sorted(dac_ui):
+            if dac_mode(u) == "off":
+                await send_dac(u)
+        await apply_sigproc()              # every setup names it (02.10.2026)
+        if not state["live"]:              # LIVE starts the new chain itself
+            await do_single()
+
+    def do_standard():
+        """Every value back to adc_gui_defaults.json - the file path stays,
+        so a following "save" makes the standard the user's own state."""
+        cfg, msg = settings_standard()
+        settings_apply(cfg)
+        settings_msg_lbl.text = msg + " applied - 'save' keeps it"
+    std_btn.on_click(lambda e: do_standard())
+
+    # ---- the input mode: test (the DAC loopback, fixed) or custom ----
+    def custom_input():
+        """The user's own input: the fields while custom is chosen, the
+        kept copy while the fields show the loopback."""
+        if ui_state["mode"] == "custom" or ui_state["custom"] is None:
+            return (int(core_sel.value), int(input_in.value or 0), int(samc_in.value or 0))
+        return ui_state["custom"]
+
+    def on_mode_change(e=None):
+        is_test = input_mode_sel.value == "test"
+        if is_test:
+            if ui_state["mode"] == "custom":          # leaving custom: keep it
+                ui_state["custom"] = (int(core_sel.value), int(input_in.value or 0),
+                                      int(samc_in.value or 0))
+                ui_state["dac_custom"] = int(ui_state["dac"])
+            core_sel.value = LOOPBACK["core"]
+            input_in.value = LOOPBACK["pinsel"]
+            samc_in.value = LOOPBACK["samc"]
+            ui_state["dac"] = LOOPBACK["dac"]
+        elif ui_state["mode"] == "test":               # back to custom: restore it
+            if ui_state["custom"] is not None:
+                core_sel.value, input_in.value, samc_in.value = ui_state["custom"]
+            ui_state["dac"] = int(ui_state["dac_custom"])
+        if ui_state["mode"] != ("test" if is_test else "custom"):
+            fake_src_sel.value = "dac2" if is_test else "sine"
+        ui_state["mode"] = "test" if is_test else "custom"
+        for el in [core_sel, input_in, samc_in] + core_ctrls + chan_ctrls + dac_ctrls:
+            el.set_enabled(not is_test)
+        for _c in dac_ui.values():
+            _c["note"].set_visibility(is_test)
+        refresh_channel()
+    input_mode_sel.on_value_change(on_mode_change)
+
+    # One selection - eval kit, ADC core, channel - shown by the sidebar
+    # and by both tiles. Any of them may change it; refresh_channel() writes
+    # it back to all of them and redraws, with a flag so the writes do not
+    # bounce back through the handlers they trigger.
+    def channel_options(board_key, core):
+        pkg = package_of(board_key)
+        opts = {}
+        for ps in pkg.channels(core):
+            if ps in INTERNAL_INPUTS:
+                opts[ps] = f"AN{ps} · internal"
+            else:
+                opts[ps] = f"AN{ps} · {pkg.adc_pin[(core, ps)].port}"
+        return opts
+
+    def refresh_channel():
+        if ui_state["sync"]:
+            return
+        ui_state["sync"] = True
+        try:
+            board_key = ui_state["board"]
+            core = int(core_sel.value)
+            pinsel = int(input_in.value if input_in.value is not None else 0)
+            chans = package_of(board_key).channels(core)
+            if pinsel not in chans:                  # not on this package
+                pinsel = chans[0]
+                input_in.value = pinsel
+            opts = channel_options(board_key, core)
+            for sel in board_ctrls:
+                sel.value = board_key
+            for sel in core_ctrls:
+                sel.value = core
+            for sel in chan_ctrls:
+                sel.set_options(opts, value=pinsel)
+            unit = int(ui_state["dac"])
+            dac_on = dac_mode(unit) == "on" if unit in dac_ui else False
+            if ui_state["mode"] == "test":         # 'stream on <ksps>' starts DAC2 itself
+                unit, dac_on = LOOPBACK["dac"], dac_mode(LOOPBACK["dac"]) != "off"
+            for sel in dac_ctrls:
+                sel.value = unit
+            info = channel_pin_info(board_key, core, pinsel)
+            channel_info_lbl.text = info
+            chip_html.content = chip_svg(board_key, core, pinsel, True, unit, dac_on)
+            board_html.content = board_svg(board_key, core, pinsel, unit, dac_on)
+            site = channel_site(board_key, core, pinsel)
+            chip_pin_lbl.text = site[2] or site[1]
+            needed, head, _sub = wire_hint(board_key, core, pinsel, unit)
+            board_pin_lbl.text = site[1] + (f"   |   {head}" if head else "")
+            board_note_lbl.text = (
+                "Cyan = where the channel comes out. Grey pads carry another signal, dark pads are "
+                "power, ground or not on the device. Hover a pad for its device pin. Sources: DIM "
+                "information sheet DS70005563A for the EV74H48A, Curiosity Nano user guide "
+                "DS70005634A for the EV17P63A.")
+        except Exception as exc:                      # never take the page down
+            channel_info_lbl.text = f"pin lookup failed: {exc}"
+        finally:
+            ui_state["sync"] = False
+
+    def on_board_change(e):
+        if ui_state["sync"]:
+            return
+        ui_state["board"] = e.value
+        board = BOARDS[e.value]
+        pkg = package_of(e.value)
+        core, pinsel = int(core_sel.value), int(input_in.value or 0)
+        if (core, pinsel) not in pkg.adc_pin and pinsel not in INTERNAL_INPUTS:
+            core_sel.value = board["default_core"]
+            input_in.value = board["default_pinsel"]
+        refresh_channel()
+
+    for sel in board_ctrls:
+        sel.on_value_change(on_board_change)
+    for sel in core_ctrls:
+        sel.on_value_change(lambda e: (setattr(core_sel, "value", int(e.value)), refresh_channel()))
+    for sel in chan_ctrls:
+        sel.on_value_change(lambda e: (setattr(input_in, "value", int(e.value)), refresh_channel())
+                            if e.value is not None else None)
+
+    def on_dac_pick(e):
+        if ui_state["sync"] or e.value is None:
+            return
+        ui_state["dac"] = int(e.value)
+        refresh_channel()
+
+    for sel in dac_ctrls:
+        sel.on_value_change(on_dac_pick)
+    for _u, _c in dac_ui.items():
+        _c["on"].on_value_change(lambda e: refresh_channel())
+    core_sel.on_value_change(lambda e: refresh_channel())
+    input_in.on_value_change(lambda e: refresh_channel())
+    refresh_channel()
+
+    # The time chart's tooltip: time on top, "counts  (dot)  volts" in the
+    # middle, the sample number below. Built as a JS function (NiceGUI turns
+    # a ':'-prefixed key into one) with the current time step and reference
+    # voltage baked in; rebuilt whenever either changes.
+    time_axis = {"per_sample": 1e6 / 8e6, "unit": "µs"}
+
+    def update_time_tooltip():
+        vref = float(vref_in.value or 3.3)
+        per, unit = time_axis["per_sample"], time_axis["unit"]
+        time_chart.options["yAxis"][1]["max"] = vref
+        time_chart.options["tooltip"][":formatter"] = (
+            "p => { const s = p[0].data[0], c = p[0].data[1];"
+            f" return (s * {per!r}).toFixed(3) + ' {unit}<br/>'"
+            " + '<b>' + c + '</b>&nbsp; ' + p[0].marker + ' '"
+            f" + (c * {vref!r} / 4096).toFixed(3) + ' V<br/>'"
+            " + '<span style=\"color:#94a3b8\">sample ' + (+s.toFixed(2)) + '</span>'; }")
+        time_chart.update()
+    vref_in.on_value_change(lambda e: update_time_tooltip())
+    update_time_tooltip()
+
+    def update_dac_freq_label():
+        """The triangle's period from low/high/slpdat, for every DAC card."""
+        for c in dac_ui.values():
+            try:
+                low = int(c["low"].value or 0)
+                high = int(c["high"].value or 0)
+                slp = int(c["slp"].value or 0)
+                period_ns = dac_period_ns_of(low, high, slp)
+                c["freq"].text = (f"period {period_ns/1e3:.2f} µs  ({1e9/period_ns/1e3:.2f} kHz)"
+                                  if period_ns > 0 else "invalid: need high > low and slpdat > 0")
+            except Exception:
+                c["freq"].text = ""
+    for _c in dac_ui.values():
+        for _k in ("low", "high", "slp"):
+            _c[_k].on_value_change(lambda e: update_dac_freq_label())
+    update_dac_freq_label()
+
+    # The file has the last word over the built-in defaults above.
+    state["settings_path"] = args.settings
+    _cfg, _msg = settings_read(args.settings)
+    settings_apply(_cfg)
+    settings_msg_lbl.text = _msg
+    show_settings_path()
+
+    def set_chip(name, value):
+        c = chips[name]
+        c.text = f"{name} {value}"
+        c.props(f'color={"positive" if value == 0 else "negative"}')
+
+    # ---- connection ----
+    async def do_connect():
+        # async, and every call that can wait (bench_client subprocesses,
+        # the tunnel, a board's sync) through run.io_bound(): a blocking
+        # connect stalled NiceGUI's event loop long enough for the browser
+        # to show "Connection lost. Trying to reconnect..." (28.09.2026).
+        if state["target"]:
+            t = state["target"]
+            push_log(f"--- disconnected: {t.port} ---")
+            state["live"] = False
+            live_btn.text, live_btn.icon = "live", "play_arrow"
+            single_btn.enable()
+            # Closing the port under a grab still reading it in its io_bound
+            # thread gave "cycle failed: ClearCommError failed (OSError 9,
+            # handle is invalid)" (29.09.2026). So: wait for that cycle to
+            # finish, take the port lock, stop the board's stream (it would
+            # keep running otherwise), and only then close.
+            for _ in range(100):                   # up to 10 s; a grab takes < 2 s
+                if not state["busy"]:
+                    break
+                await asyncio.sleep(0.1)
+            async with port_lock:
+                if state["acq_active"] is not None:
+                    try:
+                        await run.io_bound(t.cmd, "stream off")
+                    except Exception as ex:
+                        push_log(f"--- stream off on disconnect failed: {ex} ---")
+                state["target"] = None
+                await run.io_bound(t.close)
+            if state["remote_bench"]:
+                push_log("--- closing the remote tunnel ---")
+                state["remote_bench"].close_tunnel()
+                state["remote_bench"] = None
+            state["acq_active"] = None
+            conn_btn.text, conn_btn.icon = "connect", "usb"
+            conn_chip.text, conn_chip.icon = "not connected", "link_off"
+            conn_chip.props("color=grey-8")
+            buf_lbl.text = "buf: not queried yet"
+            return
+        try:
+            remote_row.set_visibility(port_sel.value == "remote")
+            if port_sel.value == "fake":
+                push_log("--- connecting: fake target ---")
+                state["target"] = FakeTarget(board=args.fake_board,
+                                             signal_khz=float(sig_in.value or 100.0),
+                                             amplitude=float(amp_in.value or 1500.0),
+                                             noise_std=float(noise_in.value or 6.0),
+                                             harm2_amp=float(harm2_in.value or 150.0),
+                                             harm3_amp=float(harm3_in.value or 0.0),
+                                             on_log=push_log)
+            elif port_sel.value == "remote":
+                push_log(f"--- connecting: remote via {bench_client_in.value} ---")
+                bench = remote.RemoteBench(bench_client=bench_client_in.value)
+                state["remote_bench"] = bench
+                reset_steps()
+                remote_row.set_visibility(True)
+                conn_chip.text, conn_chip.icon = "remote: checking relay, agent, port ...", "hourglass_top"
+                conn_chip.props("color=grey-8")
+                steps = await run.io_bound(bench.check, 10.0)
+                for st in steps:
+                    show_step(st)
+                    if st["ok"] is not None:
+                        push_log(f"--- {st['name']}: {'ok' if st['ok'] else 'FAILED'} - {st['detail']} ---")
+                failed = next((st for st in steps if st["ok"] is False), None)
+                if failed:
+                    raise RuntimeError(f"{failed['name']}: {failed['detail']}")
+                conn_chip.text = "remote: tunnel open, waiting for the board ..."
+                step, t = await run.io_bound(bench.check_board, 8.0, push_log)
+                show_step(step)
+                push_log(f"--- board: {'ok' if step['ok'] else 'FAILED'} - {step['detail']} ---")
+                if t is None:
+                    raise RuntimeError(f"board: {step['detail']}")
+                state["target"] = t
+            else:
+                push_log(f"--- connecting: {port_sel.value} ---")
+                state["target"] = await run.io_bound(Target, port_sel.value, on_log=push_log)
+            ok, lines = state["target"].cmd("version")
+            state["acq_active"] = None
+            # The firmware names its board: follow it, and start from that
+            # board's default measurement input when it is a different one.
+            found = detect_board(lines) if ok else None
+            if found and found != ui_state["board"]:
+                # A different board: start from the DAC loopback, which works
+                # on both with no wire, and keep the board's own measurement
+                # input as the custom one (Nano: core 1 / PINSEL 0 = RA2).
+                push_log(f"--- board detected: {found} - profile switched, input set to the "
+                         f"DAC2 loopback (core 5, AN3 = RA8) ---")
+                ui_state["board"] = found
+                input_mode_sel.value = "test"
+                ui_state["custom"] = (BOARDS[found]["default_core"],
+                                      BOARDS[found]["default_pinsel"], 0)
+                ui_state["dac_custom"] = 0
+                if ui_state["mode"] != "test":
+                    on_mode_change()
+                refresh_channel()
+            conn_chip.text = (lines[0] if ok and lines else f"{port_sel.value}: connected")
+            if found:
+                conn_chip.text += f"   ·   {found}"
+            # Round trip to the board right after connecting (Target.ping():
+            # empty line out, prompt + ACK back) - over "remote" that is host
+            # -> relay -> agent -> COM port and back. FakeTarget has no ping.
+            if hasattr(state["target"], "ping"):
+                try:
+                    rtt = state["target"].ping(n=3)
+                    conn_chip.text += f"   ·   RTT {rtt['avg_ms']:.0f} ms"
+                    push_log(f"--- round trip to the board: {format_rtt(rtt)} ---")
+                except TimeoutError:
+                    conn_chip.text += "   ·   RTT: no reply"
+            conn_chip.icon = "link"
+            conn_chip.props("color=positive")
+            conn_btn.text, conn_btn.icon = "disconnect", "usb_off"
+            state["buf_size"] = query_buf(state["target"])
+            # the field's limit is the board's, not this tool's: an older
+            # image takes at most 1024 per half
+            state["buf_half_max"] = query_buf_max(state["target"])
+            buf_in.max = 2 * state["buf_half_max"]
+            buf_in.label = f"buffer size, total (32..{2 * state['buf_half_max']}, 'buf' = half of it)"
+            buf_in.value = state["buf_size"]
+            buf_lbl.text = f"buf: {state['buf_size']} (half {state['buf_size'] // 2})"
+            await apply_sigproc()
+        except Exception as ex:
+            push_log(f"--- connect failed: {ex} ---")
+            ui.notify(f"connect failed - {ex}", type="negative", multi_line=True, timeout=12000)
+            conn_chip.text = f"connect failed: {ex}"
+            conn_chip.icon = "error"
+            conn_chip.props("color=negative")
+            state["target"] = None
+            if state["remote_bench"]:
+                state["remote_bench"].close_tunnel()
+                state["remote_bench"] = None
+    conn_btn.on_click(do_connect)
+
+    async def send_dac(unit):
+        """cli.c: dac <1|2> <on|off> [low] [high] [slpdat] - the card's
+        values to the board, under the port lock (LIVE may be grabbing).
+        A DAC2 sent while the test input streams replaces the firmware's
+        triangle on RA8; state["test_dac2"] keeps what was sent, so the
+        triangle card's slope model uses it instead of the frame's slp
+        (which still reports triangle_for()'s choice)."""
+        c = dac_ui[unit]
+        t = state["target"]
+        if not t:
+            c["msg"].text = "not connected"
+            return False
+        # The signal generator plays on this DAC: any "dac" command would
+        # stop it (cli.c: siggen_release_dac()). 'off'/'auto' leave it alone;
+        # only switching the card to 'on' replaces it with the triangle, and
+        # the generator card then says so.
+        sg = state.get("siggen")
+        if sg and sg["dac"] == unit:
+            if dac_mode(unit) != "on":
+                c["msg"].text = f"dac{unit}: the signal generator plays on it - not touched"
+                return True
+            state["siggen"] = None
+            sg_msg.text = f"off - dac{unit}'s triangle replaced it"
+            sg_on_sel.set_value(False)
+        if dac_mode(unit) != "on":            # 'auto' outside the test input = off
+            cmd = f"dac {unit} off"
+        else:
+            low, high = int(c["low"].value or 0), int(c["high"].value or 0)
+            slp = int(c["slp"].value or 0)
+            cmd = f"dac {unit} on {low} {high} {slp}" + (" force" if c["force"].value else "")
+        async with port_lock:
+            ok, lines = await port_cmd(t, cmd)
+        if ok and unit == 2 and (state["acq_active"] or {}).get("mode") == "test":
+            state["test_dac2"] = (low, high, slp) if dac_mode(2) == "on" else "off"
+        c["msg"].text = "   ".join(lines) if lines else (f"dac{unit} applied" if ok else f"dac{unit} refused")
+        return ok
+
+    async def apply_dac(unit):
+        """The card's apply button. With the test input, DAC2 'on' and
+        'off' are sent (and resent after every 'stream on'); 'auto'
+        restarts the stream, and 'stream on' brings the firmware's own
+        triangle back. Without LIVE, one grab shows the result."""
+        c = dac_ui[unit]
+        if not state["target"]:
+            c["msg"].text = "not connected"
+            return
+        if unit == 2 and (input_mode_sel.value or "test") == "test":
+            if dac_mode(2) != "auto":
+                running = state["acq_active"] == current_acq_cfg()
+                if not await ensure_streaming():   # a new 'stream on' sends DAC2 itself
+                    return
+                if running:
+                    await send_dac(2)
+            else:
+                state["test_dac2"] = None
+                state["acq_active"] = None          # next cycle: 'stream on' again
+                c["msg"].text = "dac2: the firmware's own test triangle again (stream restarted)"
+        else:
+            await send_dac(unit)
+        refresh_channel()
+        if not state["live"]:
+            await do_single()
+    for _u in sorted(dac_ui):
+        dac_ui[_u]["btn"].on_click(lambda e, u=_u: apply_dac(u))
+
+    # A change in a DAC card goes to the board by itself, 0.8 s after the
+    # last one (typing "1000" is four changes, and "1" alone would be
+    # refused as high <= low); the apply button stays for a resend.
+    dac_pending = {}
+
+    def dac_changed(unit):
+        if not state["target"]:
+            return
+        old = dac_pending.get(unit)
+        if old and not old.done():
+            old.cancel()
+
+        async def later():
+            await asyncio.sleep(0.8)
+            # past the wait: off the pending list, so a later change cannot
+            # cancel it halfway through its commands (it queues behind it)
+            dac_pending.pop(unit, None)
+            await apply_dac(unit)
+        dac_pending[unit] = asyncio.ensure_future(later())
+    for _u in sorted(dac_ui):
+        for _k in ("on", "low", "high", "slp", "force"):
+            dac_ui[_u][_k].on_value_change(lambda e, u=_u: dac_changed(u))
+
+    async def apply_active_dacs():
+        """Every DAC switched on in its card, sent to the board - what a
+        custom (non-test) input needs, since 'stream on <ksps> <core>
+        <pinsel> <samc>' leaves the DAC alone on purpose (chaintest.c)."""
+        for u in sorted(dac_ui):
+            sg = state.get("siggen")
+            if dac_mode(u) == "on" and not (sg and sg["dac"] == u):   # the generator keeps its DAC
+                await send_dac(u)
+
+    # ---- the signal generator card (SG.6) ----
+    state["siggen"] = None          # dict(dac, n, play, f0_used, table) while it plays
+
+    def sg_params():
+        return dict(on=bool(sg_on_sel.value), dac=int(sg_dac_sel.value or 2),
+                    n=int(sg_n_in.value or 5000), play=int(sg_play_in.value or 500000),
+                    f0=float(sg_f0_in.value or 0.0),
+                    h={k: float(sg_h_in[k].value or 0.0) for k in range(2, 8)},
+                    decay=float(sg_decay_in.value or 0.0), amp=float(sg_amp_in.value or 0.0),
+                    lo=int(sg_lo_in.value or 0), hi=int(sg_hi_in.value or 0),
+                    snap=bool(sg_snap_cb.value), force=bool(sg_force_cb.value))
+
+    def sg_preview_update():
+        """The table as the firmware computes it - with the rate and f0 it
+        reported when it plays, otherwise with SCCP2's rate and the snap the
+        card asks for."""
+        p = sg_params()
+        sg = state["siggen"]
+        try:
+            if sg:
+                table = sg["table"]
+            else:
+                real = wavegen_model.sccp2_rate(max(100, p["play"]))
+                f0 = wavegen_model.snap_hz(p["f0"], p["n"], real) if p["snap"] else p["f0"]
+                table = wavegen_model.wavegen(p["n"], real, f0, [p["h"][k] for k in range(2, 8)],
+                                              p["decay"], p["amp"], p["lo"], p["hi"])
+        except (ZeroDivisionError, ValueError):
+            table = []
+        step = max(1, len(table) // 1500)             # at most ~1500 points drawn
+        sg_preview.options["series"][0]["data"] = [[i, v] for i, v in enumerate(table)][::step]
+        sg_preview.options["xAxis"]["max"] = max(1, len(table))
+        sg_preview.update()
+
+    async def apply_siggen():
+        t = state["target"]
+        if not t:
+            sg_msg.text = "not connected"
+            return
+        p = sg_params()
+        lines, too_long = siggen_plan(p)
+        if too_long:
+            sg_msg.text = (f"not sent: '{too_long[:40]}...' is {len(too_long)} characters, "
+                           f"the console takes {CMD_LINE_MAX}")
+            ui.notify(sg_msg.text, type="negative")
+            return
+        reply, ok = [], True
+        # The test input runs its own triangle on DAC2, and the board refuses
+        # the generator on DAC2 while it does (routing: ROUTE_ERR_DAC_BUSY) -
+        # stop that stream first; the next cycle starts the chain again with
+        # whatever input the acquisition card says.
+        if p["on"] and p["dac"] == 2 and (state["acq_active"] or {}).get("mode") == "test":
+            while state["busy"]:
+                await asyncio.sleep(0.05)
+            async with port_lock:
+                await run.io_bound(t.cmd, "stream off")
+            state["acq_active"] = None
+        async with port_lock:
+            for x in lines:
+                ok, reply = await port_cmd(t, x)
+                if not ok:
+                    break
+        if not ok:
+            state["siggen"] = None
+            sg_msg.text = f"'{x}' refused: " + "  ".join(reply)
+        elif p["on"]:
+            st = parse_kv(reply)
+            play = int(st.get("play_hz_actual", "0") or 0)
+            f0u = float(st.get("f0_used", "0") or 0)
+            table = wavegen_model.wavegen(p["n"], play, f0u, [p["h"][k] for k in range(2, 8)],
+                                          p["decay"], p["amp"], p["lo"], p["hi"])
+            state["siggen"] = dict(dac=p["dac"], n=p["n"], play=play, f0_used=f0u, table=table)
+            sg_msg.text = (f"on: DAC{p['dac']}, {p['n']} entries at {play} Hz actual, f0 {f0u:g} Hz, "
+                           f"table {st.get('table_min')}..{st.get('table_max')}, "
+                           f"{st.get('transfers_per_s')} transfers/s")
+        else:
+            state["siggen"] = None
+            sg_msg.text = "off"
+        sg_preview_update()
+        refresh_channel()
+        if ok and not state["live"] and state["acq_active"] is not None:
+            await do_single()
+    sg_apply_btn.on_click(apply_siggen)
+
+    sg_pending = {}
+
+    def sg_changed():
+        sg_preview_update()
+        if not state["target"]:
+            return
+        old = sg_pending.get("t")
+        if old and not old.done():
+            old.cancel()
+
+        async def later():
+            await asyncio.sleep(0.8)
+            sg_pending.pop("t", None)      # past the wait: see dac_changed()
+            await apply_siggen()
+        sg_pending["t"] = asyncio.ensure_future(later())
+    for _el in [sg_on_sel, sg_dac_sel, sg_n_in, sg_play_in, sg_f0_in, sg_decay_in, sg_amp_in,
+                sg_lo_in, sg_hi_in, sg_snap_cb, sg_force_cb] + list(sg_h_in.values()):
+        _el.on_value_change(lambda e: sg_changed())
+
+    async def sg_loop_preset():
+        """The loop the design asks for (DESIGN-MULTICHANNEL 5): the
+        generator on DAC2, the chain reading RA8 = core 5 / PINSEL 3 as a
+        custom input (the test form would put its own triangle on DAC2),
+        a 1 kHz tone with a 3rd harmonic, table 800..3500 (the board's DAC
+        does not follow below about code 780, HARDWARE-LOG 29.09.2026)."""
+        sg_on_sel.value, sg_dac_sel.value = True, 2
+        sg_n_in.value, sg_play_in.value, sg_f0_in.value = 1000, 100000, 1000
+        for k in range(2, 8):
+            sg_h_in[k].value = 0.3 if k == 3 else 0.0
+        sg_decay_in.value, sg_amp_in.value, sg_lo_in.value, sg_hi_in.value = 0, 1.0, 800, 3500
+        sg_snap_cb.value = True
+        # DAC2's own card off ('auto'): an 'on' there would be sent after the
+        # next 'stream on' and replace the generator with its triangle
+        dac_ui[2]["on"].value = "auto"
+        input_mode_sel.value = "custom"
+        core_sel.value = 5
+        input_in.value = 3
+        if rate_in.value and int(rate_in.value) > 4000:
+            rate_in.value = 1000
+        old = sg_pending.get("t")
+        if old and not old.done():
+            old.cancel()
+        await apply_siggen()
+    sg_loop_btn.on_click(sg_loop_preset)
+
+    def loop_eval(samples, fs):
+        """The loop's verdict for one grab, or None when the chain does not
+        read the generator's pin."""
+        sg = state["siggen"]
+        cfg = state["acq_active"] or {}
+        if not sg or cfg.get("mode") != "custom" or not fs:
+            return None
+        if (cfg.get("core"), cfg.get("pinsel")) != {1: (5, 1), 2: (5, 3)}[sg["dac"]]:
+            return None
+        return wavegen_model.align(samples, sg["table"], sg["play"], fs)
+
+    async def apply_buf():
+        t = state["target"]
+        if not t:
+            buf_lbl.text = "not connected"
+            return
+        n = int(buf_in.value or state["buf_size"])
+        # cli.c: samples per half, 16..the board's maximum, even
+        half = max(16, min(state.get("buf_half_max", BUF_HALF_MAX), n // 2 & ~1))
+        # The firmware refuses 'buf' while the chain streams: stop it first.
+        # acq_active = None makes the next cycle send 'stream on' again, which
+        # sets the DMA block up with the new size (LIVE carries on by itself).
+        while state["busy"]:
+            await asyncio.sleep(0.05)
+        async with port_lock:
+            if state["acq_active"] is not None:
+                await run.io_bound(t.cmd, "stream off")
+                state["acq_active"] = None
+            ok, lines = await port_cmd(t, f"buf {half}")
+        got = _parse_buf(lines)
+        if ok and got is not None:
+            state["buf_size"] = got
+            buf_in.value = got
+            buf_lbl.text = f"buf: {got} (half {got // 2})" + (f" - {n} rounded" if got != n else "")
+        else:
+            buf_lbl.text = "buf refused: " + " ".join(lines)
+        if ok and not state["live"]:
+            await one_cycle()   # refresh the charts immediately against the new size
+    buf_btn.on_click(apply_buf)
+
+    async def apply_sigproc(e=None):
+        """cli.c: 'sigproc <filter>', 'sigproc gz on|off', 'sigproc gz thr <n>'
+        - the card's state to the board (02.10.2026). Also sent once after
+        connecting, because the board starts with both off. A firmware from
+        before 02.10.2026 knows only 'sigproc on|off' and refuses the rest."""
+        t = state["target"]
+        filt = sp_filter_sel.value or "off"
+        gz = bool(sp_gz_cb.value)
+        thr = int(sp_thr_in.value or 100)
+        if not t:
+            sigproc_lbl.text = "not connected"
+            return
+        while state["busy"]:
+            await asyncio.sleep(0.05)
+        refused = None
+        async with port_lock:
+            app_lines = app_card.command_lines() if app_card else []
+            for line in [f"sigproc {filt}", f"sigproc gz {'on' if gz else 'off'}",
+                         f"sigproc gz thr {thr}"] + app_lines:
+                ok, lines = await port_cmd(t, line)
+                if not ok:
+                    refused = (line, lines)
+                    break
+        if refused:
+            sigproc_lbl.text = f"'{refused[0]}' refused - not in this firmware? " + " ".join(refused[1])[:50]
+        else:
+            sigproc_lbl.text = (f"filter: {SP_FILTERS[filt] if filt in SP_FILTERS else filt}; Goertzel "
+                                + (f"on, threshold {thr} LSB" if gz else "off")
+                                + (f"; {app_card.summary()}" if app_card else ""))
+        if not gz:
+            sp_gz_chip.text = "fs/16: Goertzel off"
+            sp_gz_chip.props("color=grey-8")
+    sp_filter_sel.on_value_change(apply_sigproc)
+    sp_gz_cb.on_value_change(apply_sigproc)
+    sp_thr_in.on_value_change(apply_sigproc)
+    if app_card:
+        for _el in app_card.value_elements():
+            _el.on_value_change(apply_sigproc)
+
+        async def app_reset(e=None):
+            t = state["target"]
+            if not t:
+                return
+            while state["busy"]:
+                await asyncio.sleep(0.05)
+            async with port_lock:
+                await port_cmd(t, app_card.RESET_LINE)
+            app_card.after_reset()
+        app_card.reset_btn.on_click(app_reset)
+
+    # ---- acquisition: configure, start/keep the chain, grab, repeat ----
+    def current_acq_cfg():
+        mode = input_mode_sel.value or "test"
+        ksps = int(rate_in.value or 8000)
+        if mode == "test":
+            return dict(mode="test", ksps=ksps, core=5, pinsel=3, samc=0)
+        return dict(mode="custom", ksps=ksps, core=int(core_sel.value),
+                    pinsel=int(input_in.value or 0), samc=int(samc_in.value or 0))
+
+    def sync_fake_signal(t):
+        if isinstance(t, FakeTarget):
+            t.fake_source = fake_src_sel.value or None
+            t.signal_khz = float(sig_in.value or 100.0)
+            t.amplitude = float(amp_in.value or 0.0)
+            t.noise_std = float(noise_in.value or 0.0)
+            t.harm2_amp = float(harm2_in.value or 0.0)
+            t.harm3_amp = float(harm3_in.value or 0.0)
+
+    def cycle_failed(text, stop_live=True):
+        cyc_lbl.text = text
+        cyc_lbl.classes(replace="text-red-400 mono")
+        if stop_live and state["live"]:
+            state["live"] = False
+            live_btn.text, live_btn.icon = "live", "play_arrow"
+            single_btn.enable()
+
+    async def ensure_streaming():
+        """Send 'stream on ...' only when the chain is not already running
+        at this rate/input - and resend it (which reconfigures cleanly:
+        chain_stream_on_input() calls chain_stream_off() first) as soon as
+        the rate or the input changes."""
+        t = state["target"]
+        if not t:
+            return False
+        cfg = current_acq_cfg()
+        if state["acq_active"] == cfg:
+            return True
+        cmd = (f"stream on {cfg['ksps']}" if cfg["mode"] == "test"
+               else f"stream on {cfg['ksps']} {cfg['core']} {cfg['pinsel']} {cfg['samc']}")
+        async with port_lock:
+            ok, lines = await port_cmd(t, cmd)
+        if not ok:
+            cycle_failed("stream on refused: " + " ".join(lines))
+            return False
+        state["acq_active"] = cfg
+        state["grabs"] = 0
+        state["live_t0"] = None          # set at the first grab, see one_cycle()
+        state["test_dac2"] = None        # 'stream on' set its own triangle
+        if cfg["mode"] == "custom":
+            await apply_active_dacs()
+        elif dac_mode(2) != "auto":      # test input, DAC2 'on' or 'off' in its card
+            await send_dac(2)
+        return True
+
+    async def one_cycle():
+        t = state["target"]
+        if not t or state["busy"]:
+            return
+        state["busy"] = True
+        try:
+            sync_fake_signal(t)
+            if not await ensure_streaming():
+                return
+            async with port_lock:
+                res = await run.io_bound(t.grab)
+                ok, samples, meta = res if res is not None else (False, None, {"error": "cancelled"})
+            if not ok:
+                cycle_failed("grab failed: " + meta.get("error", "unknown"))
+                state["acq_active"] = None        # the board says it is not streaming any more
+                return
+            state["cycles"] += 1
+            state["grabs"] += 1
+            fs = meta["ksps"] * 1e3
+            f, db = spectrum(samples, fs)
+
+            # TRG.3: with the trigger on, only the time plot changes - a
+            # fixed window of L = N/2 samples from the crossing, x = 0 at
+            # the (interpolated) crossing itself; FFT and triangle below
+            # keep the full half.
+            if trig_cb.value:
+                trig_level = int(trig_level_in.value or 0)
+                L = max(len(samples) // 2, 1)
+                k, frac, found = trigger_window(samples, trig_level, trig_slope_sel.value or RISING,
+                                                int(trig_hyst_in.value or 0), L)
+                x0 = (k - 1 + frac) if found else 0.0
+                plot = [[round(j - x0, 3), int(samples[j])] for j in range(k, k + L)]
+                n_samp = L
+                trig_chip.text = f"trig @ {k}" if found else "no trigger"
+                trig_chip.props(f'color={"positive" if found else "warning"}')
+                time_chart.options["series"][0]["markLine"] = {
+                    "silent": True, "symbol": "none", "label": {"show": False},
+                    "lineStyle": {"type": "dashed", "color": "#f59e0b", "width": 1},
+                    "data": [{"yAxis": trig_level}]}
+            else:
+                plot = [[i, int(v)] for i, v in enumerate(samples)]
+                n_samp = max(len(samples) - 1, 1)
+                trig_chip.text = "trigger off"
+                trig_chip.props("color=grey-8")
+                # emptied, not removed: the chart merges options, a removed
+                # key would leave the last line standing
+                time_chart.options["series"][0]["markLine"] = {"data": []}
+            duration_s = n_samp / fs if fs > 0 else 1.0
+            t_scale, t_name = ((1e6, "time (µs)") if duration_s < 1e-3 else
+                               (1e3, "time (ms)") if duration_s < 1.0 else (1.0, "time (s)"))
+            time_chart.options["series"][0]["data"] = plot
+            # SG.6: the loop - the generator's table, aligned and fitted to
+            # this grab, drawn over it (in the trigger's window when that is on)
+            lp = loop_eval(samples, fs)
+            if lp is not None:
+                exp_v = lp["expected"]
+                rng = range(k, k + L) if trig_cb.value else range(len(exp_v))
+                off_x = x0 if trig_cb.value else 0.0
+                time_chart.options["series"][1]["data"] = [[round(j - off_x, 3), round(float(exp_v[j]), 1)]
+                                                          for j in rng]
+                loop_chip.text = (f"loop rms {lp['rms']:.1f} LSB · gain {lp['gain']:.3f} · "
+                                  f"entry {lp['entry']:.1f}")
+                # the harmonic factors the generator was told, against what the
+                # grab holds - fitted in the time domain at k x f0_used, not
+                # read off the FFT: a grab holds as little as one period of f0,
+                # far too few bins to tell the harmonics apart
+                if float(sg_decay_in.value or 0) == 0:
+                    meas = harmonic_factors(samples, fs, state["siggen"]["f0_used"], 7)
+                    set_h = {k: float(sg_h_in[k].value or 0.0) for k in range(2, 8)}
+                    shown = [f"h{k} {meas[k]:.2f}/{abs(set_h[k]):.2f}" for k in range(2, 8)
+                             if set_h[k] or meas[k] > 0.02]
+                    if shown:
+                        loop_chip.text += "  ·  " + " ".join(shown)
+                loop_chip.props(f'color={"positive" if lp["rms"] < 30 else "warning"}')
+            else:
+                time_chart.options["series"][1]["data"] = []
+                loop_chip.text = "loop –"
+                loop_chip.props("color=grey-8")
+            time_chart.options["xAxis"][0]["max"] = n_samp
+            time_chart.options["xAxis"][1]["max"] = duration_s * t_scale
+            time_chart.options["xAxis"][1]["name"] = t_name
+            time_axis["per_sample"] = t_scale / fs if fs > 0 else 0.0
+            time_axis["unit"] = t_name.split("(")[-1].rstrip(")")
+            update_time_tooltip()                 # also does time_chart.update()
+            cfg_now = state["acq_active"] or {}
+            if isinstance(t, FakeTarget) and t.fake_source in ("sine", "dac1"):
+                src_txt = ("fake: sine generator" if t.fake_source == "sine"
+                           else "fake: DAC1 card's triangle")
+            elif cfg_now.get("mode") == "custom":
+                src_txt = f"core {cfg_now.get('core')} / AN{cfg_now.get('pinsel')}"
+            elif state["test_dac2"] == "off":
+                src_txt = "RA8: DAC2 off"
+            elif state["test_dac2"]:
+                lo_, hi_, sl_ = state["test_dac2"]
+                src_txt = f"RA8: DAC2 card's triangle {lo_}..{hi_}, SLPDAT {sl_}"
+            else:
+                src_txt = f"RA8: the firmware's test triangle, SLPDAT {meta['slpdat']}"
+            if meta.get("proc", 0):
+                src_txt += f" - {PROC_NAMES.get(meta['proc'], 'processed')} at fs/8 in the firmware"
+            sig_src_lbl.text = (f"source: {src_txt}   |   grab {state['cycles']}: "
+                                f"min {int(np.min(samples))}  max {int(np.max(samples))}")
+            fft_chart.options["series"][0]["data"] = [[float(fx) / 1e3, float(d)] for fx, d in zip(f, db)]
+            fft_chart.options["xAxis"][0]["max"] = float(f[-1]) / 1e3 if len(f) else 1
+            # the signal processing's frequencies (sigproc.c): the filter's
+            # fs/8, the Goertzel's fs/16 - emptied, not removed, when off
+            gzm = meta.get("gz")
+            marks = []
+            if meta.get("proc", 0) and meta["ksps"]:
+                marks.append({"xAxis": meta["ksps"] / 8.0, "label": {"formatter": "fs/8"}})
+            if gzm is not None and meta["ksps"]:
+                marks.append({"xAxis": meta["ksps"] / 16.0, "label": {"formatter": "fs/16"}})
+            if app_card:
+                marks += app_card.fft_marks(meta)
+            fft_chart.options["series"][0]["markLine"] = {
+                "silent": True, "symbol": "none",
+                "lineStyle": {"type": "dashed", "color": "#a78bfa", "width": 1}, "data": marks}
+            fft_chart.update()
+            if app_card:
+                app_card.update(meta)
+            if gzm is None:
+                sp_gz_chip.text = ("fs/16: no result in the frame" if sp_gz_cb.value
+                                   else "fs/16: Goertzel off")
+                sp_gz_chip.props("color=grey-8")
+            else:
+                fs16 = meta["ksps"] / 16.0
+                sp_gz_chip.text = (f"fs/16 = {fs16:g} kHz: {gzm['amp']} LSB, "
+                                   f"{gzm['share_pm'] / 10:.1f} % of the signal - "
+                                   + ("DETECTED" if gzm["detected"] else "not detected"))
+                sp_gz_chip.props("color=" + ("positive" if gzm["detected"] else "grey-8"))
+
+            # Grabs per second between the first grab and this one, while
+            # LIVE runs only: counted from 'stream on' a SINGLE (one grab a
+            # few ms after the start) showed a meaningless 50+ grabs/s.
+            now = time.time()
+            if state["grabs"] == 1 or not state["live_t0"]:
+                state["live_t0"] = now
+            rate_txt = ""
+            if state["live"] and state["grabs"] >= 2 and now > state["live_t0"]:
+                rate_txt = f"   {(state['grabs'] - 1) / (now - state['live_t0']):.2f} grabs/s"
+            cyc_lbl.classes(replace="text-slate-300 mono")
+            # the CPU's budget per sample: CLKGEN1 = PLL2 = 200 MHz (clock.h)
+            # over the frame's actual rate
+            # what the processing uses of it: the frame's load= (per mille of
+            # a half period, firmware since 02.10.2026) times the budget
+            budget = CPU_HZ / (meta['ksps'] * 1e3) if meta["ksps"] else 0.0
+            load = meta.get("load_pm")
+            used_txt = (f"{budget * load / 1000:.1f} of " if (load is not None and budget) else "")
+            cyc_txt = (f"   {used_txt}{budget:.1f} CPU cycles/sample" if budget else "")
+            cyc_lbl.text = (f"grab {state['cycles']}   n={len(samples)}   from={meta['from_']}   "
+                            f"{meta['ksps']} kSPS actual{cyc_txt}{rate_txt}")
+            for k in ("overrun", "late", "missed"):
+                set_chip(k, meta[k])
+            rate_chip.text = f"actual rate {meta['ksps']} kSPS"
+            rate_chip.props("color=grey-8")
+            halves_chip.text = f"halves {meta['halves']} / xfer {meta['transfers']}"
+            halves_chip.props("color=grey-8")
+            if load is None:
+                load_chip.text = "CPU load –"
+                load_chip.props("color=grey-8")
+            else:
+                load_chip.text = f"CPU load {load / 10:.1f} %"
+                load_chip.props("color=" + ("positive" if load < 700 else
+                                            "warning" if load < 1000 else "negative"))
+
+            metrics = analyze_spectrum(f, db)
+            if metrics:
+                eval_chips["fundamental"].text = f"fundamental {metrics['fund_freq']/1e3:.2f} kHz"
+                eval_chips["level"].text = f"level {metrics['fund_db']:.1f} dBFS"
+                eval_chips["noise floor"].text = f"noise floor {metrics['noise_db']:.1f} dBFS"
+                eval_chips["SNR"].text = f"SNR {metrics['snr_db']:.1f} dB"
+                eval_chips["THD"].text = f"THD {metrics['thd_pct']:.2f} %"
+                eval_chips["SNR"].props(f'color={"positive" if metrics["snr_db"] >= 40 else "negative"}')
+                harmonics = {h["k"]: h for h in metrics["harmonics"]}
+                for k in (2, 3, 4, 5):
+                    chip = eval_chips[f"H{k}"]
+                    if k in harmonics:
+                        chip.text = f"H{k}  {harmonics[k]['rel_db']:.1f} dBc"
+                    else:
+                        chip.text = f"H{k} –"
+                    chip.props("color=grey-8")
+
+            fake_no_tri = isinstance(t, FakeTarget) and t.fake_source in ("sine", "dac1")
+            # processed data (proc=1) need not be a triangle any more
+            if (meta["slpdat"] > 0 and not fake_no_tri and state["test_dac2"] != "off"
+                    and not meta.get("proc", 0)):
+                triangle_card.set_visibility(True)
+                r = chain_tri_eval([int(v) for v in samples])
+                verdict = chain_grid_ok(r)
+                if r["slip_n"] == 0 and not r["overflow"]:
+                    # the slip test compares whole slopes; with fewer than
+                    # two in the window there is nothing to compare
+                    triangle_verdict_chip.text = "n/a - too few slopes in the window"
+                    triangle_verdict_chip.props("color=grey-8")
+                else:
+                    triangle_verdict_chip.text = "PASS" if verdict else "FAIL"
+                    triangle_verdict_chip.props(f'color={"positive" if verdict else "negative"}')
+                triangle_chips["turning points"].text = f"turning points {r['tps']}"
+                triangle_chips["up"].text = f"up {r['n_up']} · {r['l_up']:.2f} smp"
+                triangle_chips["down"].text = f"down {r['n_dn']} · {r['l_dn']:.2f} smp"
+                triangle_chips["slip"].text = f"slip {r['slip']:.2f} (k={r['slip_k']}, {r['slip_n']} spans)"
+                if isinstance(state["test_dac2"], tuple):
+                    lo_, hi_, sl_ = state["test_dac2"]
+                    model = ((hi_ - lo_) * 32.0 * meta["ksps"] * 1e3 / (sl_ * meta["dac_hz"])
+                             if meta["dac_hz"] > 0 else 0.0)
+                else:
+                    model = chain_model_slope_samples(meta["slpdat"], meta["dac_hz"], meta["ksps"])
+                mean_len = (r["l_up"] + r["l_dn"]) / 2.0 if (r["n_up"] or r["n_dn"]) else 0.0
+                triangle_chips["model"].text = (f"slope/model {mean_len / model:.3f}"
+                                                if model > 0 and mean_len > 0 else "slope/model –")
+                triangle_chips["steps"].text = (f"zero {r['zero']} dbl {r['dbl']}" if r["step_checked"]
+                                                else "steps not checked (slope < 40 LSB/sample)")
+                triangle_chips["steps"].props(
+                    f'color={"positive" if (not r["step_checked"]) or (r["zero"] == 0 and r["dbl"] == 0) else "negative"}')
+            else:
+                triangle_card.set_visibility(False)
+        except Exception as ex:
+            cycle_failed(f"cycle failed: {ex}")
+            state["acq_active"] = None
+        finally:
+            state["busy"] = False
+
+    async def stop_stream():
+        t = state["target"]
+        if t:
+            async with port_lock:
+                await run.io_bound(t.cmd, "stream off")
+        state["acq_active"] = None
+
+    async def do_single():
+        """One grab: if nothing is streaming yet, start it, grab once, and
+        stop it again - LIVE leaves the chain running between grabs, SINGLE
+        does not. Disabled while LIVE is running (see the live_btn/
+        single_btn enable/disable pairing below)."""
+        if state["live"] or not state["target"]:
+            return
+        pre_active = state["acq_active"] is not None
+        await one_cycle()
+        if not pre_active:
+            await stop_stream()
+    single_btn.on_click(do_single)
+
+    async def live_loop():
+        while state["live"]:
+            await one_cycle()
+            await asyncio.sleep(max(0.05, float(interval_in.value or 500) / 1000.0))
+
+    def toggle_live():
+        if state["live"]:
+            state["live"] = False
+            live_btn.text, live_btn.icon = "live", "play_arrow"
+            single_btn.enable()
+            asyncio.create_task(stop_stream())
+        else:
+            if not state["target"]:
+                return
+            state["live"] = True
+            live_btn.text, live_btn.icon = "stop", "stop"
+            single_btn.disable()
+            asyncio.create_task(live_loop())
+    live_btn.on_click(toggle_live)
+    setup_sel.on_value_change(do_setup)
+
+    if args.fake or args.port or args.remote:
+        ui.timer(0.5, do_connect, once=True)
+
+    ui.run(title="ADC/DMA capture", port=args.http_port, show=not args.no_browser, reload=False, dark=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port", help="COM port of the board's console")
+    ap.add_argument("--fake", action="store_true", help="use the built-in stand-in instead of a board")
+    ap.add_argument("--fake-board", default="EV74H48A", choices=["EV74H48A", "EV17P63A"],
+                    help="which board the stand-in reports (its 'version' reply), for trying the "
+                         "Curiosity Nano profile without one")
+    ap.add_argument("--remote", action="store_true",
+                    help="preselect 'remote' (a bench_client tunnel, tools/remote.py) instead of "
+                         "a board or the fake target - no flashing here")
+    ap.add_argument("--bench-client",
+                    help="path to bench_client.py for the 'remote' connection choice (default: "
+                         "$BENCH_CLIENT)")
+    ap.add_argument("--selftest", action="store_true", help="fake target through one cycle, no GUI")
+    ap.add_argument("--settings", default=SETTINGS_FILE,
+                    help="settings file, read at start and written by 'save' "
+                         f"(default: {os.path.basename(SETTINGS_FILE)} next to this script)")
+    ap.add_argument("--http-port", type=int, default=8080)
+    ap.add_argument("--no-browser", action="store_true", help="do not open a browser window")
+    args = ap.parse_args()
+    if args.selftest:
+        sys.exit(selftest())
+    main_gui(args)
+
+
+if __name__ in {"__main__", "__mp_main__"}:
+    main()

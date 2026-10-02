@@ -1,0 +1,293 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 944" width="1160" height="944" role="img" aria-label="Firmware layers and modules">
+<style>
+svg{--bg:#f4f6f8;--ink:#17202b;--muted:#566273;--line:#b9c2cd;--surface:#fff;--accent:#0d7a6b;
+--b-host:#eceef1;--s-host:#8b95a3;--b-cli:#e5edf9;--s-cli:#4f74b3;--b-test:#f0e9f8;--s-test:#8062ad;
+--b-app:#e2f2ee;--s-app:#2f8a78;--b-lib:#f8efe0;--s-lib:#b07a2a;--s-diag:#b0574d;
+--b-port:#ebeae6;--s-port:#7c7768;--b-drv:#e7f0e1;--s-drv:#5c8a3f;--b-hw:#e3e7ec;--s-hw:#4a5868;
+--st-tested:#2e9d57;--st-pending:#9aa3ad}
+svg{--bg:#11161c;--ink:#e3e8ee;--muted:#9aa6b4;--line:#3a4552;
+--surface:#1a2129;--accent:#3cc2ab;--b-host:#1a1f25;--s-host:#6f7b89;--b-cli:#172236;--s-cli:#7fa3e0;
+--b-test:#221b2e;--s-test:#a88bd6;--b-app:#12251f;--s-app:#52b8a2;--b-lib:#2a2215;--s-lib:#d6a352;
+--s-diag:#d98277;--b-port:#22211d;--s-port:#a8a292;--b-drv:#18231a;--s-drv:#86b865;--b-hw:#1b2027;--s-hw:#8c9aab;
+--st-tested:#4cc47a;--st-pending:#6f7b89}
+.bg{fill:var(--bg)} text{fill:var(--ink)}
+.b-host{fill:var(--b-host)}.b-cli{fill:var(--b-cli)}.b-test{fill:var(--b-test)}.b-app{fill:var(--b-app)}
+.b-lib{fill:var(--b-lib)}.b-port{fill:var(--b-port)}.b-drv{fill:var(--b-drv)}.b-hw{fill:var(--b-hw)}
+.bx{fill:var(--surface);stroke-width:1.3}
+.s-host{stroke:var(--s-host)}.s-cli{stroke:var(--s-cli)}.s-test{stroke:var(--s-test)}.s-app{stroke:var(--s-app)}
+.s-lib{stroke:var(--s-lib)}.s-diag{stroke:var(--s-diag)}.s-port{stroke:var(--s-port)}.s-drv{stroke:var(--s-drv)}.s-hw{stroke:var(--s-hw)}
+.dash{stroke-dasharray:5 4}
+.t{font:600 12.5px Consolas,"Cascadia Mono","DejaVu Sans Mono",monospace}
+.s{font:400 11px "Segoe UI",Arial,"Helvetica Neue",sans-serif;fill:var(--muted)}
+.ln{font:600 13px "Segoe UI",Arial,"Helvetica Neue",sans-serif}
+.lf{font:400 10.5px Consolas,"Cascadia Mono","DejaVu Sans Mono",monospace;fill:var(--muted)}
+.an{font:500 11px "Segoe UI",Arial,"Helvetica Neue",sans-serif;fill:var(--accent)}
+.ar,.ar2{fill:none;stroke:var(--accent);stroke-width:1.6;marker-end:url(#arr)}
+.ar2{marker-start:url(#arrs)} .ar.dash{stroke-dasharray:5 4}
+.ln1{stroke:var(--line);stroke-width:1.3} .mk{fill:var(--accent)}
+.st-tested{fill:var(--st-tested)}.st-pending{fill:none;stroke:var(--st-pending);stroke-width:1.6}
+</style>
+<defs>
+<marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="mk" d="M0 0 L10 5 L0 10 z"/></marker>
+<marker id="arrs" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="mk" d="M10 0 L0 5 L10 10 z"/></marker>
+</defs>
+<rect class="bg" x="0" y="0" width="1160" height="944"/>
+<rect class="b-host" x="10" y="16" width="1140" height="64" rx="6"/>
+<text class="ln" x="24" y="40">Host</text>
+<text class="lf" x="24" y="56">tools/</text>
+<text class="lf" x="24" y="69">off-target</text>
+<rect class="bx s-host dash" x="170" y="26" width="233" height="44" rx="4"/>
+<circle class="st-pending" cx="392" cy="37" r="5"><title>not tested with this version yet (changed since it was tested at 86f4753); open: the GUI itself in a board-run block - checked by hand 29.09.2026 (DAC cards with force, buffer tile, DISCONNECT during LIVE), not by a block</title></circle>
+<text class="t" x="180" y="45">adc_gui.py</text>
+<text class="s" x="180" y="59">NiceGUI: stream on / grab, time + FFT</text>
+<rect class="bx s-host dash" x="415" y="26" width="233" height="44" rx="4"/>
+<circle class="st-pending" cx="637" cy="37" r="5"><title>not tested with this version yet</title></circle>
+<text class="t" x="425" y="45">eval_chain.py</text>
+<text class="s" x="425" y="59">chain all log → verdict</text>
+<rect class="bx s-host dash" x="660" y="26" width="233" height="44" rx="4"/>
+<circle class="st-pending" cx="882" cy="37" r="5"><title>not tested with this version yet; open: a remote run against a real bench</title></circle>
+<text class="t" x="670" y="45">remote.py → bench_client</text>
+<text class="s" x="670" y="59">relay: flash, tunnel (socket://)</text>
+<rect class="bx s-host dash" x="905" y="26" width="233" height="44" rx="4"/>
+
+<text class="t" x="915" y="45">terminal</text>
+<text class="s" x="915" y="59">console by hand</text>
+<path class="ar2" d="M300 72 V120"/>
+<text class="an" x="312" y="100">UART2 · text commands with ACK/NAK, binary frames (blk, GRAB) with CRC-16</text>
+<rect class="b-cli" x="10" y="112" width="1140" height="86" rx="6"/>
+<text class="ln" x="24" y="136">Console</text>
+<text class="lf" x="24" y="152">src/core/</text>
+<rect class="bx s-cli" x="170" y="124" width="400" height="62" rx="4"/>
+<circle class="st-pending" cx="559" cy="135" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="180" y="145">cli.c · console.h</text>
+<text class="s" x="180" y="159">14 core commands + help; the lab adds 15 through</text>
+<text class="s" x="180" y="173">cli_register_lab() (weak) · 32 parser slots</text>
+<rect class="bx s-cli" x="582" y="124" width="250" height="62" rx="4"/>
+<circle class="st-pending" cx="821" cy="135" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="592" y="145">cmd_parser.c</text>
+<text class="s" x="592" y="159">upstream zabooh/cmd_parser</text>
+<text class="s" x="592" y="173">do not edit (MAX_COMMANDS only)</text>
+<rect class="bx s-cli" x="844" y="124" width="296" height="62" rx="4"/>
+<circle class="st-pending" cx="1129" cy="135" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260); open: snap, rate, blk</title></circle>
+<text class="t" x="854" y="145">gui_link.c</text>
+<text class="s" x="854" y="159">stream grab: a frozen pair →</text>
+<text class="s" x="854" y="173">GRAB frame, the stream runs on</text>
+<rect class="b-test" x="10" y="214" width="1140" height="86" rx="6"/>
+<text class="ln" x="24" y="238">Lab</text>
+<text class="lf" x="24" y="254">src/lab/</text>
+<text class="lf" x="24" y="267">src/sim/</text>
+<text class="lf" x="24" y="280">not in the core build</text>
+<rect class="bx s-test" x="170" y="226" width="130" height="62" rx="4"/>
+<circle class="st-pending" cx="289" cy="237" r="5"><title>not tested with this version yet (earlier: ran on silicon before N+1&#x27;s restructuring)</title></circle>
+<text class="t" x="180" y="247">chaintest.c</text>
+<text class="s" x="180" y="261">chain all S0..S9</text>
+<text class="s" x="180" y="275">chain run</text>
+<rect class="bx s-test" x="310" y="226" width="130" height="62" rx="4"/>
+<circle class="st-pending" cx="429" cy="237" r="5"><title>not tested with this version yet (earlier: ran on silicon before N+1&#x27;s restructuring)</title></circle>
+<text class="t" x="320" y="247">bench.c</text>
+<text class="s" x="320" y="261">sweep · test</text>
+<text class="s" x="320" y="275">(back-to-back)</text>
+<rect class="bx s-test" x="450" y="226" width="130" height="62" rx="4"/>
+<circle class="st-pending" cx="569" cy="237" r="5"><title>not tested with this version yet (earlier: tested on silicon (no revision recorded))</title></circle>
+<text class="t" x="460" y="247">dactest.c</text>
+<text class="s" x="460" y="261">captured halves vs</text>
+<text class="s" x="460" y="275">the DAC triangle</text>
+<rect class="bx s-test" x="590" y="226" width="130" height="62" rx="4"/>
+<circle class="st-pending" cx="709" cy="237" r="5"><title>not tested with this version yet (earlier: ran on silicon before N+1&#x27;s restructuring)</title></circle>
+<text class="t" x="600" y="247">meter.c</text>
+<text class="s" x="600" y="261">selftest · oneshot</text>
+<text class="s" x="600" y="275">measure_rate</text>
+<rect class="bx s-test" x="730" y="226" width="130" height="62" rx="4"/>
+<circle class="st-pending" cx="849" cy="237" r="5"><title>not tested with this version yet (moved out of the library box on CORE.4 (02.10.2026))</title></circle>
+<text class="t" x="740" y="247">tri_eval.c</text>
+<text class="s" x="740" y="261">triangle evaluator</text>
+<text class="s" x="740" y="275">(chain test)</text>
+<rect class="bx s-test" x="870" y="226" width="130" height="62" rx="4"/>
+<circle class="st-pending" cx="989" cy="237" r="5"><title>not tested with this version yet (the lab commands, out of cli.c on CORE.3 (02.10.2026))</title></circle>
+<text class="t" x="880" y="247">cli_lab.c</text>
+<text class="s" x="880" y="261">15 lab commands:</text>
+<text class="s" x="880" y="275">start … chain</text>
+<rect class="bx s-test" x="1010" y="226" width="130" height="62" rx="4"/>
+<circle class="st-pending" cx="1129" cy="237" r="5"><title>not tested with this version yet (snap/rate/blk, out of gui_link.c on CORE.2 (02.10.2026))</title></circle>
+<text class="t" x="1020" y="247">b2b_link.c</text>
+<text class="s" x="1020" y="261">snap · rate · blk</text>
+<text class="s" x="1020" y="275">(back-to-back)</text>
+<rect class="b-app" x="10" y="316" width="1140" height="176" rx="6"/>
+<text class="ln" x="24" y="340">Core · app glue</text>
+<text class="lf" x="24" y="356">src/core/</text>
+<text class="lf" x="24" y="369">glue: src/app/,</text>
+<text class="lf" x="24" y="382">src/boards/</text>
+<rect class="bx s-app" x="170" y="328" width="120" height="48" rx="4"/>
+<circle class="st-pending" cx="279" cy="339" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260); open: intermittent fail 8 just after stream off with the generator on: 2 in ~176, not reproduced in 76 more (HARDWARE-LOG 2026-09-29)</title></circle>
+<text class="t" x="180" y="349">main.c</text>
+<text class="s" x="180" y="363">glue · the lab&#x27;s</text>
+<rect class="bx s-app" x="302" y="328" width="150" height="48" rx="4"/>
+<circle class="st-pending" cx="441" cy="339" r="5"><title>not tested with this version yet (the core build (CORE.5, 02.10.2026); ran on the board uncommitted (HARDWARE-LOG 02.10.2026, CORE)); open: no board-run block flashes the core build</title></circle>
+<text class="t" x="312" y="349">example_main.c</text>
+<text class="s" x="312" y="363">core · customer start</text>
+<rect class="bx s-app" x="464" y="328" width="270" height="48" rx="4"/>
+<circle class="st-pending" cx="723" cy="339" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260); open: intermittent fail 8 just after stream off with the generator on: 2 in ~176, not reproduced in 76 more (HARDWARE-LOG 2026-09-29)</title></circle>
+<text class="t" x="474" y="349">acquisition.c</text>
+<text class="s" x="474" y="363">rate (PLL1), stream on/off, chain setup</text>
+<rect class="bx s-app" x="746" y="328" width="200" height="48" rx="4"/>
+<circle class="st-pending" cx="935" cy="339" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="756" y="349">routing.c</text>
+<text class="s" x="756" y="363">route_t, resources, apply()</text>
+<rect class="bx s-app" x="958" y="328" width="182" height="48" rx="4"/>
+<circle class="st-pending" cx="1129" cy="339" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260); open: the EV17P63A (Nano) profile - its own first run</title></circle>
+<text class="t" x="968" y="349">board.h · board_cfg</text>
+<text class="s" x="968" y="363">glue · EV74H48A | EV17P63A</text>
+<rect class="bx s-app" x="170" y="384" width="290" height="44" rx="4"/>
+<circle class="st-pending" cx="449" cy="395" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260); open: intermittent fail 8 just after stream off with the generator on: 2 in ~176, not reproduced in 76 more (HARDWARE-LOG 2026-09-29)</title></circle>
+<text class="t" x="180" y="403">capture.c</text>
+<text class="s" x="180" y="417">pairs A/B + guards · dma0_event() · counters</text>
+<rect class="bx s-app" x="472" y="384" width="218" height="44" rx="4"/>
+<circle class="st-pending" cx="679" cy="395" r="5"><title>not tested with this version yet (HARDWARE-LOG 2026-10-02 (the low-pass entry); not marked tested - no board run of the committed revision); open: the low-pass (fs/8 since 02.10.2026) ran on the board - frequency response within 0.7 dB of the design, grabs with proc=1 - but not with this committed version yet; it keeps up only to 2 MSPS (about 63 CPU cycles per sample)</title></circle>
+<text class="t" x="482" y="403">sigproc.c</text>
+<text class="s" x="482" y="417">filter fs/8 · Goertzel · app hooks</text>
+<rect class="bx s-app" x="702" y="384" width="160" height="44" rx="4"/>
+<circle class="st-pending" cx="851" cy="395" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="712" y="403">pingpong.c</text>
+<text class="s" x="712" y="417">half bookkeeping</text>
+<rect class="bx s-app" x="874" y="384" width="266" height="44" rx="4"/>
+<circle class="st-pending" cx="1129" cy="395" r="5"><title>not tested with this version yet</title></circle>
+<text class="t" x="884" y="403">port_impl.c</text>
+<text class="s" x="884" y="417">glue · port_* → console / fail()</text>
+<rect class="bx s-app" x="170" y="440" width="970" height="44" rx="4"/>
+<circle class="st-pending" cx="1129" cy="451" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260); open: SG.8 board-run block R8; intermittent fail 8 after stream off with the generator on (HARDWARE-LOG 2026-09-29)</title></circle>
+<text class="t" x="180" y="459">siggen.c</text>
+<text class="s" x="180" y="473">src/core/ · wavegen table (8192 x 16 bit, .dma_buffer) → dma.c ch. 2 → dac.c, paced by sccp.c (SCCP2); claim in routing.c; no register</text>
+<rect class="b-lib" x="10" y="508" width="1140" height="86" rx="6"/>
+<text class="ln" x="24" y="532">Libraries</text>
+<text class="lf" x="24" y="548">src/lib/</text>
+<text class="lf" x="24" y="561">diag.c: src/core/</text>
+<rect class="bx s-lib" x="170" y="520" width="380" height="62" rx="4"/>
+<circle class="st-pending" cx="539" cy="531" r="5"><title>not tested with this version yet</title></circle>
+<text class="t" x="180" y="541">frame · crc16 · fmt · stats</text>
+<text class="s" x="180" y="555">hardware-free, tested on the host</text>
+<text class="s" x="180" y="569">(tests/host, Python cross-checks)</text>
+<rect class="bx s-lib" x="562" y="520" width="300" height="62" rx="4"/>
+
+<text class="t" x="572" y="541">iir1 · goertzel_f/i · detect · wavegen</text>
+<text class="s" x="572" y="555">wavegen: called by siggen.c</text>
+<text class="s" x="572" y="569">rest linked, not called yet (N+4)</text>
+<rect class="bx s-diag" x="874" y="520" width="266" height="62" rx="4"/>
+<circle class="st-pending" cx="1129" cy="531" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="884" y="541">diag.c</text>
+<text class="s" x="884" y="555">fail() codes, trap, boot record,</text>
+<text class="s" x="884" y="569">reg_print(), stack high-water mark</text>
+<rect class="b-port" x="10" y="610" width="1140" height="50" rx="6"/>
+<text class="ln" x="24" y="634">Port layer</text>
+<text class="lf" x="24" y="650">src/port/ · headers</text>
+<rect class="bx s-port" x="170" y="618" width="233" height="34" rx="4"/>
+<circle class="st-pending" cx="392" cy="629" r="5"><title>not tested with this version yet</title></circle>
+<text class="t" x="180" y="639">log.h · port_log/trace</text>
+<rect class="bx s-port" x="415" y="618" width="233" height="34" rx="4"/>
+<circle class="st-pending" cx="637" cy="629" r="5"><title>not tested with this version yet; open: runs only on a fault</title></circle>
+<text class="t" x="425" y="639">panic.h · port_panic()</text>
+<rect class="bx s-port" x="660" y="618" width="233" height="34" rx="4"/>
+<circle class="st-pending" cx="882" cy="629" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="670" y="639">wait.h · PORT_WAIT_WHILE()</text>
+<rect class="bx s-port" x="905" y="618" width="233" height="34" rx="4"/>
+<circle class="st-pending" cx="1127" cy="629" r="5"><title>not tested with this version yet</title></circle>
+<text class="t" x="915" y="639">regs.h · reg_visit_t</text>
+<rect class="b-drv" x="10" y="676" width="1140" height="86" rx="6"/>
+<text class="ln" x="24" y="700">Drivers</text>
+<text class="lf" x="24" y="716">src/drivers/</text>
+<rect class="b-hw" x="10" y="778" width="1140" height="86" rx="6"/>
+<text class="ln" x="24" y="802">Silicon</text>
+<text class="lf" x="24" y="818">dsPIC33AK512</text>
+<text class="lf" x="24" y="831">MPS512</text>
+<rect class="bx s-drv" x="170" y="688" width="110" height="62" rx="4"/>
+<circle class="st-pending" cx="269" cy="699" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="180" y="709">clock.c</text>
+<text class="s" x="180" y="723">PLL1, PLL2</text>
+<text class="s" x="180" y="737">CLKGEN6/7/13</text>
+<path class="ln1" d="M225 750 V790"/>
+<rect class="bx s-hw" x="170" y="790" width="110" height="62" rx="4"/>
+
+<text class="t" x="180" y="811">PLL1 / PLL2</text>
+<text class="s" x="180" y="825">PLL1 → ADC path</text>
+<text class="s" x="180" y="839">PLL2 → CPU</text>
+<rect class="bx s-drv" x="292" y="688" width="110" height="62" rx="4"/>
+<circle class="st-pending" cx="391" cy="699" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="302" y="709">adc.c</text>
+<text class="s" x="302" y="723">core 5, burst</text>
+<text class="s" x="302" y="737">trigger, calib.</text>
+<path class="ln1" d="M347 750 V790"/>
+<rect class="bx s-hw" x="292" y="790" width="110" height="62" rx="4"/>
+
+<text class="t" x="302" y="811">ADC</text>
+<text class="s" x="302" y="825">core 5, AD5AN3</text>
+<text class="s" x="302" y="839">(pin RA8)</text>
+<rect class="bx s-drv" x="414" y="688" width="110" height="62" rx="4"/>
+<circle class="st-pending" cx="513" cy="699" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="424" y="709">dma.c</text>
+<text class="s" x="424" y="723">ch. 0+1 ping-pong,</text>
+<text class="s" x="424" y="737">ch. 2 tx; sim_dma.c</text>
+<path class="ln1" d="M469 750 V790"/>
+<rect class="bx s-hw" x="414" y="790" width="110" height="62" rx="4"/>
+
+<text class="t" x="424" y="811">DMA0/1 · DMA2</text>
+<text class="s" x="424" y="825">0+1: ADC → A/B</text>
+<text class="s" x="424" y="839">2: RAM → DAC</text>
+<rect class="bx s-drv" x="536" y="688" width="110" height="62" rx="4"/>
+<circle class="st-pending" cx="635" cy="699" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="546" y="709">sccp.c</text>
+<text class="s" x="546" y="723">SCCP1 trigger,</text>
+<text class="s" x="546" y="737">SCCP2 play clock</text>
+<path class="ln1" d="M591 750 V790"/>
+<rect class="bx s-hw" x="536" y="790" width="110" height="62" rx="4"/>
+
+<text class="t" x="546" y="811">SCCP1 · SCCP2</text>
+<text class="s" x="546" y="825">CLKGEN13 160 MHz,</text>
+<text class="s" x="546" y="839">peripheral 100 MHz</text>
+<rect class="bx s-drv" x="658" y="688" width="110" height="62" rx="4"/>
+<circle class="st-pending" cx="757" cy="699" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260); open: dac 1 (DACOUT1 = RA1) - the GUI has a DAC1 card; dac ... force (dac_triangle_force()) - checked by hand 29.09.2026, no block sends it</title></circle>
+<text class="t" x="668" y="709">dac.c</text>
+<text class="s" x="668" y="723">DAC1/2 triangle</text>
+<text class="s" x="668" y="737">UREF route</text>
+<path class="ln1" d="M713 750 V790"/>
+<rect class="bx s-hw" x="658" y="790" width="110" height="62" rx="4"/>
+
+<text class="t" x="668" y="811">DAC2</text>
+<text class="s" x="668" y="825">on CLKGEN7</text>
+<text class="s" x="668" y="839">400 MHz → RA8</text>
+<rect class="bx s-drv" x="780" y="688" width="110" height="62" rx="4"/>
+<circle class="st-pending" cx="879" cy="699" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="790" y="709">uart.c</text>
+<text class="s" x="790" y="723">UART2, PPS</text>
+<text class="s" x="790" y="737">RX ISR, TX ring</text>
+<path class="ln1" d="M835 750 V790"/>
+<rect class="bx s-hw" x="780" y="790" width="110" height="62" rx="4"/>
+
+<text class="t" x="790" y="811">UART2</text>
+<text class="s" x="790" y="825">console</text>
+<text class="s" x="790" y="839">(COM port)</text>
+<rect class="bx s-drv" x="902" y="688" width="110" height="62" rx="4"/>
+<circle class="st-pending" cx="1001" cy="699" r="5"><title>not tested with this version yet (changed since it was tested at 7b16260)</title></circle>
+<text class="t" x="912" y="709">timebase.c</text>
+<text class="s" x="912" y="723">Timer1</text>
+<text class="s" x="912" y="737">stopwatch</text>
+<path class="ln1" d="M957 750 V790"/>
+<rect class="bx s-hw" x="902" y="790" width="110" height="62" rx="4"/>
+
+<text class="t" x="912" y="811">Timer1</text>
+<text class="s" x="912" y="825">12.5 MHz</text>
+<text class="s" x="912" y="839">on PLL2</text>
+<rect class="bx s-drv" x="1024" y="688" width="110" height="62" rx="4"/>
+<circle class="st-pending" cx="1123" cy="699" r="5"><title>not tested with this version yet (earlier: tested on silicon (no revision recorded))</title></circle>
+<text class="t" x="1034" y="716">led.c</text>
+<text class="s" x="1034" y="730">LED0</text>
+<path class="ln1" d="M1079 750 V790"/>
+<rect class="bx s-hw" x="1024" y="790" width="110" height="62" rx="4"/>
+
+<text class="t" x="1034" y="818">LED0</text>
+<text class="s" x="1034" y="832">heartbeat</text>
+<text class="s" x="20" y="884">Core (CORE, 02.10.2026; docs/CORE.md): src/drivers/, src/port/, src/lib/, src/core/ - what a customer takes over, with their own glue in place of src/app/ and src/boards/. Lab: src/lab/, src/sim/.</text>
+<text class="s" x="20" y="910">Test status, 30.09.2026 (docs/TEST-COVERAGE.md):</text>
+<circle class="st-tested" cx="26" cy="926" r="5"/>
+<text class="s" x="36" y="930">functionally tested on silicon with this version</text>
+<circle class="st-pending" cx="319" cy="926" r="5"/>
+<text class="s" x="329" y="930">not tested with this version yet</text>
+</svg>

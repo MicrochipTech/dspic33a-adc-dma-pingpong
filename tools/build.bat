@@ -1,0 +1,151 @@
+@echo off
+rem ---------------------------------------------------------------------
+rem  dsPIC33AK512MPS512 (EV74H48A) ADC/DMA demo - build without MPLAB X
+rem
+rem    build.bat          firmware for the board -> ..\build\adc_dma_40msps.elf/.hex
+rem    build.bat sim      simulator build        -> ..\build\adc_dma_40msps_sim.elf
+rem    build.bat sim 256  simulator build with 256 samples per half -> ..\build\adc_dma_40msps_sim256.elf
+rem    build.bat smoke    simulator smoke build (-DSIM_SMOKE=1: boot, a fixed
+rem                       command script, "[smoke] DONE", no stream)
+rem                                              -> ..\build\adc_dma_40msps_smoke.elf
+rem    build.bat smoke fault [n]  the same plus -DSIM_SMOKE_FAULT=n (1..4, main.c;
+rem                       default 3 = stack error, 1 = a misaligned 32-bit read): a
+rem                       deliberate trap after the script, the negative test for
+rem                       tools\sim_trap.py --smoke
+rem                                              -> ..\build\adc_dma_40msps_smokefault.elf
+rem                                                 (..._smokefault<n>.elf with n given)
+rem    build.bat nano     the EV17P63A Curiosity Nano (dsPIC33AK512MPS506)
+rem                                              -> ..\build\adc_dma_40msps_nano.elf/.hex
+rem    build.bat core     the customer's core build (CORE.5, 02.10.2026): drivers,
+rem                       port, lib, core, the app glue and src\core\example_main.c
+rem                       instead of main.c - no file of src\lab\ or src\sim\
+rem                                              -> ..\build\adc_dma_40msps_core.elf/.hex
+rem    build.bat nanosmoke  the smoke build for the Nano, for
+rem                       tools\sim_trap.py --smoke --nano
+rem                                              -> ..\build\adc_dma_40msps_nanosmoke.elf
+rem
+rem  The simulator builds compile sim_dma.c instead of dma.c, define
+rem  __MPLAB_DEBUGGER_SIMULATOR (as MPLAB X does for a Simulator
+rem  configuration) and keep debug symbols for tools\sim_trap.py.
+rem
+rem  Board configuration as data (P7.1, 27.09.2026): src\boards\ev74h48a.c
+rem  or src\boards\ev17p63a.c defines the one board_cfg linked into the
+rem  image, picked the same way dma.c vs sim_dma.c is - BOARDFILE below,
+rem  ev17p63a.c only for "nano". Never both in one build.
+rem
+rem  The sources live under ..\src\<folder>\ (P1.1, 27.09.2026). Every
+rem  folder is on the include path (INC below), so the sources keep
+rem  including each other as "name.h" without a folder prefix.
+rem
+rem  Verified with the versions below on 2026-09-22. Adjust the two paths
+rem  if your installation differs; nothing else needs to change.
+rem ---------------------------------------------------------------------
+
+setlocal
+
+rem Git revision for the banner -> ..\src\app\version.h (writes "unknown" without git)
+call "%~dp0version.bat"
+
+set XC_DSC=C:\Program Files\Microchip\xc-dsc\v3.31
+set DFP=C:\Program Files\Microchip\MPLABX\v6.35\packs\Microchip\dsPIC33AK-MP_DFP\1.4.260\xc16
+
+set MCU=33AK512MPS512
+set TARGET=adc_dma_40msps
+set DMA=..\src\drivers\dma.c
+set BOARDFILE=..\src\boards\ev74h48a.c
+set EXTRA=
+set OUT=..\build\%TARGET%
+
+if /i "%1"=="sim" (
+  set DMA=..\src\sim\sim_dma.c
+  set EXTRA=-D__MPLAB_DEBUGGER_SIMULATOR=1 -g
+  set OUT=..\build\%TARGET%_sim
+  rem build.bat sim <n>: run the ping-pong check at n samples per half
+  if not "%2"=="" (
+    set EXTRA=-D__MPLAB_DEBUGGER_SIMULATOR=1 -g -DSIM_HALF_LEN=%2
+    set OUT=..\build\%TARGET%_sim%2
+  )
+)
+if /i "%1"=="smoke" (
+  set DMA=..\src\sim\sim_dma.c
+  set EXTRA=-D__MPLAB_DEBUGGER_SIMULATOR=1 -g -DSIM_SMOKE=1
+  set OUT=..\build\%TARGET%_smoke
+  rem build.bat smoke fault [n]: fault case n (1..4, main.c). Default 3, the
+  rem stack error - the one trap of the four that the MPLAB X v6.35 simulator
+  rem raises (tests\baseline.md, P0.7); 1 is the plan's misaligned read, which
+  rem it executes without a trap.
+  if /i "%2"=="fault" (
+    set EXTRA=-D__MPLAB_DEBUGGER_SIMULATOR=1 -g -DSIM_SMOKE=1 -DSIM_SMOKE_FAULT=3
+    set OUT=..\build\%TARGET%_smokefault
+    if not "%3"=="" (
+      set EXTRA=-D__MPLAB_DEBUGGER_SIMULATOR=1 -g -DSIM_SMOKE=1 -DSIM_SMOKE_FAULT=%3
+      set OUT=..\build\%TARGET%_smokefault%3
+    )
+  )
+)
+rem  build.bat nano   the dsPIC33AK512MPS506 Curiosity Nano (EV17P63A): other
+rem                   device, other pins (BOARD in board.h) -> ..\build\adc_dma_40msps_nano.elf/.hex
+if /i "%1"=="nano" (
+  set MCU=33AK512MPS506
+  set EXTRA=-DBOARD=2
+  set OUT=..\build\%TARGET%_nano
+  set BOARDFILE=..\src\boards\ev17p63a.c
+)
+rem  build.bat nanosmoke  the smoke build for the Nano: "nano"'s device, pins
+rem                   and board file with "smoke"'s simulator flags, for
+rem                   tools\sim_trap.py --smoke --nano
+rem                                              -> ..\build\adc_dma_40msps_nanosmoke.elf
+if /i "%1"=="nanosmoke" (
+  set MCU=33AK512MPS506
+  set DMA=..\src\sim\sim_dma.c
+  set EXTRA=-DBOARD=2 -D__MPLAB_DEBUGGER_SIMULATOR=1 -g -DSIM_SMOKE=1
+  set OUT=..\build\%TARGET%_nanosmoke
+  set BOARDFILE=..\src\boards\ev17p63a.c
+)
+set SRC=..\src
+set MAIN=%SRC%\app\main.c
+set INC=-I%SRC%\drivers -I%SRC%\app -I%SRC%\core -I%SRC%\lab -I%SRC%\lib -I%SRC%\sim -I%SRC%\port -I%SRC%\boards
+rem  The lab (CORE, 02.10.2026): every file of src\lab\, on top of the core.
+set LAB=%SRC%\lab\meter.c %SRC%\lab\tri_eval.c %SRC%\lab\dactest.c %SRC%\lab\chaintest.c %SRC%\lab\bench.c %SRC%\lab\b2b_link.c %SRC%\lab\cli_lab.c
+rem  build.bat core: without the lab, src\lab\ and src\sim\ not even on the
+rem  include path, so a core file that reaches into the lab fails here.
+if /i "%1"=="core" (
+  set MAIN=%SRC%\core\example_main.c
+  set LAB=
+  set INC=-I%SRC%\drivers -I%SRC%\app -I%SRC%\core -I%SRC%\lib -I%SRC%\port -I%SRC%\boards
+  set OUT=..\build\%TARGET%_core
+)
+set SOURCES=%MAIN% %SRC%\app\config_bits.c %SRC%\app\port_impl.c %SRC%\drivers\clock.c %SRC%\drivers\adc.c %DMA% %SRC%\core\pingpong.c %SRC%\core\sigproc.c %SRC%\core\capture.c %SRC%\core\acquisition.c %SRC%\core\routing.c %SRC%\lib\crc16.c %SRC%\lib\fmt.c %SRC%\lib\stats.c %SRC%\lib\iir1.c %SRC%\lib\goertzel_f.c %SRC%\lib\goertzel_i.c %SRC%\lib\detect.c %SRC%\lib\wavegen.c %SRC%\core\siggen.c %SRC%\lib\frame.c %SRC%\drivers\sccp.c %SRC%\drivers\led.c %SRC%\core\diag.c %SRC%\drivers\timebase.c %SRC%\drivers\dac.c %SRC%\drivers\uart.c %SRC%\core\gui_link.c %SRC%\core\cli.c %SRC%\core\cmd_parser.c %BOARDFILE% %LAB%
+
+if not exist ..\build mkdir ..\build
+
+rem NOTE: -mdfp must point at the xc16 SUBDIRECTORY of the pack, not the
+rem pack root. The root gives "does not seem to support the selected
+rem device" because c30_device.info lives one level down.
+
+"%XC_DSC%\bin\xc-dsc-gcc.exe" ^
+  -mcpu=%MCU% ^
+  -mdfp="%DFP%" ^
+  -O1 -Wall -Wextra %EXTRA% %INC% ^
+  -T"%DFP%\support\dsPIC33A\gld\p%MCU%.gld" ^
+  %SOURCES% -o %OUT%.elf
+
+if errorlevel 1 (
+  echo.
+  echo BUILD FAILED
+  exit /b 1
+)
+
+echo.
+echo Build OK: %OUT%.elf
+if /i "%1"=="sim" goto :done
+if /i "%1"=="smoke" goto :done
+if /i "%1"=="nanosmoke" goto :done
+rem NOTE: bin2hex needs -mdfp too. Without it the HEX is still written, but
+rem it prints "Could not open resource file ... c30_device.info / Please
+rem specify the location of a DFP" and looks like a failed build.
+"%XC_DSC%\bin\xc-dsc-bin2hex.exe" -mdfp="%DFP%" %OUT%.elf
+if exist %OUT%.hex echo HEX written: %OUT%.hex
+
+:done
+endlocal

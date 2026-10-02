@@ -1,0 +1,600 @@
+"""Headless-browser test of tools/adc_gui.py against its built-in --fake
+target: connect, LIVE with the test triangle input, LIVE with a custom
+input, a rate change while LIVE, STOP, SINGLE, and no server-side
+exception.
+
+How to run (Windows, from the repository root):
+
+    pip install playwright                 (once, into whatever Python has
+                                             nicegui/pyserial/numpy too)
+    python -m playwright install chrome    (once, if Chrome is not already
+                                             on the machine - this test uses
+                                             the installed Chrome via
+                                             channel="chrome", not the
+                                             Playwright-managed Chromium)
+    python tools/gui_ui_test.py
+
+The GUI server itself is started with the system `python` (must have
+nicegui/pyserial/numpy); only the browser driver needs the `playwright`
+package. Exit code is 0 on PASS, 1 on FAIL. A full-page screenshot is
+written to the path printed at the end.
+"""
+import json
+import os
+import tempfile
+import re
+import subprocess
+import sys
+import time
+
+from playwright.sync_api import sync_playwright
+
+def free_port():
+    """A TCP port nothing listens on - a fixed one collided with a GUI left
+    running from an earlier session, and the browser then tested that one."""
+    import socket
+    with socket.socket() as so:
+        so.bind(("127.0.0.1", 0))
+        return so.getsockname()[1]
+
+
+PORT = free_port()
+# The test's own settings file, so that "save" in it never touches the
+# user's tools/adc_gui_settings.json.
+SETTINGS_TMP = os.path.join(tempfile.mkdtemp(prefix="adc_gui_test_"), "settings.json")
+
+
+def server_errors(out):
+    """Error lines of a GUI's output. A client that goes away while the
+    server shuts down leaves a ConnectionResetError (WinError 10054) from
+    asyncio's proactor on Windows - that is the browser closing, not the
+    GUI failing, so the traceback it belongs to is not counted."""
+    lines = out.splitlines()
+    if any("WinError 10054" in l for l in lines):
+        lines = [l for l in lines if not re.search(r"_call_connection_lost|10054|Traceback|"
+                                                   r"^\s+File |^\s+\^|self\._sock|ConnectionResetError", l)]
+    return [l for l in lines if re.search(r"Traceback|error|exception", l, re.I)]
+SCRATCH = os.environ.get("GUI_UI_TEST_OUT") or tempfile.gettempdir()
+SCREENSHOT = SCRATCH + r"\gui_after.png"
+GUI_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adc_gui.py")
+
+gui = subprocess.Popen(["python", GUI_SCRIPT, "--fake", "--settings", SETTINGS_TMP,
+                        "--no-browser", "--http-port", str(PORT)],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+results = []
+
+
+def check(name, ok, detail=""):
+    results.append(ok)
+    line = ("PASS " if ok else "FAIL ") + name + ("  - " + detail if detail else "")
+    print(line.encode("ascii", "replace").decode())   # the Windows console is cp1252
+
+
+def wait_text(page, locator, pattern, timeout=20.0):
+    t0 = time.time()
+    last = ""
+    while time.time() - t0 < timeout:
+        try:
+            last = locator.inner_text(timeout=1000)
+            if re.search(pattern, last):
+                return True, last
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False, last
+
+
+def wait_changed(page, locator, baseline, timeout=20.0):
+    """Like wait_text, but waits for the text to differ from `baseline`
+    rather than merely matching a pattern - a static label like 'grab 30 ...'
+    already matches '^grab \\d+' before the next grab has even happened."""
+    t0 = time.time()
+    last = baseline
+    while time.time() - t0 < timeout:
+        try:
+            last = locator.inner_text(timeout=1000)
+            if last != baseline:
+                return True, last
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False, last
+
+
+try:
+    time.sleep(10)  # let the server come up
+    with sync_playwright() as p:
+        b = p.chromium.launch(channel="chrome", headless=True)
+        page = b.new_page(viewport={"width": 1600, "height": 3400})
+        page.goto(f"http://127.0.0.1:{PORT}/")
+        time.sleep(4)  # auto-connect to the fake target
+
+        cyc = page.get_by_text(re.compile(r"^(no grab yet|grab \d|cycle failed|grab failed|stream on refused)"))
+        rate_field = page.get_by_label(re.compile(r"^rate, kSPS", re.I))
+        live = page.get_by_role("button", name=re.compile(r"^\W*live$", re.I))
+        stop_btn = page.get_by_role("button", name=re.compile(r"^\W*stop$", re.I))
+        single = page.get_by_role("button", name=re.compile(r"^\W*single$", re.I))
+        triangle_chip = page.get_by_text(re.compile(r"^(PASS|FAIL)$")).first
+        fundamental = page.get_by_text(re.compile(r"^fundamental"))
+
+        # ---- connect (fake) ----
+        conn = page.locator(".q-chip").filter(has_text="adc_dma_40msps").first
+        ok, txt = wait_text(page, conn, r".", timeout=15.0)
+        check("connect (fake)", ok, txt[:80])
+
+        # ---- LIVE with the test input: cycles at fs = the chosen rate, PASS triangle ----
+        live.click()
+        ok, txt = wait_text(page, cyc, r"^grab [3-9]")
+        check("LIVE (test input) runs grab cycles", ok, txt[:100])
+        ok_rate = "8000 kSPS actual" in cyc.inner_text() or re.search(r"79\d\d kSPS actual|80\d\d kSPS actual", cyc.inner_text())
+        check("LIVE (test input) fs follows the chosen rate (8000)", bool(ok_rate), cyc.inner_text()[:100])
+        ok, txt = wait_text(page, triangle_chip, r"^PASS$")
+        check("LIVE (test input) shows a PASS triangle verdict", ok, txt[:60])
+
+        # ---- a rate change while LIVE: the actual rate follows ----
+        rate_field.fill("4000")
+        rate_field.press("Tab")
+        time.sleep(2.5)
+        ok, txt = wait_text(page, cyc, r"4\d\d\d kSPS actual")
+        check("rate change while LIVE takes effect (actual rate follows)", ok, txt[:100])
+
+        # back to 8000 before switching input, so the next check is unambiguous
+        rate_field.fill("8000")
+        rate_field.press("Tab")
+        time.sleep(1.5)
+
+        # ---- STOP ----
+        stop_btn.first.click()
+        time.sleep(1.0)
+        ok_live_btn = live.count() == 1
+        check("STOP puts the button back to 'live'", ok_live_btn)
+
+        # ---- LIVE with a non-test input: spectrum with a fundamental, no triangle verdict ----
+        page.get_by_label(re.compile(r"^input$", re.I)).click()
+        page.get_by_text("custom input", exact=True).click()
+        core_field = page.get_by_label(re.compile(r"^core \(1\.\.5\)", re.I))
+        pin_field = page.get_by_label(re.compile(r"^PINSEL", re.I))
+        core_field.click()
+        page.get_by_role("option", name="ADC3").click()
+        pin_field.fill("5")
+        pin_field.press("Tab")
+
+        live.click()
+        ok, txt = wait_text(page, cyc, r"^grab [3-9]")
+        check("LIVE (custom input core 3 pin 5) runs grab cycles", ok, txt[:100])
+        ok, txt = wait_text(page, fundamental, r"fundamental")
+        check("LIVE (custom input) spectrum shows a fundamental", ok, txt[:60])
+        triangle_card_visible = page.get_by_text("triangle verdict · test input only").is_visible()
+        check("LIVE (custom input) hides the triangle verdict card", not triangle_card_visible)
+
+        # ---- TRG.5: trigger on while LIVE (chip "trig @", level line drawn), off again ----
+        trig_chip = page.locator(".q-chip").filter(has_text=re.compile(r"^(trigger off|trig @ \d+|no trigger)$")).first
+        tchart_trg = page.locator(".tile", has=page.locator(".card-title", has_text="time signal"))                          .locator(".nicegui-echart").first
+
+        def mark_line():
+            """The time series' markLine level as ECharts has it, or None."""
+            return page.evaluate(
+                "id => { const o = getElement(id).chart.getOption();"
+                " const m = o.series[0].markLine; return m && m.data && m.data.length"
+                " ? m.data[0].yAxis : null; }", int(tchart_trg.get_attribute("id")[1:]))
+        page.get_by_role("checkbox", name=re.compile(r"^trigger$", re.I)).click()
+        ok, txt = wait_text(page, trig_chip, r"^trig @ \d+$")
+        check("trigger on while LIVE: chip 'trig @ k' appears", ok, txt[:40])
+        lvl = mark_line()
+        check("trigger on: the level line is drawn at 2048", lvl == 2048, repr(lvl))
+        page.get_by_role("checkbox", name=re.compile(r"^trigger$", re.I)).click()
+        ok, txt = wait_text(page, trig_chip, r"^trigger off$")
+        check("trigger off again: chip 'trigger off', level line gone", ok and mark_line() is None, txt[:40])
+
+        stop_btn.first.click()
+        time.sleep(1.0)
+
+        # ---- SINGLE works when not live ----
+        c0 = cyc.inner_text()
+        single.click()
+        ok, txt = wait_changed(page, cyc, c0, timeout=15.0)
+        check("SINGLE grabs once when not live", ok, txt[:100])
+
+        # ---- test input: DAC2 card 'on' + apply puts its triangle on RA8 ----
+        tchart_el = page.locator(".tile", has=page.locator(".card-title", has_text="time signal")) \
+                        .locator(".nicegui-echart").first
+
+        def time_max():
+            return tchart_el.evaluate(
+                "e => { const c = (window.echarts && echarts.getInstanceByDom(e)) || "
+                "getElement(e.id.replace(/^c/, '')).chart; "
+                "const d = c.getOption().series[0].data || []; "
+                "return d.length ? Math.max(...d.map(p => p[1])) : -1; }")
+        page.get_by_label(re.compile(r"^input$", re.I)).click()
+        page.get_by_text("RA8 / DAC2 test triangle (core 5, pin 3)", exact=True).click()
+        time.sleep(0.5)
+        dac2 = page.locator(".tile", has=page.locator(".card-title", has_text="dac2 · triangle"))
+        dac2.get_by_label(re.compile(r"^dac2$", re.I)).click()
+        page.get_by_role("option", name="on", exact=True).click()
+        hi = dac2.get_by_label(re.compile(r"^high", re.I))
+        hi.fill("1500")
+        c0 = cyc.inner_text()     # no Tab: apply straight from the field, as a user does
+        dac2.get_by_role("button", name=re.compile(r"apply dac2", re.I)).click()
+        wait_changed(page, cyc, c0, timeout=15.0)
+        time.sleep(1.0)
+        m_on = time_max()
+        live.click()
+        hi.fill("2000")                   # no apply: the card sends it by itself
+        time.sleep(4.0)
+        m_auto = time_max()
+        stop_btn.first.click()
+        time.sleep(1.0)
+        check("DAC2 card: a changed value reaches the time chart without apply (LIVE)",
+              abs(m_auto - 2000) < 60, f"max {m_auto}")
+        dac2.get_by_label(re.compile(r"^dac2$", re.I)).click()
+        page.get_by_role("option", name="off", exact=True).click()
+        time.sleep(3.0)                   # the card sends it by itself, then one grab
+        m_off = time_max()
+        live.click()
+        rate_field.fill("4000")
+        rate_field.press("Tab")
+        time.sleep(4.0)
+        m_off_rate = time_max()
+        stop_btn.first.click()
+        time.sleep(1.0)
+        rate_field.fill("8000")
+        rate_field.press("Tab")
+        dac2.get_by_label(re.compile(r"^dac2$", re.I)).click()
+        page.get_by_role("option", name=re.compile(r"^auto"), exact=False).click()
+        time.sleep(3.0)
+        m_auto = time_max()
+        check("test input: DAC2 'on' (high 1500) reaches the time chart, 'off' is a quiet channel "
+              "(also after a rate change), 'auto' the firmware's triangle",
+              abs(m_on - 1500) < 60 and m_off < 100 and m_off_rate < 100 and m_auto > 3000,
+              f"max on {m_on}, off {m_off}, off after rate change {m_off_rate}, auto {m_auto}")
+
+        # ---- tooltips: readable size, and the header checkbox hides them ----
+        rate_field.hover()
+        time.sleep(1.5)
+        tip = page.locator(".q-tooltip").first
+        vis = tip.is_visible()
+        size = tip.evaluate("e => getComputedStyle(e).fontSize") if vis else "-"
+        check("tooltip shows on hover, at 18px", vis and size == "18px", size)
+        page.mouse.move(5, 5)
+        time.sleep(0.8)
+        page.get_by_role("checkbox", name=re.compile(r"tooltips", re.I)).click()
+        time.sleep(0.5)
+        rate_field.hover()
+        time.sleep(1.5)
+        hidden = all(not t.is_visible() for t in page.locator(".q-tooltip").all())
+        check("header checkbox 'tooltips' off hides every tooltip", hidden)
+        page.get_by_role("checkbox", name=re.compile(r"tooltips", re.I)).click()
+
+        # ---- time chart: tooltip "time / counts (dot) volts / sample", vref ----
+        tchart = page.locator(".tile", has=page.locator(".card-title", has_text="time signal")) \
+                     .locator(".nicegui-echart").first
+        TT_RE = re.compile(r"^([\d.]+) \S+\n(\d+)\D+([\d.]+) V\nsample (\d+)$")
+
+        def chart_tooltip():
+            bx = tchart.bounding_box()
+            page.mouse.move(bx["x"] + bx["width"] * 0.55, bx["y"] + bx["height"] * 0.5)
+            time.sleep(1.2)
+            tt = page.evaluate("() => [...document.querySelectorAll('div')].filter(d => d.style && "
+                               "d.style.zIndex === '9999999' && d.innerText).map(d => d.innerText)")
+            return tt[0] if tt else ""
+        tt = chart_tooltip()
+        m = TT_RE.match(tt)
+        ok_tt = bool(m) and abs(float(m.group(3)) - int(m.group(2)) * 3.3 / 4096) < 0.002
+        check("time tooltip: time / counts, dot, volts / sample (at 3.3 V)", ok_tt,
+              tt.replace("\n", " | "))
+        vref = page.get_by_label(re.compile(r"^reference voltage", re.I))
+        vref.fill("2.5")
+        vref.press("Tab")
+        time.sleep(0.8)
+        tt = chart_tooltip()
+        m = TT_RE.match(tt)
+        ok_tt = bool(m) and abs(float(m.group(3)) - int(m.group(2)) * 2.5 / 4096) < 0.002
+        check("reference voltage 2.5 V: the tooltip's volts follow", ok_tt, tt.replace("\n", " | "))
+        page.mouse.move(5, 5)
+
+        # ---- tiles fold and unfold on a click on their title ----
+        title = page.locator(".tile .card-title", has_text="spectrum")
+        # what sits under the title: the tile's second child (the chart)
+        canvas = page.locator(".tile", has=page.locator(".card-title", has_text="spectrum"))                      .locator(":scope > :nth-child(2)").first
+        before = canvas.is_visible()
+        title.click()
+        time.sleep(0.5)
+        folded = not canvas.is_visible()
+        arrow = title.evaluate("e => getComputedStyle(e, '::before').content")
+        title.click()
+        time.sleep(0.8)
+        unfolded = canvas.is_visible()
+        check("a tile folds on a click on its title and unfolds again",
+              before and folded and unfolded,
+              f"visible before {before}, hidden when folded {folded}, visible again {unfolded}")
+
+        # ---- fake target signal: sine or a DAC triangle ----
+        freq = page.get_by_label(re.compile(r"^frequency, kHz", re.I))
+        page.get_by_label(re.compile(r"^signal$", re.I)).click()
+        page.get_by_role("option", name="sine generator (parameters below)", exact=True).click()
+        time.sleep(0.5)
+        vis_sine = freq.is_visible()
+        page.get_by_label(re.compile(r"^signal$", re.I)).click()
+        page.get_by_role("option", name="DAC2 triangle (RA8)", exact=True).click()
+        time.sleep(0.5)
+        hid_dac = not freq.is_visible()
+        page.get_by_label(re.compile(r"^signal$", re.I)).click()
+        page.get_by_role("option", name="sine generator (parameters below)", exact=True).click()
+        time.sleep(0.5)
+        check("fake signal: sine parameters shown for 'sine', hidden for 'DAC2 triangle'",
+              vis_sine and hid_dac and freq.is_visible())
+
+        # ---- fake signal 'sine' with the test input: the time chart shows it ----
+        page.get_by_label(re.compile(r"^signal$", re.I)).click()
+        page.get_by_role("option", name="sine generator (parameters below)", exact=True).click()
+        c0 = cyc.inner_text()
+        single.click()
+        wait_changed(page, cyc, c0, timeout=15.0)
+        time.sleep(1.0)
+        m_sine = time_max()
+        tri_vis = page.get_by_text("triangle verdict · test input only").is_visible()
+        page.get_by_label(re.compile(r"^signal$", re.I)).click()
+        page.get_by_role("option", name="DAC2 triangle (RA8)", exact=True).click()
+        c0 = cyc.inner_text()
+        single.click()
+        wait_changed(page, cyc, c0, timeout=15.0)
+        time.sleep(1.0)
+        m_tri = time_max()
+        check("test input: fake 'sine' shows the sine (max ~2048+1500+150), no triangle verdict; "
+              "'DAC2' the triangle again", 3300 <= m_sine <= 3800 and not tri_vis and m_tri > 3700,
+              f"max sine {m_sine}, triangle card shown {tri_vis}, max DAC2 {m_tri}")
+
+        # ---- settings: fold a tile, keep vref 2.5 V, save to the test's file ----
+        page.locator(".tile .card-title", has_text="buffer").click()
+        time.sleep(0.5)
+        try:
+            kept = json.load(open(SETTINGS_TMP, encoding="utf-8")).get("view", {}).get("collapsed", [])
+        except (OSError, ValueError):
+            kept = []
+        check("a fold is written to the settings file at once, without 'save'", "buffer" in kept, str(kept))
+        page.get_by_role("button", name=re.compile(r"^\W*save$", re.I)).click()
+        time.sleep(1.0)
+        try:
+            saved = json.load(open(SETTINGS_TMP, encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+        check("save writes view.collapsed, view.vref and connection.port",
+              "buffer" in saved.get("view", {}).get("collapsed", []) and
+              abs(saved.get("view", {}).get("vref", 0) - 2.5) < 1e-6 and
+              "port" in saved.get("connection", {}),
+              json.dumps(saved.get("view", {}))[:120])
+
+        page.screenshot(path=SCREENSHOT, full_page=True)
+
+        # "documentation": docs/ARCHITECTURE.md in a dialog, both diagrams
+        # actually loaded through the GUI's static route (naturalWidth > 0)
+        page.get_by_role("button", name=re.compile(r"documentation", re.I)).click()
+        heading = page.locator(".arch-doc h2", has_text="Layers and modules")
+        try:
+            heading.wait_for(timeout=10000)
+            shown = True
+        except Exception:
+            shown = False
+        time.sleep(1.0)
+        widths = page.eval_on_selector_all(".arch-doc img", "els => els.map(e => e.naturalWidth)")
+        check("documentation opens ARCHITECTURE.md with both diagrams loaded",
+              shown and len(widths) >= 2 and all(w > 0 for w in widths), f"shown={shown} widths={widths}")
+        page.screenshot(path=SCREENSHOT.replace(".png", "_docs.png"))
+        page.keyboard.press("Escape")
+
+        # ---- SG.7: the signal generator card - loop preset, LIVE, the loop
+        # chip and the overlay, generator off again ----
+        loop_chip = page.locator(".q-chip").filter(has_text=re.compile(r"^loop ")).first
+        # the case that hid the generator on 29.09.2026: DAC2's own card left
+        # 'on' from an earlier session - its triangle must not replace the
+        # generator after the loop preset's 'stream on'
+        page.get_by_label(re.compile(r"^dac2$", re.I)).click()
+        page.get_by_role("option", name="on", exact=True).click()
+        time.sleep(1.5)
+        page.get_by_role("button", name=re.compile(r"^\W*loop preset$", re.I)).click()
+        time.sleep(1.5)
+        live.click()
+        ok, txt = wait_text(page, loop_chip, r"^loop rms [\d.]+ LSB")
+        check("signal generator: loop preset + LIVE -> the loop chip reports a match", ok, txt[:90])
+        m = re.search(r"loop rms ([\d.]+) LSB", txt)
+        check("signal generator: the stand-in's loop residual is small (< 30 LSB)",
+              bool(m) and float(m.group(1)) < 30, txt[:90])
+        tchart_sg = page.locator(".tile", has=page.locator(".card-title", has_text="time signal")) \
+                        .locator(".nicegui-echart").first
+        n_overlay = page.evaluate(
+            "id => { const o = getElement(id).chart.getOption(); return o.series.length > 1 ?"
+            " o.series[1].data.length : -1; }", int(tchart_sg.get_attribute("id")[1:]))
+        check("signal generator: the expected signal is drawn over the grab", n_overlay > 100, str(n_overlay))
+        # with the trigger on too, the overlay follows the triggered window
+        page.get_by_role("checkbox", name=re.compile(r"^trigger$", re.I)).click()
+        time.sleep(2.5)
+        ok, txt = wait_text(page, loop_chip, r"^loop rms [\d.]+ LSB")
+        check("signal generator: loop and trigger together", ok, txt[:60])
+        page.get_by_role("checkbox", name=re.compile(r"^trigger$", re.I)).click()
+        stop_btn.first.click()
+        time.sleep(1.0)
+        page.get_by_label(re.compile(r"^generator$", re.I)).click()
+        page.get_by_role("option", name="off", exact=True).click()
+        time.sleep(2.0)
+        single.click()
+        ok, txt = wait_text(page, loop_chip, r"^loop –$")
+        check("signal generator: off -> no loop verdict", ok, txt[:40])
+
+        # ---- DISCONNECT while LIVE: waits for the running grab, no
+        # "cycle failed" (29.09.2026: the port was closed under a grab) ----
+        time.sleep(0.5)
+        live.click()
+        wait_text(page, cyc, r"^grab \d")
+        page.get_by_role("button", name=re.compile(r"^\W*disconnect$", re.I)).click()
+        time.sleep(3.0)
+        chip_txt = page.get_by_text("not connected").count()
+        check("DISCONNECT while LIVE: no 'cycle failed', not connected",
+              chip_txt >= 1 and not cyc.inner_text().startswith("cycle failed"), cyc.inner_text()[:100])
+        b.close()
+finally:
+    gui.terminate()
+    try:
+        out = gui.communicate(timeout=10)[0]
+    except Exception:
+        out = ""
+    errs = server_errors(out)
+    check("no server-side exceptions", not errs, "; ".join(errs[:5]))
+
+# ---- the Curiosity Nano profile: a second GUI whose fake reports the EV17P63A ----
+NANO_PORT = free_port()
+gui2 = subprocess.Popen(["python", GUI_SCRIPT, "--fake", "--fake-board", "EV17P63A",
+                         "--no-browser", "--http-port", str(NANO_PORT)],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+try:
+    time.sleep(10)
+    with sync_playwright() as p:
+        b = p.chromium.launch(channel="chrome", headless=True)
+        page = b.new_page(viewport={"width": 1600, "height": 3400})
+        page.goto(f"http://127.0.0.1:{NANO_PORT}/")
+        time.sleep(4)
+        conn = page.locator(".q-chip").filter(has_text="adc_dma_40msps").first
+        ok, txt = wait_text(page, conn, r"EV17P63A", timeout=15.0)
+        check("Nano: the board is detected from 'version'", ok, txt[:90])
+
+        # The preset after detection is the DAC loopback: DAC2 -> RA8 -> AD5AN3,
+        # shown as such on the board tile (core ADC5, AN3 · RA8, source DAC2).
+        # The tile's selects are disabled in test mode, so they are read as
+        # field texts ("label value"), not looked up by their aria label.
+        fields = [t.replace("\n", " ") for t in page.locator(".q-field").all_inner_texts()]
+
+        def field_text(label):
+            return " ".join(t for t in fields if t.startswith(label))
+        core_t = field_text("core ")
+        chan_t = field_text("channel (PINSEL)")
+        src_t = field_text("signal source")
+        page.screenshot(path=SCRATCH + r"\gui_nano.png", full_page=True)
+        check("Nano: preset is the DAC loopback on the board tile (ADC5, AN3 = RA8, DAC2)",
+              ("ADC5" in core_t) and ("AN3" in chan_t and "RA8" in chan_t) and ("DAC2" in src_t),
+              f"{core_t[:30]} | {chan_t[:40]} | {src_t[:40]}")
+        cyc = page.get_by_text(re.compile(r"^(no grab yet|grab \d|cycle failed|grab failed|stream on refused)")).first
+        page.get_by_role("button", name=re.compile(r"^\W*live$", re.I)).click()
+        ok, txt = wait_text(page, cyc, r"^grab [3-9]")
+        check("Nano: LIVE on the loopback runs grab cycles", ok, txt[:90])
+        ok, txt = wait_text(page, page.get_by_text(re.compile(r"^(PASS|FAIL)$")).first, r"^PASS$")
+        check("Nano: the loopback triangle passes the grid check", ok, txt[:30])
+        page.get_by_role("button", name=re.compile(r"^\W*stop$", re.I)).first.click()
+        time.sleep(1.0)
+
+        page.get_by_label(re.compile(r"^input$", re.I)).click()
+        page.get_by_text("custom input", exact=True).click()
+        core_txt = page.get_by_label(re.compile(r"^core \(1\.\.5\)", re.I)).locator("xpath=ancestor::label").inner_text()
+        pin_val = page.get_by_label(re.compile(r"^PINSEL", re.I)).input_value()
+        check("Nano: default input switched to core 1, PINSEL 0 (RA2)",
+              ("ADC1" in core_txt) and pin_val == "0", f"{core_txt.split()[-1]} / {pin_val}")
+        c0 = cyc.inner_text()
+        page.get_by_role("button", name=re.compile(r"^\W*live$", re.I)).click()
+        ok, txt = wait_changed(page, cyc, c0, timeout=15.0)
+        check("Nano: LIVE on the default input runs grab cycles", ok, txt[:90])
+        ok, txt = wait_text(page, page.get_by_text(re.compile(r"^fundamental")), r"fundamental")
+        check("Nano: spectrum shows a fundamental", ok, txt[:60])
+        page.get_by_role("button", name=re.compile(r"^\W*stop$", re.I)).first.click()
+        b.close()
+finally:
+    gui2.terminate()
+    try:
+        out = gui2.communicate(timeout=10)[0]
+    except Exception:
+        out = ""
+    errs = server_errors(out)
+    check("Nano: no server-side exceptions", not errs, "; ".join(errs[:5]))
+
+# ---- a new start reads the saved file; "standard" puts the standard back ----
+PORT3 = free_port()
+gui3 = subprocess.Popen(["python", GUI_SCRIPT, "--fake", "--settings", SETTINGS_TMP,
+                         "--no-browser", "--http-port", str(PORT3)],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+try:
+    time.sleep(10)
+    with sync_playwright() as p:
+        b = p.chromium.launch(channel="chrome", headless=True)
+        page = b.new_page(viewport={"width": 1600, "height": 3400})
+        page.goto(f"http://127.0.0.1:{PORT3}/")
+        time.sleep(5)
+        buf_tile = page.locator(".tile", has=page.locator(".card-title", has_text="buffer")).first
+        vref = page.get_by_label(re.compile(r"^reference voltage", re.I))
+        folded = "collapsed" in (buf_tile.get_attribute("class") or "")
+        v = vref.input_value()
+        check("restart: the saved file is read (buffer tile folded, vref 2.5)",
+              folded and v.replace(",", ".").startswith("2.5"), f"folded {folded}, vref {v}")
+        page.get_by_role("button", name=re.compile(r"^\W*standard$", re.I)).click()
+        time.sleep(1.5)
+        folded = "collapsed" in (buf_tile.get_attribute("class") or "")
+        v = vref.input_value()
+        check("'standard' puts the standard back (tile open, vref 3.3)",
+              (not folded) and v.replace(",", ".").startswith("3.3"), f"folded {folded}, vref {v}")
+        b.close()
+finally:
+    gui3.terminate()
+    try:
+        out = gui3.communicate(timeout=10)[0]
+    except Exception:
+        out = ""
+    errs = server_errors(out)
+    check("settings restart: no server-side exceptions", not errs, "; ".join(errs[:5]))
+
+# ---- "remote": which link is missing, and the page stays responsive ----
+# A GUI started with --remote against tests/host/fake_bench_client.py (never
+# the real relay), once per FAKE_BENCH_SCENARIO: the chip of the missing link
+# turns negative, the ones before it positive, and the page never shows
+# NiceGUI's "Connection lost" (the connect used to block the event loop).
+FAKE_BENCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "host",
+                          "fake_bench_client.py")
+REMOTE_CASES = [("agent_offline", {"relay": "positive", "bench agent": "negative"}),
+                ("no_port", {"relay": "positive", "bench agent": "positive", "console port": "negative"}),
+                ("board_silent", {"console port": "positive", "board": "negative"}),
+                ("ok", {"relay": "positive", "bench agent": "positive", "console port": "positive",
+                        "board": "positive"})]
+for sc, want in REMOTE_CASES:
+    port_r = free_port()
+    env = dict(os.environ, FAKE_BENCH_SCENARIO=sc,
+               FAKE_BENCH_STATE_DIR=tempfile.mkdtemp(prefix="fake_bench_"))
+    gui_r = subprocess.Popen(["python", GUI_SCRIPT, "--remote", "--bench-client", FAKE_BENCH,
+                              "--settings", os.path.join(tempfile.mkdtemp(prefix="adc_gui_r_"), "s.json"),
+                              "--no-browser", "--http-port", str(port_r)],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    try:
+        time.sleep(10)
+        with sync_playwright() as p:
+            b = p.chromium.launch(channel="chrome", headless=True)
+            page = b.new_page(viewport={"width": 1600, "height": 1200})
+            page.goto(f"http://127.0.0.1:{port_r}/")
+            got, deadline = {}, time.time() + 40
+            while time.time() < deadline:
+                got = {}
+                for name in want:
+                    # the chip's text is exactly "<icon ligature> <name>"; the
+                    # connection chip's error text also mentions the links
+                    chip = page.locator(".q-chip").filter(
+                        has_text=re.compile(r"(^|[a-z_]\s*)" + re.escape(name) + r"$")).first
+                    cls = chip.get_attribute("class") or ""
+                    got[name] = ("positive" if "positive" in cls else
+                                 "negative" if "negative" in cls else "grey")
+                if got == want:
+                    break
+                time.sleep(1)
+            lost = sum(1 for i in range(page.get_by_text(re.compile(r"Connection lost", re.I)).count())
+                       if page.get_by_text(re.compile(r"Connection lost", re.I)).nth(i).is_visible())
+            check(f"remote {sc!r}: the chips name the missing link, page stays connected",
+                  got == want and lost == 0, f"{got} lost={lost}")
+            if sc == "ok":
+                conn = page.locator(".q-chip").filter(has_text="RTT").count()
+                check("remote 'ok': connected, the round trip shown in the connection chip",
+                      conn >= 1, f"chips with RTT: {conn}")
+            b.close()
+    finally:
+        gui_r.terminate()
+        try:
+            out = gui_r.communicate(timeout=10)[0]
+        except Exception:
+            out = ""
+        errs = server_errors(out)
+        check(f"remote {sc!r}: no server-side exceptions", not errs, "; ".join(errs[:5]))
+
+print("UI TEST", "PASS" if all(results) else "FAIL")
+print("screenshot:", SCREENSHOT)
+sys.exit(0 if all(results) else 1)
