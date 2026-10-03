@@ -1,0 +1,49 @@
+{
+  "format": "fdesign-gui",
+  "version": 1,
+  "spec": {
+    "type": "lowpass",
+    "characteristic": "chebyshev",
+    "fs": 20000,
+    "ap": 0.5,
+    "as": 50,
+    "edges": {
+      "lowpass": [
+        1000.0,
+        2000.0
+      ]
+    }
+  },
+  "implementation": {
+    "arithmetic": "fixed16",
+    "section_scaling": true,
+    "auto_q": true,
+    "frac_bits": 14,
+    "c_name": "motor_current_lp"
+  },
+  "view": {
+    "dark": true,
+    "magnitude_scale": "db",
+    "frequency_axis": "lin",
+    "tolerance_scheme": true,
+    "implemented_response": true,
+    "phase": "unwrap",
+    "group_delay_unit": "ms",
+    "time_response": "impulse",
+    "test_view": "freq"
+  },
+  "test": {
+    "implementations": [
+      "float",
+      "double",
+      "fixed32",
+      "fixed16"
+    ],
+    "signal": "noise",
+    "f1": 500.0,
+    "f2": 3000.0,
+    "amplitude": 0.9,
+    "samples": 2048,
+    "compiler": "gcc"
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "format": "fdesign-gui",
+  "version": 1,
+  "spec": {
+    "type": "highpass",
+    "characteristic": "butterworth",
+    "fs": 16000,
+    "ap": 1,
+    "as": 32.0,
+    "edges": {
+      "highpass": [
+        60.0,
+        120.0
+      ]
+    }
+  },
+  "implementation": {
+    "arithmetic": "fixed16",
+    "section_scaling": true,
+    "auto_q": true,
+    "frac_bits": 14,
+    "c_name": "overload_demo_hp"
+  },
+  "view": {
+    "dark": true,
+    "magnitude_scale": "db",
+    "frequency_axis": "log",
+    "tolerance_scheme": true,
+    "implemented_response": true,
+    "phase": "unwrap",
+    "group_delay_unit": "ms",
+    "time_response": "impulse",
+    "test_view": "out"
+  },
+  "test": {
+    "implementations": [
+      "float",
+      "double",
+      "fixed32",
+      "fixed16"
+    ],
+    "signal": "chirp",
+    "f1": 8.0,
+    "f2": 7200.0,
+    "amplitude": 0.9,
+    "samples": 4096,
+    "compiler": "gcc"
+  }
+}

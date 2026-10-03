@@ -58,3 +58,8 @@ tools/adc_gui_settings.json
 defmplabxtrace.log*
 **/defmplabxtrace.log*
 MPLABXLog.xml*
+
+# tools/filterdesign: the fdesign command line tool, built on first use
+# (fdcore.build_fdesign(), or make in tools/filterdesign/fdesign)
+tools/filterdesign/fdesign/fdesign.exe
+tools/filterdesign/fdesign/fdesign

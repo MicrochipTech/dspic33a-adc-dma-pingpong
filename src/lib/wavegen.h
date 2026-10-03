@@ -54,6 +54,19 @@
  * rounding is about that many x 4e-7 rad; up to a few hundred periods
  * (the P3.1 vectors: 72) that is well under 0.1 LSB of a 12-bit table.
  *
+ * Noise (03.10.2026, for measuring a filter's frequency response): with
+ * noise > 0 every value gets noise x r_i added AFTER the envelope,
+ *   y_i = exp(-decay t_i) x sum_k a_k sin(...) + noise x r_i,
+ * r_i uniform in [-1, 1), white. r_i is a hash of the index i (wavegen_noise_u():
+ * a 32-bit integer mix, the same in tools/wavegen_model.py), not a running
+ * generator - the table is computed twice, and the Python model has to
+ * reproduce it value for value. noise is relative to the fundamental's
+ * amplitude 1: f0 = 0 (allowed only with noise > 0) gives noise alone,
+ * then without snap. The table is still played cyclically: its period
+ * n / play_hz should span several of the ADC's blocks, so that every grab
+ * sees another piece of it (the GUI's noise setup: n 8192, play_hz = 2 x
+ * the sample rate - flat to fs/2 within the DAC's hold, and four blocks of
+ * 1024 per period).
  * Option `snap`: the table is played cyclically, and unless
  * f0 x n / play_hz is a whole number the signal jumps at the wrap. With
  * snap the fundamental is moved to the nearest whole number of periods
@@ -62,7 +75,8 @@
  * matter, but snap is still honoured.
  *
  * wavegen_fill() checks its inputs and returns a code instead of a table
- * for: n < 2, play_hz = 0, f0 outside (0, play_hz / 2), decay < 0,
+ * for: n < 2, play_hz = 0, f0 outside (0, play_hz / 2) - 0 allowed with
+ * noise > 0 -, noise outside [0, 100], decay < 0,
  * amplitude outside (0, 1] (0 would divide by zero in the script's
  * formula), out_min >= out_max, and a flat signal (max y = min y - e.g.
  * a decay so large that every sample after the first is 0).
@@ -82,6 +96,7 @@ typedef struct {
     float    amplitude;    /* 0 < amplitude <= 1 */
     uint16_t out_min;      /* output range, for the DAC 205 .. 3890 (ATDF) */
     uint16_t out_max;
+    float    noise;        /* white noise, relative to the fundamental, 0..100 (0 = none) */
 } wavegen_cfg_t;
 
 typedef enum {
@@ -92,8 +107,12 @@ typedef enum {
     WAVEGEN_E_DECAY,       /* decay < 0 */
     WAVEGEN_E_AMPLITUDE,   /* amplitude <= 0 or > 1 */
     WAVEGEN_E_RANGE,       /* out_min >= out_max */
-    WAVEGEN_E_FLAT         /* the signal has no swing to scale */
+    WAVEGEN_E_FLAT,        /* the signal has no swing to scale */
+    WAVEGEN_E_NOISE        /* noise < 0 or > 100 */
 } wavegen_result_t;
+
+/* The noise value for table index i: uniform in [-1, 1) (wavegen.h above). */
+float wavegen_noise_u(uint32_t i);
 
 /* The fundamental snapped to the nearest whole number of periods in the
  * table (at least one): round(f0 n / play_hz) x play_hz / n. */

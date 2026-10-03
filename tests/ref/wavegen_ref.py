@@ -102,6 +102,7 @@ def add_wave_args(p):
                    help="factors of the 2nd..7th harmonic (script defaults)")
     p.add_argument("--decay", type=float, default=1000.0, help="envelope exp(-decay t)")
     p.add_argument("--amplitude", type=float, default=1.0)
+    p.add_argument("--noise", type=float, default=0.0, help="white noise, relative to the fundamental")
     p.add_argument("--out", required=True, help="CSV to write")
 
 
@@ -131,7 +132,7 @@ def main(argv):
 
     if a.cmd == "table":
         tab = wavegen(a.n, a.play_hz, a.f0, a.harm, a.decay, a.amplitude,
-                      a.out_min, a.out_max)
+                      a.out_min, a.out_max, a.noise)
         write_csv(a.out, cmd, ["i", "value"], enumerate(tab))
         print("%s: %d values, min %d, max %d" % (a.out, len(tab), min(tab), max(tab)))
         return 0

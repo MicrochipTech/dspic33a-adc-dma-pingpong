@@ -31,6 +31,22 @@
       "evidence": "HARDWARE-LOG 2026-09-29: the GUI's signal generator card on the board",
       "rev": "86f4753"
     },
+    "filterdesign/": {
+      "status": "pending",
+      "offboard": true,
+      "blocks": [],
+      "open": [
+        "the dsPIC33 tab's flash step against a board (only 'programmer not found' was seen), and the Curiosity Nano's drag-and-drop flash never ran"
+      ],
+      "files": [
+        "tools/filterdesign/gui/app.py",
+        "tools/filterdesign/gui/firmware.py",
+        "tools/filterdesign/gui/codegen.py",
+        "tools/filterdesign/gui/fdcore.py"
+      ],
+      "evidence": "new 03.10.2026: test_codegen.py (40 C builds, fixtures), fw_ui_test.py (install, build, dsPIC33 GUI on the fake target); no board",
+      "rev": null
+    },
     "adc_gui.py (host)": {
       "status": "tested",
       "offboard": true,
@@ -367,11 +383,13 @@
       "offboard": true,
       "blocks": [],
       "open": [
-        "the low-pass (fs/8 since 02.10.2026) ran on the board - frequency response within 0.7 dB of the design, grabs with proc=1 - but not with this committed version yet; it keeps up only to 2 MSPS (about 63 CPU cycles per sample)"
+        "the low-pass (fs/8 since 02.10.2026) ran on the board - frequency response within 0.7 dB of the design, grabs with proc=1 - but not with this committed version yet; it keeps up only to 2 MSPS (about 63 CPU cycles per sample)",
+        "the user filter ('sigproc user', 03.10.2026, user_filter.h from tools/filterdesign) never ran on a board: host test_user_filter_xcheck (bit-exact for fixed point) and the simulator smoke only"
       ],
       "files": [
         "src/core/sigproc.c",
-        "src/core/sigproc.h"
+        "src/core/sigproc.h",
+        "src/core/user_filter.h"
       ],
       "evidence": "HARDWARE-LOG 2026-10-02 (the low-pass entry); not marked tested - no board run of the committed revision",
       "rev": null

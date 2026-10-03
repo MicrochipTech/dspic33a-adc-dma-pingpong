@@ -37,7 +37,8 @@
     "lo": 800,
     "hi": 3500,
     "snap": true,
-    "force": true
+    "force": true,
+    "noise": 0.0
   },
   "trigger": {
     "on": false,

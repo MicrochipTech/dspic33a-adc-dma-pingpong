@@ -1,0 +1,49 @@
+{
+  "format": "fdesign-gui",
+  "version": 1,
+  "spec": {
+    "type": "lowpass",
+    "characteristic": "elliptic",
+    "fs": 44100,
+    "ap": 0.1,
+    "as": 80,
+    "edges": {
+      "lowpass": [
+        9000.0,
+        11025.0
+      ]
+    }
+  },
+  "implementation": {
+    "arithmetic": "double",
+    "section_scaling": true,
+    "auto_q": true,
+    "frac_bits": 30,
+    "c_name": "anti_alias_lp"
+  },
+  "view": {
+    "dark": true,
+    "magnitude_scale": "db",
+    "frequency_axis": "lin",
+    "tolerance_scheme": true,
+    "implemented_response": true,
+    "phase": "unwrap",
+    "group_delay_unit": "ms",
+    "time_response": "impulse",
+    "test_view": "freq"
+  },
+  "test": {
+    "implementations": [
+      "float",
+      "double",
+      "fixed32",
+      "fixed16"
+    ],
+    "signal": "chirp",
+    "f1": 0.0,
+    "f2": 19845.0,
+    "amplitude": 0.9,
+    "samples": 4096,
+    "compiler": "gcc"
+  }
+}

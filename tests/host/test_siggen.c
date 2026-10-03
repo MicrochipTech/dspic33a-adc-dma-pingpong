@@ -157,8 +157,15 @@ int main(void)
     CHECK_EQ(siggen_set("h1", 1), SIGGEN_E_PARAM);
     CHECK_EQ(siggen_set("h8", 1), SIGGEN_E_PARAM);
     CHECK_EQ(siggen_set("h", 1), SIGGEN_E_PARAM);
-    CHECK_EQ(siggen_set("f0", 0), SIGGEN_E_VALUE);
     CHECK_EQ(siggen_set("f0", -5), SIGGEN_E_VALUE);
+    /* noise (03.10.2026): 0..100, and f0 0 = no tone, the noise alone */
+    CHECK_EQ(siggen_set("noise", 1000000), SIGGEN_OK);
+    CHECK_EQ(siggen_set("noise", 100000000), SIGGEN_OK);
+    CHECK_EQ(siggen_set("noise", 100000001), SIGGEN_E_VALUE);
+    CHECK_EQ(siggen_set("noise", -1), SIGGEN_E_VALUE);
+    CHECK_EQ(siggen_set("f0", 0), SIGGEN_OK);
+    CHECK_EQ(siggen_set("noise", 0), SIGGEN_OK);
+    CHECK_EQ(siggen_set("f0", 10000LL * 1000000), SIGGEN_OK);
     CHECK_EQ(siggen_set("amp", 0), SIGGEN_E_VALUE);
     CHECK_EQ(siggen_set("amp", 1000001), SIGGEN_E_VALUE);
     CHECK_EQ(siggen_set("decay", -1), SIGGEN_E_VALUE);

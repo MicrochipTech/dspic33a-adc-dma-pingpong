@@ -41,19 +41,36 @@ float wavegen_snap_hz(const wavegen_cfg_t *c)
     return periods * (float)c->play_hz / (float)c->n;
 }
 
+/* A 32-bit integer hash of i (the "lowbias32" mix) as a uniform value in
+ * [-1, 1): the noise of entry i, the same whichever pass asks for it.
+ * tools/wavegen_model.py's noise_u() is the same function. */
+float wavegen_noise_u(uint32_t i)
+{
+    uint32_t x = i * 0x9E3779B9u + 0x7F4A7C15u;
+    x ^= x >> 16; x *= 0x7FEB352Du;
+    x ^= x >> 15; x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return (float)(int32_t)x * (1.0f / 2147483648.0f);
+}
+
 /* y_i: script lines 51-58 (envelope, harmonic sum), amplitude left out
- * of the sum - it cancels in the normalisation. */
+ * of the sum - it cancels in the normalisation - plus the noise. */
 static float wavegen_y(const wavegen_cfg_t *c, float f0, uint32_t i)
 {
     const float t = (float)i / (float)c->play_hz;
-    const float w0t = WAVEGEN_TWO_PI * f0 * t;
-    float s = sinf(w0t);
-    for (uint32_t k = 0; k < 6u; k++) {
-        if (c->harm[k] != 0.0f) {
-            s += c->harm[k] * sinf((float)(k + 2u) * w0t);
+    float y = 0.0f;
+    if (f0 > 0.0f) {
+        const float w0t = WAVEGEN_TWO_PI * f0 * t;
+        float s = sinf(w0t);
+        for (uint32_t k = 0; k < 6u; k++) {
+            if (c->harm[k] != 0.0f) {
+                s += c->harm[k] * sinf((float)(k + 2u) * w0t);
+            }
         }
+        y = expf(-c->decay * t) * s;
     }
-    return expf(-c->decay * t) * s;
+    if (c->noise > 0.0f) { y += c->noise * wavegen_noise_u(i); }
+    return y;
 }
 
 wavegen_result_t wavegen_fill(const wavegen_cfg_t *c, uint16_t *table,
@@ -61,12 +78,14 @@ wavegen_result_t wavegen_fill(const wavegen_cfg_t *c, uint16_t *table,
 {
     if (c->n < 2u) { return WAVEGEN_E_N; }
     if (c->play_hz == 0u) { return WAVEGEN_E_RATE; }
-    if (!(c->f0_hz > 0.0f) || !(c->f0_hz < 0.5f * (float)c->play_hz)) { return WAVEGEN_E_F0; }
+    if (!(c->noise >= 0.0f) || !(c->noise <= 100.0f)) { return WAVEGEN_E_NOISE; }
+    const bool tone = !(c->f0_hz == 0.0f && c->noise > 0.0f);    /* f0 = 0: noise alone */
+    if (tone && (!(c->f0_hz > 0.0f) || !(c->f0_hz < 0.5f * (float)c->play_hz))) { return WAVEGEN_E_F0; }
     if (!(c->decay >= 0.0f)) { return WAVEGEN_E_DECAY; }
     if (!(c->amplitude > 0.0f) || !(c->amplitude <= 1.0f)) { return WAVEGEN_E_AMPLITUDE; }
     if (c->out_min >= c->out_max) { return WAVEGEN_E_RANGE; }
 
-    const float f0 = snap ? wavegen_snap_hz(c) : c->f0_hz;
+    const float f0 = (snap && tone) ? wavegen_snap_hz(c) : (tone ? c->f0_hz : 0.0f);
 
     /* pass 1: min and max (script lines 61-62) */
     float lo = wavegen_y(c, f0, 0u), hi = lo;

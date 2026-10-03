@@ -98,11 +98,12 @@ _GRAB_HEADER_RE = re.compile(
 # processing's mean share of a half period since the previous grab, per
 # mille (1000 = it just keeps up); None when the firmware does not send it.
 # Since 02.10.2026 proc= names the filter (0 none, 1 low-pass, 2 high-pass,
-# 3 band-pass at fs/8, PROC_NAMES), and gz=/gzs=/gzd= - present only while
+# 3 band-pass at fs/8, 4 the user filter from tools/filterdesign since
+# 03.10.2026 - PROC_NAMES), and gz=/gzs=/gzd= - present only while
 # the firmware's Goertzel at fs/16 runs - are its amplitude (LSB), the tone's
 # share of the block's power (per mille) and detected (0/1): meta['gz'] is
 # then a dict with amp/share_pm/detected, None otherwise.
-PROC_NAMES = {0: "off", 1: "low-pass", 2: "high-pass", 3: "band-pass"}
+PROC_NAMES = {0: "off", 1: "low-pass", 2: "high-pass", 3: "band-pass", 4: "user filter"}
 # Any further " key=value" fields (02.10.2026) are the application's own
 # (gui_link_app_fields(), src/core/gui_link.h): meta['ext'] is a dict of
 # them, name -> int, empty when there are none.

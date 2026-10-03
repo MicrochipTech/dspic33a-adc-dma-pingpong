@@ -85,12 +85,20 @@ that matter:
 - `info->gap` = 1 means this block does not follow the previous one (first block, restart,
   or a missed half): reset your filter state there.
 
-The example's body is selectable (`sigproc lp|hp|bp|off`). The filters are a 4th-order Butterworth low-,
+The example's body is selectable (`sigproc lp|hp|bp|user|off`). The filters are a 4th-order Butterworth low-,
 high- or band-pass at fs/8, and independently a Goertzel detector for a tone at fs/16
 (`sigproc gz on|off`). The coefficients come from `tools/sigproc_design.py`. A filter costs
 about 63-67 cycles per sample, so it keeps up to about 2 MSPS; the Goertzel adds about
 7. Replace it with your own; the console command and the GRAB fields (`proc=`,
 `gz=`) can stay or go with it.
+
+A fourth filter, `sigproc user`, runs whatever IIR filter you design in
+`tools/filterdesign` (`toolsilterdesign.bat`): its dsPIC33 tab writes
+`src/core/user_filter.h` (generated, header-only, included by `sigproc.c` alone), builds,
+flashes and opens the GUI. The filter holds at its design rate only (`sigproc` prints it).
+The same generated code is what the tool's C test compiled and compared - for fixed point
+bit-exact to its model - so a filter can also leave this example for your own processing as
+it is. The README's "Your own filter" section has the whole way.
 
 ## 4. Building
 

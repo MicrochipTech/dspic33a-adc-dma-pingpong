@@ -32,6 +32,10 @@
  *   wavegen_0_1023          amplitude 1.0, 0 .. 1023   (the script's range)
  *   wavegen_0_1023_amp05    amplitude 0.5, 0 .. 1023   (maximum 512)
  *   wavegen_205_3890        amplitude 1.0, 205 .. 3890 (the DAC range, ATDF)
+ *   wavegen_noise           f0 0, decay 0, noise 1, 205 .. 3890: noise alone (03.10.2026)
+ *   wavegen_tone_noise      the first one plus noise 0.3
+ * Besides: the noise alone over 4096 entries is white (lag-1..8
+ * autocorrelation) and centred, and its error codes.
  *
  * TOLERANCE: +-1 LSB per value. The C table is float32 (relative
  * rounding 6e-8; the phase argument reaches 450 rad, so its rounding is
@@ -81,27 +85,25 @@ static wavegen_cfg_t base_cfg(void)
     c.amplitude = 1.0f;
     c.out_min = 0u;
     c.out_max = 1023u;
+    c.noise = 0.0f;
     return c;
 }
 
 static uint16_t ref[NMAX], tab[NMAX];
 
 /* One vector: +-1 LSB per value, exact range. */
-static void run_case(const char *argv0, const char *name, const char *needle,
-                     float amplitude, uint16_t out_min, uint16_t out_max)
+static void run_case_cfg(const char *argv0, const char *name, const char *needle, wavegen_cfg_t c)
 {
+    const float amplitude = c.amplitude;
+    const uint16_t out_min = c.out_min, out_max = c.out_max;
     const int n = load_table(argv0, name, needle, ref);
     CHECK_EQ(n, 512);
     if (n != 512) { return; }
 
-    wavegen_cfg_t c = base_cfg();
-    c.amplitude = amplitude;
-    c.out_min = out_min;
-    c.out_max = out_max;
-    float f0 = 0.0f;
+    float f0 = -1.0f;
     memset(tab, 0xAA, sizeof tab);
     CHECK_EQ(wavegen_fill(&c, tab, false, &f0), WAVEGEN_OK);
-    CHECK(f0 == 10000.0f);
+    CHECK(f0 == c.f0_hz);
 
     int differ = 0, worst = 0;
     uint16_t lo = 0xFFFFu, hi = 0u;
@@ -125,6 +127,16 @@ static void run_case(const char *argv0, const char *name, const char *needle,
            name, differ, n, worst);
 }
 
+static void run_case(const char *argv0, const char *name, const char *needle,
+                     float amplitude, uint16_t out_min, uint16_t out_max)
+{
+    wavegen_cfg_t c = base_cfg();
+    c.amplitude = amplitude;
+    c.out_min = out_min;
+    c.out_max = out_max;
+    run_case_cfg(argv0, name, needle, c);
+}
+
 int main(int argc, char **argv)
 {
     const char *argv0 = argc > 0 ? argv[0] : NULL;
@@ -139,6 +151,45 @@ int main(int argc, char **argv)
     run_case(argv0, "wavegen_205_3890.csv",
              "--decay 1000 --amplitude 1.0 --out-min 205 --out-max 3890",
              1.0f, 205u, 3890u);
+
+    /* ---- noise (03.10.2026): against the reference, then its statistics ---- */
+    {
+        wavegen_cfg_t c = base_cfg();
+        c.f0_hz = 0.0f; c.decay = 0.0f; c.noise = 1.0f; c.out_min = 205u; c.out_max = 3890u;
+        run_case_cfg(argv0, "wavegen_noise.csv", "--f0 0 --harm 0.2 0.4 0.1 0 0 0 --decay 0 --amplitude 1.0 --out-min 205 --out-max 3890 --noise 1", c);
+        c = base_cfg();
+        c.noise = 0.3f;
+        run_case_cfg(argv0, "wavegen_tone_noise.csv", "--decay 1000 --amplitude 1.0 --out-min 0 --out-max 1023 --noise 0.3", c);
+
+        /* white and centred: 4096 entries of noise alone, 0..4095 */
+        c = base_cfg();
+        c.n = NMAX; c.f0_hz = 0.0f; c.decay = 0.0f; c.noise = 1.0f; c.out_min = 0u; c.out_max = 4095u;
+        float f0 = -1.0f;
+        CHECK_EQ(wavegen_fill(&c, tab, true, &f0), WAVEGEN_OK);     /* snap ignored without a tone */
+        CHECK(f0 == 0.0f);
+        double mean = 0.0;
+        for (int i = 0; i < NMAX; i++) { mean += tab[i]; }
+        mean /= NMAX;
+        double var = 0.0;
+        for (int i = 0; i < NMAX; i++) { var += (tab[i] - mean) * (tab[i] - mean); }
+        CHECK(fabs(mean - 2047.5) < 40.0);                 /* 3 sigma of a uniform mean: 28 */
+        CHECK(fabs(sqrt(var / NMAX) - 4095.0 / sqrt(12.0)) < 25.0);   /* uniform: 1182 */
+        double worst = 0.0;
+        for (int lag = 1; lag <= 8; lag++) {
+            double acc = 0.0;
+            for (int i = 0; i + lag < NMAX; i++) { acc += (tab[i] - mean) * (tab[i + lag] - mean); }
+            const double rho = acc / var;
+            if (fabs(rho) > worst) { worst = fabs(rho); }
+        }
+        CHECK(worst < 0.05);                               /* 1/sqrt(4096) = 0.016 */
+        printf("noise: mean %.1f, rms %.1f, largest autocorrelation lag 1..8 %.4f\n",
+               mean, sqrt(var / NMAX), worst);
+        CHECK(wavegen_noise_u(0u) != wavegen_noise_u(1u));
+        for (uint32_t i = 0u; i < 1000u; i++) {
+            const float u = wavegen_noise_u(i * 7919u);
+            CHECK(u >= -1.0f && u < 1.0f);
+        }
+    }
 
     /* ---- snap: 10 kHz x 512 / 500 kHz = 10.24 periods -> 10 periods =
      * 9765.625 Hz. Without decay and harmonics the table then wraps
@@ -183,8 +234,12 @@ int main(int argc, char **argv)
         CHECK_EQ(wavegen_fill(&c, tab, false, &f0), WAVEGEN_E_N);
         c = base_cfg(); c.play_hz = 0u;
         CHECK_EQ(wavegen_fill(&c, tab, false, &f0), WAVEGEN_E_RATE);
-        c = base_cfg(); c.f0_hz = 0.0f;
+        c = base_cfg(); c.f0_hz = 0.0f;                /* no tone needs noise */
         CHECK_EQ(wavegen_fill(&c, tab, false, &f0), WAVEGEN_E_F0);
+        c = base_cfg(); c.noise = -0.1f;
+        CHECK_EQ(wavegen_fill(&c, tab, false, &f0), WAVEGEN_E_NOISE);
+        c = base_cfg(); c.noise = 101.0f;
+        CHECK_EQ(wavegen_fill(&c, tab, false, &f0), WAVEGEN_E_NOISE);
         c = base_cfg(); c.f0_hz = 250000.0f;           /* play_hz / 2 */
         CHECK_EQ(wavegen_fill(&c, tab, false, &f0), WAVEGEN_E_F0);
         c = base_cfg(); c.decay = -1.0f;

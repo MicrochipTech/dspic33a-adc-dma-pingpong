@@ -50,12 +50,14 @@ as `"name.h"` without a folder prefix; file names are unique across the tree.
 | `lib/crc16`, `fmt`, `stats`, `frame`, `wavegen`, `iir1`, `goertzel_f/_i`, `detect` | hardware-free helpers, host-tested |
 | `core/capture`, `acquisition`, `pingpong`, `routing` | DMA buffer and ISR bookkeeping, rate setters and the standing stream, ping-pong bookkeeping, route/resource checks (`routing_apply()`) |
 | `core/sigproc`, `siggen` | per-half processing callback (selectable filters, Goertzel), signal generator |
+| `core/user_filter.h` (+ `.json`) | **generated** by `tools/filterdesign` ("Install into firmware"): the `sigproc user` filter, header-only, included by `sigproc.c` alone; the checked-in one is the default (`firmware.py --default`) |
 | `core/cli.c`, `console.h`, `cmd_parser`, `gui_link`, `diag`, `sim.h`, `example_main.c` | console and the core's commands, `stream grab` frame, fail codes/traps/boot record, the core build's `main()` |
 | `app/main.c`, `config_bits.c`, `port_impl.c`, `board.h` | start-up order, configuration words, port layer, board profiles (`BOARD`) |
 | `boards/board_cfg.h`, `ev74h48a.c`, `ev17p63a.c` | run-time board data (boot PLL dividers); exactly one board file is linked per build |
 | `lab/chaintest`, `bench`, `dactest`, `meter`, `tri_eval`, `cli_lab.c`, `b2b_link` | chain test, back-to-back suite and instruments, the lab's console commands |
 | `sim/sim_dma.c` | replaces `dma.c` in the simulator build |
 | `tools/adc_gui.py`, `protocol.py`, `eval_chain.py`, `trigger.py`, `wavegen_model.py`, `remote.py` | NiceGUI front end (`--fake` needs no board), wire protocol, chain evaluator, optional remote bench |
+| `tools/filterdesign/` (`filterdesign.bat`) | IIR filter design tool (03.10.2026, from the FilterDesign project's `pc/`): `fdesign/` C design library + CLI (MIT, built by the GUI on first use), `gui/` NiceGUI app; its dsPIC33 tab (`firmware.py`) installs into `src/core/user_filter.h`, builds, flashes (ipecmd/PKOB4; Nano: copy to drive) and starts `adc_gui.py --sigproc user` |
 
 ## Driver and board rules
 
@@ -120,6 +122,12 @@ python gen_core_project.py --check     core_example.X still matches adc_dma_40ms
   nothing else. Keep long waits out of its path (`__delay32()` runs far slower than real time).
 - **GUI:** `tools\gui_setup.bat` once, then `tools\adc_gui.bat --fake`;
   `python tools\adc_gui.py --selftest` and `python tools\gui_ui_test.py` are its checks.
+- **Filter design tool:** a change under `tools/filterdesign/` runs
+  `python tools\filterdesign\gui\test_codegen.py` (40 C builds, and the firmware fixtures
+  `tests/host/user_filter` against a fresh `firmware.py --fixtures` - "stale" -> regenerate and
+  commit them) and `python tools\filterdesign\gui\fw_ui_test.py` (browser: install, build,
+  dsPIC33 GUI on the fake; it puts the default `user_filter.h` back). `--flash` programs a
+  connected board: only on purpose.
 - **Customer handover:** `python tools\export_core.py [--rev <commit>]` builds
   `build\core-<rev>.zip` from a commit (not the working tree) and compiles it before it says PASS.
 - A change to the reply format of `version`, `help`, `status`, `regs`, `chain all` or the
@@ -178,6 +186,26 @@ python gen_core_project.py --check     core_example.X still matches adc_dma_40ms
   table (the table lies directly below the buffer, the buffer's end stays the window's end).
   After a build `xc-dsc-objdump -h` must show ONE `.dma_buffer` section.
 - `dma_overrun` is a lower bound (one status bit, counted once per interrupt entry).
+- **The user filter** (`sigproc user`, 03.10.2026) is `src/core/user_filter.h`, generated:
+  never edit it by hand. Its coefficients hold at `USER_FILTER_FS_HZ` only (unlike lp/hp/bp,
+  which are fractions of fs). Samples go in centred (x - 2048), fixed point in the top bits
+  (Q15/Q31); a gap clears the state. Its state sits in a fixed 256-byte union, so another
+  filter does not move the RAM layout - the smoke `expected*.log` stay valid whatever filter is
+  installed (checked 03.10.2026 with a fixed32 band-pass). Run trace/smoke/host tests with any
+  filter, but commit the default unless a different default is the point. The firmware's
+  `#include "user_filter.h"` finds the copy beside `sigproc.c` before any `-I`: a test with
+  another header compiles a copy of `sigproc.c` next to it (`test_user_filter_xcheck.py`).
+  XC-DSC's `double` is 32 bits: "double" is generated as `long double`.
+- **Generator noise** (`siggen set noise <0..100>`, 03.10.2026, `lib/wavegen`): uniform white
+  noise from a hash of the table index (`wavegen_noise_u()`, the same in `wavegen_model.py`),
+  added after the envelope; `f0 0` = noise alone. It is a fixed, cyclic table: one FFT of it
+  has a fixed line pattern, so the GUI's noise test measures with and without the filter and
+  averages Welch spectra (`welch_power()`, `noise_response()` in `adc_gui.py`) - do not "fix"
+  that into a single averaged FFT, it scatters by several dB. A new vector in
+  `tests/ref/vectors` carries its whole command line, `--harm` included: the GUI's selftest
+  reads the arguments from that header.
+- Never kill `ipecmd` while it programs (03.10.2026): its java child keeps the PKoB4 and the
+  tool needs a USB re-plug. Stop it only through `firmware.py` (whole tree, after 240 s).
 - `sigproc` and `chain`/`test`/`dactest` judge samples themselves: run the latter with
   processing off. Measuring commands run inside `console_quiet_begin()/_end()` (polled UART
   output); a new measuring command gets the same wrapper.

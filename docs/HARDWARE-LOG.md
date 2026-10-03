@@ -365,6 +365,34 @@ Processing is in place on the completed half, in the main loop, never in an inte
   gives the same stream and processing figures. `__builtin_write_DISICTL(variable)` stops
   xc-dsc v3.21/v3.31 at -O0 with an internal compiler error; replaced by inline asm
   (`disi_set()`), same `disictl wN` as the builtin at -O1.
+- **03.10.2026, the user filter from tools/filterdesign (EV74H48A, by hand, flashed from the
+  filter tool's dsPIC33 tab):** an elliptic band-pass 800-1200 Hz, order 6, fixed32 for
+  8 kSPS (id EF36DD44) built and programmed with `ipecmd -TPPKOB4 ... -M -OL` - 27.7 s,
+  "Program Succeeded", the device found as `0xa77c`. What went wrong first, and why: the
+  tab showed ipecmd's output only at its end, a first run looked hung, and it was killed
+  while it was erasing/programming (exit 1 after 155 s, the log ended at "configuration
+  memory"). Killing `ipecmd.exe` alone left its java child running; from then on the PKoB4
+  answered nothing (`Transmission on endpoint 2 failed (err = -10121)`, "Connection Failed",
+  later "Target Device ID (0x0)" and "PKoB4 was unloaded while still busy"), and the
+  console on COM26 did not answer (`connect failed: no ACK/NAK`) - the part was half
+  programmed. A MPLAB X without a window (`mplab_ide64.exe` from the day before, 400 MB)
+  was still running and may have held the tool as well. Unplugging the USB cable (twice,
+  after that MPLAB X was ended) and flashing again from the tab worked. Changed because of
+  it: the tab shows build and flash output line by line as it comes, with the seconds
+  running and a note not to interrupt; a hung run is stopped after 240 s with its whole
+  process tree (`taskkill /T`), stdin closed; "Failed" in ipecmd's output counts as a
+  failure whatever its exit code; a running MPLAB X is named in the hint. The filter itself
+  and the noise test (white noise from the generator, response measured with and without
+  the filter) have **not** been measured on the board yet - a highpass 1800 Hz was
+  installed afterwards, results to follow.
+- **03.10.2026, the generator's noise on the board (by hand, GUI, filter off):** the noise
+  setup's table (8192 entries, noise 1, f0 0) played at 400 000 entries/s on DAC2, read on
+  RA8 at 8 MSPS and at 2 MSPS, the spectrum averaged over 16 grabs. It shows the DAC's
+  zero-order hold as predicted: |sin(pi f/400 kHz)/(pi f/400 kHz)| with nulls at 400, 800,
+  1200 ... kHz (both rates), and at 2 MSPS about -27 dBFS near DC, 3-4 dB less at 200 kHz
+  (the hold's -3.9 dB at half the play rate). The time plot at 8 MSPS shows the held steps,
+  about 20 samples each. So the noise reaches the ADC as designed; it is flat only up to
+  half the play rate, which is why the noise test plays at twice the stream rate.
 
 ## 11. Limits and open questions
 
@@ -393,6 +421,9 @@ Open:
 ## 12. Not run on silicon
 
 - The EV17P63A Curiosity Nano with this firmware (build and simulator smoke run only).
+- The user filter's response and cost per sample on the board, the GUI's noise test and
+  filter switch against a board (the noise itself was seen on the board, section 10), the Nano's copy-to-drive flash (03.10.2026: all checked on the host, the
+  simulator and the GUI's stand-in only).
 - `test all` on the restructured firmware (R3 skipped; it hangs the older firmware after
   the 13.3 MSPS row), and the `sweep` at the current revision.
 - DAC1 as the generator's output, generator `decay` > 0 on the board.

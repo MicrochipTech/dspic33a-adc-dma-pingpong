@@ -88,21 +88,34 @@ typedef struct {
 void sigproc_block(uint16_t *x, uint32_t n, const sigproc_info_t *info);
 
 /* What sigproc_block() does (02.10.2026, sigproc.c; console "sigproc ...",
- * the GUI's signal processing card): one filter at fs/8 on the block, in
- * place, and independently a Goertzel detector for a tone at fs/16 in the
- * block as it came in. Both off after reset. The console runs a command
+ * the GUI's signal processing card): one filter on the block, in place -
+ * three fixed ones at fs/8 or, since 03.10.2026, the user filter - and
+ * independently a Goertzel detector for a tone at fs/16 in the block as
+ * it came in. Both off after reset. The console runs a command
  * never while sigproc_block() runs (cli.c's uart_rx_hook()), so a change
  * lands between two blocks. */
 typedef enum {
     SIGPROC_OFF = 0,    /* the block passes unchanged                       */
     SIGPROC_LP  = 1,    /* low-pass,  -3 dB at fs/8 ("sigproc on" = this)   */
     SIGPROC_HP  = 2,    /* high-pass, -3 dB at fs/8, output + 2048          */
-    SIGPROC_BP  = 3     /* band-pass, centre fs/8, one octave, output + 2048 */
+    SIGPROC_BP  = 3,    /* band-pass, centre fs/8, one octave, output + 2048 */
+    SIGPROC_USER = 4    /* the filter designed in tools/filterdesign and
+                         * generated into src/core/user_filter.h ("sigproc
+                         * user", 03.10.2026): its coefficients hold for
+                         * one sample rate only, sigproc_user_fs_hz()      */
 } sigproc_filter_t;
 
 void sigproc_set_filter(sigproc_filter_t f);     /* restarts the filter state */
 sigproc_filter_t sigproc_filter(void);
-const char *sigproc_filter_name(sigproc_filter_t f);  /* "off" "lp" "hp" "bp" */
+const char *sigproc_filter_name(sigproc_filter_t f);  /* "off" "lp" "hp" "bp" "user" */
+
+/* The user filter as generated (user_filter.h): a one-line description,
+ * the sample rate it was designed for, and the id (a CRC-32 of its code)
+ * that tools/filterdesign also writes into user_filter.json - "sigproc"
+ * prints all three, so the GUI can tell which filter the board runs. */
+const char *sigproc_user_desc(void);
+uint32_t sigproc_user_fs_hz(void);
+uint32_t sigproc_user_id(void);
 
 /* The Goertzel's result for the last block it saw. */
 typedef struct {

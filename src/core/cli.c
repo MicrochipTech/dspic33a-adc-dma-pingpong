@@ -672,6 +672,9 @@ CMD_DEFINE(siggen, "siggen", cmd_siggen_fn, "siggen [set <p> <v> | on <dac> <n> 
  * "sigproc" - the signal processing (01.10.2026, selectable since
  * 02.10.2026, sigproc.h):
  *   sigproc lp | hp | bp | off   the filter at fs/8, in place (off after reset)
+ *   sigproc user                 the filter from tools/filterdesign
+ *                                (user_filter.h, 03.10.2026); the status
+ *                                then names it, its design rate and id
  *   sigproc on                   = lp (the switch of 01.10.2026)
  *   sigproc gz on | off          the Goertzel detector at fs/16
  *   sigproc gz thr <lsb>         its threshold, 1..4095 (default 100)
@@ -679,15 +682,18 @@ CMD_DEFINE(siggen, "siggen", cmd_siggen_fn, "siggen [set <p> <v> | on <dac> <n> 
  *                                if it defines sigproc_app_cmd() (console.h)
  *   sigproc                      status
  * capture.c calls sigproc_block() while any runs (sigproc_active()).
- * The GUI's signal processing card sends these. One parser slot. Longest
- * reply line: "rx_held_lost: " + 10 digits + CRLF = 26. */
+ * The GUI's signal processing card sends these. One parser slot. No reply
+ * line goes through a local buffer: put_kv*() write their parts straight
+ * to the parser's sink, so the user filter's description (generated, about
+ * 50 characters) has no limit here. */
 static void cmd_sigproc_fn(int argc, char **argv)
 {
-    static const char use[] = "sigproc [lp|hp|bp|off|on] | gz on|off | gz thr <lsb>";
+    static const char use[] = "sigproc [lp|hp|bp|user|off|on] | gz on|off | gz thr <lsb>";
     if (argc == 2) {
         if (strcmp(argv[1], "on") == 0 || strcmp(argv[1], "lp") == 0) { sigproc_set_filter(SIGPROC_LP); }
         else if (strcmp(argv[1], "hp") == 0)  { sigproc_set_filter(SIGPROC_HP); }
         else if (strcmp(argv[1], "bp") == 0)  { sigproc_set_filter(SIGPROC_BP); }
+        else if (strcmp(argv[1], "user") == 0) { sigproc_set_filter(SIGPROC_USER); }
         else if (strcmp(argv[1], "off") == 0) { sigproc_set_filter(SIGPROC_OFF); }
         else { usage(use); return; }
     } else if (argc == 3 && strcmp(argv[1], "gz") == 0) {
@@ -706,6 +712,13 @@ static void cmd_sigproc_fn(int argc, char **argv)
     if (argc > 1) { capture_sigproc_enable(sigproc_active()); }
     put_kv_str("sigproc", capture_sigproc_enabled() ? "on" : "off");
     put_kv_str("filter", sigproc_filter_name(sigproc_filter()));
+    if (sigproc_filter() == SIGPROC_USER) {
+        char id[12];                                  /* "0x" + 8 + ' ' */
+        (void)u32_to_hex(id, sigproc_user_id());
+        put_kv_str("user", sigproc_user_desc());
+        put_kv("user_fs", sigproc_user_fs_hz());
+        put_kv_str("user_id", id);
+    }
     put_kv_str("goertzel", sigproc_goertzel_on() ? "on" : "off");
     sigproc_gz_t gz;
     sigproc_goertzel_get(&gz);
@@ -719,7 +732,7 @@ static void cmd_sigproc_fn(int argc, char **argv)
     sigproc_app_status();
     put_kv("rx_held_lost", rx_held_lost);
 }
-CMD_DEFINE(sigproc, "sigproc", cmd_sigproc_fn, "sigproc [lp|hp|bp|off] | gz on|off|thr <n> - filter fs/8, Goertzel fs/16");
+CMD_DEFINE(sigproc, "sigproc", cmd_sigproc_fn, "sigproc [lp|hp|bp|user|off] | gz on|off|thr <n> - filter, Goertzel fs/16");
 
 /* The application's sub-commands of "sigproc" and its status lines
  * (console.h): none unless a project defines them. */

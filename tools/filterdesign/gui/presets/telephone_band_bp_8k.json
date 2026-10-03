@@ -1,0 +1,51 @@
+{
+  "format": "fdesign-gui",
+  "version": 1,
+  "spec": {
+    "type": "bandpass",
+    "characteristic": "chebyshev",
+    "fs": 8000,
+    "ap": 0.5,
+    "as": 40,
+    "edges": {
+      "bandpass": [
+        200.0,
+        300.0,
+        3400.0,
+        3700.0
+      ]
+    }
+  },
+  "implementation": {
+    "arithmetic": "fixed16",
+    "section_scaling": true,
+    "auto_q": true,
+    "frac_bits": 14,
+    "c_name": "telephone_bp"
+  },
+  "view": {
+    "dark": true,
+    "magnitude_scale": "db",
+    "frequency_axis": "log",
+    "tolerance_scheme": true,
+    "implemented_response": true,
+    "phase": "unwrap",
+    "group_delay_unit": "ms",
+    "time_response": "impulse",
+    "test_view": "freq"
+  },
+  "test": {
+    "implementations": [
+      "float",
+      "double",
+      "fixed32",
+      "fixed16"
+    ],
+    "signal": "chirp",
+    "f1": 4.0,
+    "f2": 3600.0,
+    "amplitude": 0.5,
+    "samples": 4096,
+    "compiler": "gcc"
+  }
+}

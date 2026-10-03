@@ -56,10 +56,12 @@ static wavegen_cfg_t cfg = {
     .harm = { 0.2f, 0.4f, 0.1f, 0.0f, 0.0f, 0.0f },
     .decay = 1000.0f, .amplitude = 1.0f,
     .out_min = SIGGEN_LO_DEFAULT, .out_max = SIGGEN_HI_DEFAULT,
+    .noise = 0.0f,
 };
 /* The parameters as set, in millionths, for the status reply - exactly
  * what was typed, not a float's rounding of it. */
 static int64_t p_f0 = 10000000000LL, p_decay = 1000000000LL, p_amp = 1000000;
+static int64_t p_noise = 0;
 static int64_t p_h[6] = { 200000, 400000, 100000, 0, 0, 0 };
 
 static bool     s_on = false;
@@ -81,8 +83,13 @@ siggen_result_t siggen_set(const char *name, int64_t v)
 {
     const float f = (float)v / 1e6f;
     if (str_eq(name, "f0")) {
-        if ((v <= 0) || (v > (int64_t)SIGGEN_PLAY_HZ_MAX * 1000000)) { return SIGGEN_E_VALUE; }
+        /* 0 since 03.10.2026: no tone, the noise alone (wavegen.h) */
+        if ((v < 0) || (v > (int64_t)SIGGEN_PLAY_HZ_MAX * 1000000)) { return SIGGEN_E_VALUE; }
         p_f0 = v; cfg.f0_hz = f; return SIGGEN_OK;
+    }
+    if (str_eq(name, "noise")) {                    /* 03.10.2026, 0..100 */
+        if ((v < 0) || (v > 100000000)) { return SIGGEN_E_VALUE; }
+        p_noise = v; cfg.noise = f; return SIGGEN_OK;
     }
     if ((name[0] == 'h') && (name[1] >= '2') && (name[1] <= '7') && (name[2] == '\0')) {
         if ((v < -100000000) || (v > 100000000)) { return SIGGEN_E_VALUE; }
@@ -204,7 +211,7 @@ const char *siggen_result_name(siggen_result_t r)
 {
     switch (r) {
     case SIGGEN_OK:          return "ok";
-    case SIGGEN_E_PARAM:     return "no such parameter (f0 h2..h7 decay amp lo hi)";
+    case SIGGEN_E_PARAM:     return "no such parameter (f0 h2..h7 decay amp lo hi noise)";
     case SIGGEN_E_VALUE:     return "value out of range";
     case SIGGEN_E_DAC:       return "dac must be 1 or 2";
     case SIGGEN_E_N:         return "n must be 2..8192";
@@ -260,6 +267,7 @@ void siggen_visit(siggen_visit_t visit)
     for (uint32_t k = 0u; k < 6u; k++) { visit(hname[k], p_h[k], SIGGEN_VIS_DEC); }
     visit("decay", p_decay, SIGGEN_VIS_DEC);
     visit("amp", p_amp, SIGGEN_VIS_DEC);
+    visit("noise", p_noise, SIGGEN_VIS_DEC);
     visit("lo", cfg.out_min, SIGGEN_VIS_NUM);
     visit("hi", cfg.out_max, SIGGEN_VIS_NUM);
     visit("snap", s_snap ? 1 : 0, SIGGEN_VIS_NUM);

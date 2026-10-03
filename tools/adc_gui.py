@@ -209,7 +209,7 @@ SETTINGS_DEFAULTS = {
     # 800..3500 where the board's DAC follows (HARDWARE-LOG 29.09.2026)
     "siggen": {"on": False, "dac": 2, "n": 5000, "play_hz": 500000, "f0": 10000.0,
                "h": [0.2, 0.4, 0.1, 0.0, 0.0, 0.0], "decay": 1000.0, "amp": 1.0,
-               "lo": 800, "hi": 3500, "snap": True, "force": True},
+               "lo": 800, "hi": 3500, "snap": True, "force": True, "noise": 0.0},
     "buffer": {"size": 4096},
     "dac": {
         "1": {"on": False, "low": 0x100, "high": 0xF00, "slpdat": 8},
@@ -257,7 +257,7 @@ def _tri_setup(unit, low, high, slp, ksps):
 
 
 def _sg_setup(h, f0=2000.0, n=1000, play=200000, decay=0.0, dac=2, ksps=1000, trig=True,
-              trig_level=2150):
+              trig_level=2150, noise=0.0):
     """The signal generator on one DAC, read on its pin; the DAC cards off
     ('auto' for DAC2) - an 'on' there would replace the generator."""
     return {
@@ -265,7 +265,8 @@ def _sg_setup(h, f0=2000.0, n=1000, play=200000, decay=0.0, dac=2, ksps=1000, tr
         "view": {"dac_source": dac},
         "siggen": {"on": True, "dac": dac, "n": n, "play_hz": play, "f0": f0,
                    "h": [float(h.get(k, 0.0)) for k in range(2, 8)],
-                   "decay": decay, "amp": 1.0, "lo": 800, "hi": 3500, "snap": True, "force": True},
+                   "decay": decay, "amp": 1.0, "lo": 800, "hi": 3500, "snap": True, "force": True,
+                   "noise": noise},
         "dac": {"1": _DAC_OFF, "2": {"on": "auto"}},
         "trigger": {"on": trig, "level": trig_level, "slope": "rising", "hyst": 32},
         "fake": {"source": "sine"},
@@ -282,6 +283,21 @@ def _gz_setup(f0, filt="off"):
     entries a period at 25 kHz."""
     cfg = _sg_setup({}, f0=f0, n=2000, play=1000000, ksps=400, trig=True)
     cfg["sigproc"] = {"filter": filt, "gz": True, "thr": 100}
+    return cfg
+
+
+def _noise_setup(ksps, filt="off"):
+    """White noise from the generator on DAC2, read on RA8 at ksps - for a
+    filter's frequency response (03.10.2026, lib/wavegen.h's noise): f0 0,
+    8192 entries played at twice the sample rate (at most the generator's
+    1 MHz). Twice: the DAC holds each entry for half a sample, so the noise
+    is flat to fs/2 within about 1 dB, and the table's period is four blocks
+    of 1024 - every grab sees another piece of it, which the FFT's average
+    needs. The filter as given ('user' for tools/filterdesign's)."""
+    play = int(min(2 * ksps * 1000, 1_000_000))
+    cfg = _sg_setup({}, f0=0.0, n=8192, play=play, ksps=ksps, trig=False, noise=1.0)
+    cfg["siggen"]["snap"] = False
+    cfg["sigproc"] = {"filter": filt, "gz": False, "thr": 100}
     return cfg
 
 
@@ -302,6 +318,10 @@ SETUPS = {
     "tri_dac1": ("DAC1 triangle - RA1, 0x400..0xE00, SLPDAT 4, 19.5 kHz (4 MSPS)",
                  _tri_setup(1, 0x400, 0xE00, 4, 4000)),
     "sg_sine": ("generator - sine 2 kHz on DAC2 (1 MSPS)", _sg_setup({})),
+    "noise_user": ("noise - white noise on DAC2, the user filter, 200 kSPS (the default user filter's rate)",
+                   _noise_setup(200, "user")),
+    "noise_raw": ("noise - white noise on DAC2, no filter, 200 kSPS (the reference for noise_user)",
+                  _noise_setup(200, "off")),
     "gz_fs16": ("Goertzel check - sine at fs/16 (25 kHz at 400 kSPS): expect DETECTED",
                 _gz_setup(25000.0)),
     "gz_fs8": ("Goertzel check - sine at fs/8 (50 kHz at 400 kSPS): expect not detected",
@@ -1121,9 +1141,9 @@ class FakeTarget:
         # the table it plays - computed by wavegen_model, as the firmware
         # computes it with lib/wavegen.
         self.sg = dict(f0=10000.0, h=[0.2, 0.4, 0.1, 0.0, 0.0, 0.0], decay=1000.0, amp=1.0,
-                       lo=205, hi=3890)
+                       lo=205, hi=3890, noise=0.0)
         self.sg_text = dict(f0="10000", h2="0.2", h3="0.4", h4="0.1", h5="0", h6="0", h7="0",
-                            decay="1000", amp="1")
+                            decay="1000", amp="1", noise="0")
         self.sg_on = False
         self.sg_dac = 0
         self.sg_n = 0
@@ -1237,8 +1257,8 @@ class FakeTarget:
         return np.clip(np.round(v), 0, 4095).astype(int)
 
     # ---- the signal generator (siggen.c / cli.c's cmd_siggen_fn()) ----
-    SG_PARAMS = ("f0", "h2", "h3", "h4", "h5", "h6", "h7", "decay", "amp", "lo", "hi")
-    SG_USAGE = ("usage: siggen set <f0|h2..h7|decay|amp|lo|hi> <value> | siggen on <dac 1|2> "
+    SG_PARAMS = ("f0", "h2", "h3", "h4", "h5", "h6", "h7", "decay", "amp", "lo", "hi", "noise")
+    SG_USAGE = ("usage: siggen set <f0|h2..h7|decay|amp|lo|hi|noise> <value> | siggen on <dac 1|2> "
                 "<n 2..8192> <play_hz 100..1000000> [snap] [force] [oc] | siggen off | siggen regs | siggen")
     # the pin each DAC's output buffer drives, as core 5 reads it (dac.h:
     # DACOUT1 = RA1 = AD5AN1, DACOUT2 = RA8 = AD5AN3, on both boards)
@@ -1270,7 +1290,7 @@ class FakeTarget:
                 f"play_hz_actual: {self.sg_play_actual if self.sg_on else 0}",
                 f"pace: {self.sg_pace}", f"f0: {dec('f0')}", f"f0_used: {f0u:.3f}".rstrip("0").rstrip("."),
                 *[f"h{k}: {dec('h' + str(k))}" for k in range(2, 8)],
-                f"decay: {dec('decay')}", f"amp: {dec('amp')}",
+                f"decay: {dec('decay')}", f"amp: {dec('amp')}", f"noise: {dec('noise')}",
                 f"lo: {self.sg['lo']}", f"hi: {self.sg['hi']}",
                 f"snap: {int(self.sg_snap)}", f"force: {int(self.sg_force)}",
                 f"table_min: {min(self.sg_table) if self.sg_on else 0}",
@@ -1288,15 +1308,15 @@ class FakeTarget:
                 return False, [self.SG_USAGE]
             v = float(text)
             if name not in self.SG_PARAMS:
-                return False, ["siggen: no such parameter (f0 h2..h7 decay amp lo hi)"]
-            ok = {"f0": 0 < v <= 1e6, "decay": 0 <= v <= 1e9, "amp": 0 < v <= 1,
+                return False, ["siggen: no such parameter (f0 h2..h7 decay amp lo hi noise)"]
+            ok = {"f0": 0 <= v <= 1e6, "decay": 0 <= v <= 1e9, "amp": 0 < v <= 1, "noise": 0 <= v <= 100,
                   "lo": v == int(v) and 0 <= v <= 4095, "hi": v == int(v) and 0 <= v <= 4095}.get(
                 name, -100 <= v <= 100)
             if not ok:
                 return False, ["siggen: value out of range"]
             if name in ("lo", "hi"):
                 self.sg[name] = int(v)
-            elif name in ("f0", "decay", "amp"):
+            elif name in ("f0", "decay", "amp", "noise"):
                 self.sg[name] = v
             else:
                 self.sg["h"][int(name[1]) - 2] = v
@@ -1326,12 +1346,13 @@ class FakeTarget:
                 return False, ["siggen: lo/hi outside 205..3890 (p1417) - add force"]
             real = wavegen_model.sccp2_rate(hz)
             f0 = self.sg["f0"]
-            f0u = wavegen_model.snap_hz(f0, n, real) if "snap" in flags else f0
-            if not (0 < f0 < real / 2) or lo >= hi or not (0 < self.sg["amp"] <= 1):
+            tone = not (f0 == 0 and self.sg["noise"] > 0)        # f0 0: the noise alone
+            f0u = (wavegen_model.snap_hz(f0, n, real) if "snap" in flags else f0) if tone else 0.0
+            if (tone and not (0 < f0 < real / 2)) or lo >= hi or not (0 < self.sg["amp"] <= 1):
                 return False, ["siggen: wavegen refused the parameters", "wavegen_err: 3"]
             try:
                 table = wavegen_model.wavegen(n, real, f0u, self.sg["h"], self.sg["decay"],
-                                              self.sg["amp"], lo, hi)
+                                              self.sg["amp"], lo, hi, self.sg["noise"])
             except ZeroDivisionError:
                 return False, ["siggen: wavegen refused the parameters", "wavegen_err: 7"]
             self.dac[dac]["on"] = False                  # the DAC is the generator's now
@@ -1373,7 +1394,7 @@ class FakeTarget:
                 # cli.c's cmd_sigproc_fn() (02.10.2026): the filter at fs/8 and
                 # the Goertzel at fs/16; grab() runs both on the stand-in's
                 # samples the way sigproc.c does (fake_filter(), fake_goertzel())
-                names = {"off": 0, "on": 1, "lp": 1, "hp": 2, "bp": 3}
+                names = {"off": 0, "on": 1, "lp": 1, "hp": 2, "bp": 3, "user": 4}
                 if len(args) == 1 and args[0] in names:
                     self.sp_filter = names[args[0]]
                 elif len(args) == 2 and args[0] == "gz" and args[1] in ("on", "off"):
@@ -1388,13 +1409,20 @@ class FakeTarget:
                     # (sigproc_app_cmd(), console.h)
                     r = self.sp_app.command(args, self.chain_ksps * 1e3) if self.sp_app else None
                     if r is None:
-                        return False, ["usage: sigproc [lp|hp|bp|off|on] | gz on|off | gz thr <lsb>"]
+                        return False, ["usage: sigproc [lp|hp|bp|user|off|on] | gz on|off | gz thr <lsb>"]
                     if not r[0]:
                         return r
                 on = bool(self.sp_filter) or self.sp_gz or bool(self.sp_app and self.sp_app.active)
                 lines = [f"sigproc: {'on' if on else 'off'}",
-                         f"filter: {['off', 'lp', 'hp', 'bp'][self.sp_filter]}",
-                         f"goertzel: {'on' if self.sp_gz else 'off'}", f"gz_thr: {self.sp_thr}"]
+                         f"filter: {['off', 'lp', 'hp', 'bp', 'user'][self.sp_filter]}"]
+                if self.sp_filter == 4:
+                    # cli.c: the user filter's description, design rate and id -
+                    # the stand-in "runs" whatever user_filter.json describes
+                    uf = load_user_filter() or {}
+                    lines += [f"user: {uf.get('description', '?')}",
+                              f"user_fs: {int(round(uf.get('spec', {}).get('fs', 0)))}",
+                              f"user_id: 0x{uf.get('id', '00000000')}"]
+                lines += [f"goertzel: {'on' if self.sp_gz else 'off'}", f"gz_thr: {self.sp_thr}"]
                 if self.sp_gz and self.sp_last_gz:
                     g = self.sp_last_gz
                     lines += [f"gz_amp: {g['amp']}", f"gz_rms: {g['rms']}",
@@ -1575,7 +1603,9 @@ class FakeTarget:
             gz_txt = f" gz={g['amp']} gzs={g['share_pm']} gzd={g['detected']}"
         # the application's fields (gui_link_app_fields()), on the input
         app_txt = self.sp_app.header_fields(v, self.chain_ksps * 1e3) if self.sp_app else ""
-        if self.sp_filter:
+        if self.sp_filter == 4:
+            v = fake_user_filter(v, load_user_filter())
+        elif self.sp_filter:
             v = fake_filter(v, self.sp_filter)
         if self.grab_fault == "overrun":
             ov = max(ov, 3)
@@ -1598,8 +1628,64 @@ class FakeTarget:
 
 
 SP_FILTERS = {"off": "off", "lp": "low-pass, -3 dB at fs/8", "hp": "high-pass, -3 dB at fs/8",
-              "bp": "band-pass at fs/8, one octave"}
+              "bp": "band-pass at fs/8, one octave",
+              "user": "user filter (tools/filterdesign, user_filter.h)"}
 _SP_SECTIONS = {}
+# The user filter ("sigproc user", 03.10.2026): tools/filterdesign's "Install
+# into firmware" writes src/core/user_filter.h and, with the same id, this
+# description - spec, sample rate, the cascade the firmware computes with.
+USER_FILTER_JSON = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "src", "core", "user_filter.json")
+
+
+def load_user_filter():
+    """src/core/user_filter.json as a dict, or None (missing or unreadable)."""
+    try:
+        with open(USER_FILTER_JSON, encoding="utf-8") as f:
+            info = json.load(f)
+        return info if info.get("format") == "user_filter" else None
+    except (OSError, ValueError):
+        return None
+
+
+def fake_user_filter(v, info):
+    """sigproc.c's user path on the stand-in's samples: centred on mid-scale,
+    the cascade of user_filter.json (transposed direct form II, in double -
+    for fixed point its quantized coefficients, not the bit-exact
+    arithmetic: tests/host/test_user_filter_xcheck.py holds the firmware to
+    that), clamped to 0..4095. The board's stream has no gaps, so its filter
+    has long settled; here the block is run through twice and the second
+    pass kept - a narrow filter would otherwise spend its first few hundred
+    samples ringing up, and a noise test would read that as attenuation."""
+    x = np.asarray(v, dtype=float) - 2048.0
+    out = np.concatenate([x, x])
+    if info:
+        for b0, b1, b2, _a0, a1, a2 in info["sos"]:
+            s0 = s1 = 0.0
+            y = np.empty_like(out)
+            for i, u in enumerate(out):
+                yi = b0 * u + s0
+                s0 = b1 * u - a1 * yi + s1
+                s1 = b2 * u - a2 * yi
+                y[i] = yi
+            out = y
+    out = out[len(x):]
+    return np.clip(np.floor(out + 2048.5), 0, 4095).astype(int)
+
+
+def user_filter_marks(info, fs_hz=None):
+    """FFT marks (kHz) at the user filter's band edges WHERE THEY ARE at the
+    stream's rate fs_hz: a digital filter's edges are fractions of the rate,
+    so at another rate than its design rate they move with it (03.10.2026 -
+    drawn at the design's Hz they sat wrongly at the axis' left end). Off the
+    design rate the labels carry a '*'."""
+    if not info:
+        return []
+    sp = info["spec"]
+    k = (fs_hz / sp["fs"]) if fs_hz and sp.get("fs") else 1.0
+    star = "" if abs(k - 1.0) < 1e-3 else "*"
+    return ([{"xAxis": f * k / 1e3, "label": {"formatter": "pass" + star}} for f in sp.get("fpass", [])]
+            + [{"xAxis": f * k / 1e3, "label": {"formatter": "stop" + star}} for f in sp.get("fstop", [])])
 
 
 def fake_filter(v, kind: int):
@@ -1622,6 +1708,57 @@ def fake_filter(v, kind: int):
         out = res
     offset = 0.0 if kind == 1 else 2048.0
     return np.clip(np.round(np.asarray(out) + offset), 0, 4095).astype(int)
+
+
+def user_filter_design_db(info, f_hz, fs_hz):
+    """|H| in dB of user_filter.json's cascade at the frequencies f_hz."""
+    z = np.exp(-2j * np.pi * np.asarray(f_hz, dtype=float) / fs_hz)
+    h = np.ones_like(z)
+    for b0, b1, b2, a0, a1, a2 in info["sos"]:
+        h *= (b0 + b1 * z + b2 * z * z) / (a0 + a1 * z + a2 * z * z)
+    return 20.0 * np.log10(np.maximum(np.abs(h), 1e-12))
+
+
+WELCH_SEG = 512
+
+
+def welch_power(samples, fs_hz, nseg=WELCH_SEG):
+    """(f, mean power per bin) of one grab by Welch's method: Hann segments of
+    nseg samples, half overlapping, DC removed. The noise test's spectrum
+    (03.10.2026): the generator's noise is a fixed table, so one grab's FFT
+    has a fixed line pattern whose Hann-windowed magnitudes also depend on
+    where in the table the grab starts - 16 grabs left 1.6 dB of scatter per
+    bin; 15 segments a grab average that to a few tenths, at fs/512."""
+    x = np.asarray(samples, dtype=float)
+    x = x - x.mean()
+    nseg = min(nseg, len(x))
+    w = np.hanning(nseg)
+    hop = nseg // 2
+    segs = [x[i:i + nseg] * w for i in range(0, len(x) - nseg + 1, hop)]
+    p = np.mean([np.abs(np.fft.rfft(sg)) ** 2 for sg in segs], axis=0)
+    return np.fft.rfftfreq(nseg, d=1.0 / fs_hz), p
+
+
+def noise_response(f, avg_off_db, avg_on_db, info, fs_hz):
+    """The noise test's result (03.10.2026): the measured response = the
+    averaged spectrum with the filter minus the one without (the same noise
+    table - its line structure cancels; one spectrum alone scatters by
+    several dB per bin), the design at the same bins, and the figures:
+    median and 90th percentile of |measured - design| where the design is
+    above -3 dB (not on the slopes, which the Hann window smears), and the
+    median measured level where the design is below -40 dB. DC and the last
+    two bins are left out. The spectra: welch_power(), averaged over grabs."""
+    meas = np.asarray(avg_on_db) - np.asarray(avg_off_db)
+    design = user_filter_design_db(info, f, fs_hz)
+    inner = np.zeros(len(f), dtype=bool)
+    inner[2:len(f) - 2] = True
+    passing, blocked = inner & (design > -3.0), inner & (design < -40.0)
+    dev = np.abs(meas[passing] - design[passing])
+    stats = {"pass_med": float(np.median(dev)) if dev.size else None,
+             "pass_p90": float(np.percentile(dev, 90)) if dev.size else None,
+             "stop_med": float(np.median(meas[blocked])) if blocked.any() else None,
+             "stop_design": float(np.median(design[blocked])) if blocked.any() else None}
+    return meas, design, stats
 
 
 def fake_goertzel(v, thr: int):
@@ -1840,6 +1977,18 @@ def selftest() -> int:
              and ok_off and ok_goff and okp0 and meta_p0.get("proc") == 0 and meta_p0.get("gz") is None
              and not ok_bad)
     ok_all &= ok_sp
+    # the user filter (03.10.2026): proc=4, the status names it like user_filter.json
+    ok_u, lines_u = t.cmd("sigproc user")
+    oku, s_u, meta_u = t.grab()
+    t.cmd("sigproc off")
+    uf = load_user_filter()
+    kv_u = dict(ln.split(": ", 1) for ln in lines_u if ln.startswith("user"))
+    ok_user = (ok_u and oku and meta_u.get("proc") == 4 and uf is not None
+               and kv_u.get("user_id") == "0x" + uf["id"] and kv_u.get("user") == uf["description"]
+               and 0 <= int(np.min(s_u)) and int(np.max(s_u)) <= 4095)
+    ok_all &= ok_user
+    print(f"sigproc user: proc={meta_u.get('proc')} id {kv_u.get('user_id')} '{kv_u.get('user')}' ->",
+          "PASS" if ok_user else "FAIL")
     print(f"sigproc lp/hp/gz/off: proc={meta_p1.get('proc')},{meta_p2.get('proc')},{meta_p0.get('proc')} "
           f"hp mean {float(np.mean(s_hp)):.0f}, gz={meta_g.get('gz')}, a bad argument refused ->",
           "PASS" if ok_sp else "FAIL")
@@ -1869,6 +2018,45 @@ def selftest() -> int:
     ok_all &= ok_gzs
     print(f"Goertzel check setups on the stand-in (detected, amp, proc): {gz_res} ->",
           "PASS" if ok_gzs else "FAIL")
+
+    # noise into the user filter (03.10.2026): the noise setup at the installed
+    # filter's rate, the FFT averaged over 16 grabs with the filter and without;
+    # their ratio is the measured response (noise_response()), against the
+    # design in src/core/user_filter.json: where the design is above -3 dB the
+    # median deviation below 1 dB and 90 % below 3 dB, where it is below
+    # -40 dB the median below -25 dB (the stand-in's 6-LSB noise floor)
+    uf = load_user_filter()
+    ok_nz, nz_txt = uf is not None, "no src/core/user_filter.json"
+    if uf:
+        ksps = max(1, int(round(uf["spec"]["fs"] / 1e3)))
+        avg = {}
+        for filt in ("off", "user"):
+            cfg = _noise_setup(ksps, filt)
+            sg, acq = cfg["siggen"], cfg["acquisition"]
+            t.cmd("stream off")
+            for line in siggen_commands(dict(sg, play=sg["play_hz"], h={k: sg["h"][k - 2] for k in range(2, 8)})):
+                t.cmd(line)
+            t.cmd(f"stream on {acq['ksps']} {acq['core']} {acq['pinsel']}")
+            t.cmd(f"sigproc {filt}")
+            pw = []
+            for _ in range(16):
+                okn, s_n, meta_n = t.grab()
+                fn, pn = welch_power(s_n, meta_n["ksps"] * 1e3)
+                pw.append(pn)
+            avg[filt] = (fn, 10.0 * np.log10(np.mean(pw, axis=0) + 1e-30))
+            t.cmd("sigproc off")
+            t.cmd("siggen off")
+            t.cmd("stream off")
+        fn = avg["user"][0]
+        _m, _d, st = noise_response(fn, avg["off"][1], avg["user"][1], uf, ksps * 1e3)
+        ok_nz = (st["pass_med"] is not None and st["pass_med"] < 1.0 and st["pass_p90"] < 3.0
+                 and st["stop_med"] is not None and st["stop_med"] < -25.0)
+        nz_txt = (f"{uf['description']} at {ksps} kSPS: |measured - design| where the design is above "
+                  f"-3 dB: median {st['pass_med']:.2f} dB, 90 % {st['pass_p90']:.2f} dB; where it is below "
+                  f"-40 dB: median {st['stop_med']:.1f} dB")
+        t.cmd("stream on 5000 3 5 0")
+    ok_all &= ok_nz
+    print(f"noise test of the user filter on the stand-in: {nz_txt} ->", "PASS" if ok_nz else "FAIL")
     # the application's own checks (gui_app.py), through the same stand-in
     if gui_app:
         ok_all &= gui_app.selftest(t, SETUPS, siggen_commands)
@@ -2081,7 +2269,7 @@ def selftest() -> int:
         harm = [float(x) for x in argv[argv.index("--harm") + 1:argv.index("--harm") + 7]]
         tab = wavegen_model.wavegen(int(a["--n"]), float(a["--play-hz"]), float(a["--f0"]), harm,
                                     float(a["--decay"]), float(a["--amplitude"]),
-                                    int(a["--out-min"]), int(a["--out-max"]))
+                                    int(a["--out-min"]), int(a["--out-max"]), float(a.get("--noise", 0.0)))
         ok_vec &= tab == rows
         n_vec += 1
     ok_vec &= n_vec >= 3
@@ -2116,7 +2304,8 @@ def selftest() -> int:
         _sg = _c["siggen"]
         _sp = dict(on=_sg["on"], dac=_sg["dac"], n=_sg["n"], play=_sg["play_hz"], f0=_sg["f0"],
                    h={k: _sg["h"][k - 2] for k in range(2, 8)}, decay=_sg["decay"], amp=_sg["amp"],
-                   lo=_sg["lo"], hi=_sg["hi"], snap=_sg["snap"], force=_sg["force"])
+                   lo=_sg["lo"], hi=_sg["hi"], snap=_sg["snap"], force=_sg["force"],
+                   noise=_sg.get("noise", 0.0))
         _good = siggen_plan(_sp)[1] is None and 1 <= _c["acquisition"]["ksps"] <= 40000
         if _c["acquisition"]["mode"] == "custom":
             _src = _sg["dac"] if _sg["on"] else _c["view"]["dac_source"]
@@ -2215,7 +2404,8 @@ def siggen_commands(p):
     lines = [f"siggen set f0 {dec(p['f0'])}"]
     lines += [f"siggen set h{k} {dec(p['h'][k])}" for k in range(2, 8)]
     lines += [f"siggen set decay {dec(p['decay'])}", f"siggen set amp {dec(p['amp'])}",
-              f"siggen set lo {int(p['lo'])}", f"siggen set hi {int(p['hi'])}"]
+              f"siggen set lo {int(p['lo'])}", f"siggen set hi {int(p['hi'])}",
+              f"siggen set noise {dec(p.get('noise', 0.0))}"]
     if p["on"]:
         lines.append(f"siggen on {int(p['dac'])} {int(p['n'])} {int(p['play'])}"
                      + (" snap" if p["snap"] else "") + (" force" if p["force"] else ""))
@@ -2532,13 +2722,24 @@ def main_gui(args):
             # for a tone at fs/16 on the input; both off after a board reset
             with ui.card().classes("tile w-full rounded-xl p-4 gap-2"):
                 ui.label("signal processing").classes("card-title")
+                # 03.10.2026: on/off at run time without the list - between "off"
+                # and the filter chosen last (the firmware switches between blocks)
+                sp_on_sw = ui.switch("filter on", value=False).props("dense")
                 sp_filter_sel = ui.select(SP_FILTERS, value="off",
-                                          label="filter (4th-order Butterworth, in the firmware)"
+                                          label="filter (in the firmware)"
                                           ).props("dense outlined").classes("w-full")
                 with ui.row().classes("w-full gap-2 items-center"):
                     sp_gz_cb = ui.checkbox("Goertzel at fs/16", value=False)
                     sp_thr_in = ui.number("threshold, LSB", value=100, min=1, max=4095, step=10,
                                           format="%d").props("dense outlined").classes("flex-grow")
+                # the user filter (03.10.2026): which one the board runs, and whether
+                # the stream's rate is the one it was designed for
+                with ui.column().classes("w-full gap-1") as sp_user_row:
+                    sp_user_lbl = ui.label("").classes("text-xs")
+                    with ui.row().classes("w-full gap-2"):
+                        sp_user_rate_btn = ui.button("use its rate").props("dense outline no-caps size=sm")
+                        sp_user_noise_btn = ui.button("noise test", icon="graphic_eq")                             .props("dense outline no-caps size=sm")
+                sp_user_row.set_visibility(False)
                 sp_gz_chip = ui.chip("fs/16: Goertzel off", color="grey-8").props("dense outline")
                 # the application's rows (gui_app.py), if it has any
                 app_card = gui_app.Card(ui) if gui_app else None
@@ -2631,8 +2832,11 @@ def main_gui(args):
                     sg_play_in = ui.number("play rate, Hz (100..1000000)", value=500000, min=100,
                                            max=1000000, step=1000, format="%d").props("dense outlined") \
                         .classes("flex-grow")
-                sg_f0_in = ui.number("f0, Hz (< play rate / 2)", value=10000, min=0.001, max=500000,
-                                     step=100).props("dense outlined")
+                with ui.row().classes("w-full gap-2"):
+                    sg_f0_in = ui.number("f0, Hz (< play rate / 2; 0 = no tone)", value=10000, min=0,
+                                         max=500000, step=100).props("dense outlined").classes("flex-grow")
+                    sg_noise_in = ui.number("noise (x f0's amplitude)", value=0.0, min=0, max=100,
+                                            step=0.1).props("dense outlined").classes("flex-grow")
                 sg_h_in = {}
                 for _row in ((2, 3, 4), (5, 6, 7)):
                     with ui.row().classes("w-full gap-2"):
@@ -2769,8 +2973,27 @@ def main_gui(args):
                     "type": "line", "showSymbol": False, "data": [], "xAxisIndex": 0,
                     "name": "expected", "lineStyle": {"width": 1, "color": "#f472b6", "type": "dashed"}})
             with ui.card().classes("tile w-full rounded-xl p-2"):
-                ui.label("spectrum · Hann window").classes("card-title px-2 pt-1")
+                with ui.row().classes("w-full items-center gap-3 px-2 pt-1 no-wrap"):
+                    fft_title = ui.label("spectrum · Hann window").classes("card-title")
+                    ui.space()
+                    # 03.10.2026: a noise input's spectrum scatters by several dB per
+                    # bin; averaged over grabs it shows the filter's response
+                    fft_avg_cb = ui.checkbox("average", value=False).props("dense")
+                    fft_avg_n = ui.number("grabs", value=16, min=2, max=256, step=1,
+                                          format="%d").props("dense outlined").classes("w-20")
                 fft_chart = chart("", "kHz", "dBFS", -100, 0, ACCENT2)
+            # 03.10.2026: the user filter's noise test - measured against design
+            with ui.card().classes("tile w-full rounded-xl p-2") as resp_card:
+                ui.label("filter response · noise test (with / without the filter)").classes("card-title px-2 pt-1")
+                resp_lbl = ui.label("").classes("text-xs mono px-2")
+                resp_chart = chart("", "kHz", "dB", -100, 5, ACCENT2)
+                resp_chart.options["legend"] = {"top": 8, "right": 16, "textStyle": {"color": DIM}}
+                resp_chart.options["series"] = [
+                    {"name": "measured", "type": "line", "showSymbol": False, "data": [],
+                     "lineStyle": {"width": 1.5, "color": ACCENT2}},
+                    {"name": "design", "type": "line", "showSymbol": False, "data": [],
+                     "lineStyle": {"width": 1.5, "type": "dashed", "color": "#a78bfa"}}]
+            resp_card.set_visibility(False)
             with ui.card().classes("tile w-full rounded-xl p-3"):
                 ui.label("signal evaluation").classes("card-title")
                 EVAL_TOOLTIPS = {
@@ -2969,7 +3192,15 @@ def main_gui(args):
                      "clock by a whole number, so the actual rate the board reports can differ "
                      "slightly; the DAC settles in 0.75-2 us per step, so above ~500 kHz the "
                      "steps are not clean (Table 40-42)."),
-        (sg_f0_in, "Fundamental in Hz, below half the play rate."),
+        (sg_f0_in, "Fundamental in Hz, below half the play rate. 0 = no tone, the noise alone."),
+        (sg_noise_in, "White noise added to the table (lib/wavegen.h, uniform, the same table every "
+                      "time), relative to the fundamental's amplitude: 0 = none, 1 = as strong as the "
+                      "fundamental. With f0 = 0 the table is noise alone - into a filter, with the "
+                      "FFT averaged, it shows the filter's frequency response (setup 'noise ...', or "
+                      "'noise test' at the user filter)."),
+        (fft_avg_cb, "Average the spectrum's power over the last N grabs (rate, length and processing "
+                     "unchanged; a change starts over). For noise: one grab scatters by several dB "
+                     "per bin, 16 grabs about +-1 dB."),
         (sg_decay_in, "Envelope exp(-decay x t) over the table, 1/s: 0 = a steady tone, 1000 = "
                       "tab_wave_gen.py's decaying pulse."),
         (sg_amp_in, "Amplitude 0..1 of the range lo..hi the table is scaled to."),
@@ -2985,12 +3216,19 @@ def main_gui(args):
                       "draws the expected signal over the grab and the 'loop' chip says how well "
                       "they match."),
         (sg_apply_btn, "Send the card to the board now (it also goes by itself, 0.8 s after a change)."),
-        (sp_filter_sel, "The firmware's filter (src/core/sigproc.c, 'sigproc lp|hp|bp|off'): a "
+        (sp_filter_sel, "The firmware's filter (src/core/sigproc.c, 'sigproc lp|hp|bp|user|off'). "
+                        "'user' is the filter designed in tools/filterdesign (its dsPIC33 tab: install, "
+                        "build, flash) - valid at its own design rate only, the row below names it and "
+                        "offers that rate. The others: a "
                         "4th-order Butterworth at fs/8 - low-pass, high-pass, or a band-pass one "
                         "octave wide around fs/8. Every completed half is filtered in place and the "
                         "grab shows the result; high- and band-pass are centred on mid-scale (2048). "
                         "Follows the sample rate by itself. The triangle check is skipped while a "
                         "filter is on. Off after every reset of the board."),
+        (sp_on_sw, "The filter on or off, at run time - also while LIVE: 'on' brings back the filter "
+                   "chosen last (the user filter by default), 'off' passes the samples unchanged. The "
+                   "firmware switches between two blocks; with the spectrum's average on, the two "
+                   "states keep separate averages."),
         (sp_gz_cb, "A Goertzel detector in the firmware ('sigproc gz on|off'): the amplitude of a "
                    "tone at exactly fs/16 in each half, measured on the input before the filter. "
                    "Try the signal generator with f0 = fs/16."),
@@ -3097,7 +3335,8 @@ def main_gui(args):
                        "h": [float(sg_h_in[k].value or 0.0) for k in range(2, 8)],
                        "decay": float(sg_decay_in.value or 0.0), "amp": float(sg_amp_in.value or 0.0),
                        "lo": int(sg_lo_in.value or 0), "hi": int(sg_hi_in.value or 0),
-                       "snap": bool(sg_snap_cb.value), "force": bool(sg_force_cb.value)},
+                       "snap": bool(sg_snap_cb.value), "force": bool(sg_force_cb.value),
+                       "noise": float(sg_noise_in.value or 0.0)},
             "trigger": {"on": bool(trig_cb.value), "level": int(trig_level_in.value or 0),
                         "slope": trig_slope_sel.value or RISING,
                         "hyst": int(trig_hyst_in.value or 0)},
@@ -3157,6 +3396,7 @@ def main_gui(args):
         sg_hi_in.value = int(sgc.get("hi", 3500))
         sg_snap_cb.value = bool(sgc.get("snap", True))
         sg_force_cb.value = bool(sgc.get("force", True))
+        sg_noise_in.value = float(sgc.get("noise", 0.0))
         trg = cfg.get("trigger", {})
         trig_cb.value = bool(trg.get("on", False))
         trig_level_in.value = int(trg.get("level", 2048))
@@ -3256,7 +3496,15 @@ def main_gui(args):
             ask_path("load settings from", do_load, "load")
             return
         name, overlay = SETUPS[key]
+        await run_setup(name, overlay)
+
+    async def run_setup(name, overlay):
+        """A setup laid over the page and sent in order (do_setup(), and the
+        user filter's noise test); a noise setup switches the FFT average on."""
         settings_apply(settings_merge(settings_collect(), overlay))
+        state["fft_avg_rate"], state["fft_avg"] = None, {}
+        if overlay.get("siggen", {}).get("noise", 0.0) > 0:
+            fft_avg_cb.value = True
         # settings_apply() set off the cards' own debounced senders; one
         # ordered sequence instead: stream off, generator, DACs, a grab
         for pend in list(dac_pending.values()) + list(sg_pending.values()):
@@ -3448,6 +3696,8 @@ def main_gui(args):
     # The file has the last word over the built-in defaults above.
     state["settings_path"] = args.settings
     _cfg, _msg = settings_read(args.settings)
+    if getattr(args, "sigproc", None):
+        _cfg.setdefault("sigproc", {})["filter"] = args.sigproc
     settings_apply(_cfg)
     settings_msg_lbl.text = _msg
     show_settings_path()
@@ -3696,7 +3946,8 @@ def main_gui(args):
                     h={k: float(sg_h_in[k].value or 0.0) for k in range(2, 8)},
                     decay=float(sg_decay_in.value or 0.0), amp=float(sg_amp_in.value or 0.0),
                     lo=int(sg_lo_in.value or 0), hi=int(sg_hi_in.value or 0),
-                    snap=bool(sg_snap_cb.value), force=bool(sg_force_cb.value))
+                    snap=bool(sg_snap_cb.value), force=bool(sg_force_cb.value),
+                    noise=float(sg_noise_in.value or 0.0))
 
     def sg_preview_update():
         """The table as the firmware computes it - with the rate and f0 it
@@ -3709,9 +3960,9 @@ def main_gui(args):
                 table = sg["table"]
             else:
                 real = wavegen_model.sccp2_rate(max(100, p["play"]))
-                f0 = wavegen_model.snap_hz(p["f0"], p["n"], real) if p["snap"] else p["f0"]
+                f0 = wavegen_model.snap_hz(p["f0"], p["n"], real) if p["snap"] and p["f0"] > 0 else p["f0"]
                 table = wavegen_model.wavegen(p["n"], real, f0, [p["h"][k] for k in range(2, 8)],
-                                              p["decay"], p["amp"], p["lo"], p["hi"])
+                                              p["decay"], p["amp"], p["lo"], p["hi"], p["noise"])
         except (ZeroDivisionError, ValueError):
             table = []
         step = max(1, len(table) // 1500)             # at most ~1500 points drawn
@@ -3755,7 +4006,7 @@ def main_gui(args):
             play = int(st.get("play_hz_actual", "0") or 0)
             f0u = float(st.get("f0_used", "0") or 0)
             table = wavegen_model.wavegen(p["n"], play, f0u, [p["h"][k] for k in range(2, 8)],
-                                          p["decay"], p["amp"], p["lo"], p["hi"])
+                                          p["decay"], p["amp"], p["lo"], p["hi"], p["noise"])
             state["siggen"] = dict(dac=p["dac"], n=p["n"], play=play, f0_used=f0u, table=table)
             sg_msg.text = (f"on: DAC{p['dac']}, {p['n']} entries at {play} Hz actual, f0 {f0u:g} Hz, "
                            f"table {st.get('table_min')}..{st.get('table_max')}, "
@@ -3869,6 +4120,7 @@ def main_gui(args):
         while state["busy"]:
             await asyncio.sleep(0.05)
         refused = None
+        user_kv = {}
         async with port_lock:
             app_lines = app_card.command_lines() if app_card else []
             for line in [f"sigproc {filt}", f"sigproc gz {'on' if gz else 'off'}",
@@ -3877,6 +4129,9 @@ def main_gui(args):
                 if not ok:
                     refused = (line, lines)
                     break
+                if line == "sigproc user":
+                    user_kv = dict(ln.split(": ", 1) for ln in lines if ln.startswith("user"))
+        show_user_filter(filt, user_kv if not refused else {})
         if refused:
             sigproc_lbl.text = f"'{refused[0]}' refused - not in this firmware? " + " ".join(refused[1])[:50]
         else:
@@ -3886,7 +4141,137 @@ def main_gui(args):
         if not gz:
             sp_gz_chip.text = "fs/16: Goertzel off"
             sp_gz_chip.props("color=grey-8")
+    def show_user_filter(filt, kv):
+        """The user filter's row: what the board reports ('sigproc user': user,
+        user_fs, user_id - cli.c), whether user_filter.json describes the same
+        filter (its id), and whether the stream rate is its design rate."""
+        if filt != "user":
+            sp_user_row.set_visibility(False)
+            state["user_filter"] = None
+            return
+        info = load_user_filter()
+        board_id = kv.get("user_id", "").replace("0x", "").upper()
+        same = bool(info and board_id and info.get("id", "").upper() == board_id)
+        state["user_filter"] = info if same else None
+        fs = int(kv.get("user_fs", "0") or 0)
+        state["user_fs"] = fs
+        txt = kv.get("user", "the board did not describe it") + (f", designed for {fs / 1e3:g} kSPS" if fs else "")
+        if not same and kv:
+            txt += (" - NOT the filter in src/core/user_filter.json (rebuild and flash?)" if info
+                    else " - no src/core/user_filter.json to compare with")
+        rate = float(rate_in.value or 0) * 1e3
+        mismatch = bool(fs) and abs(rate - fs) > 0.5
+        if mismatch:
+            txt += f"; the stream rate is {rate / 1e3:g} kSPS - the filter only fits its own rate"
+        sp_user_lbl.text = txt
+        sp_user_lbl.classes(replace="text-xs flex-grow " + ("text-amber-500" if (mismatch or not same) else ""))
+        sp_user_rate_btn.set_visibility(mismatch)
+        sp_user_row.set_visibility(True)
+
+    def use_user_rate():
+        if state.get("user_fs"):
+            rate_in.value = state["user_fs"] / 1e3
+            ui.notify(f"rate {rate_in.value:g} kSPS - takes effect with the next stream start "
+                      f"(single / live)", type="info")
+            # apply_sigproc() asks the board again and redraws the row - not
+            # show_user_filter("user", {}): that forgot the board's rate, and the
+            # noise test then refused to start (03.10.2026)
+            asyncio.ensure_future(apply_sigproc())
+
+    sp_user_rate_btn.on_click(use_user_rate)
+
+    async def user_noise_test():
+        """White noise into the user filter at its own rate (_noise_setup()),
+        the FFT averaged: the filter's frequency response on the board."""
+        fs = state.get("user_fs") or 0
+        if not fs:
+            ui.notify("the board has not reported the user filter's rate yet - connect first", type="warning")
+            return
+        ksps = max(1, int(round(fs / 1e3)))
+        if ksps > 500:
+            ui.notify("above 500 kSPS the generator's 1 MHz cannot play the noise at twice the rate - "
+                      "it then reaches only 500 kHz", type="warning")
+        if state["live"]:
+            toggle_live()                              # one sequence, not the live loop's
+            await asyncio.sleep(0.2)
+        info = load_user_filter()
+        n = max(2, int(fft_avg_n.value or 16))
+        sp_user_noise_btn.props("loading")
+        acc = {0: [], 4: []}                           # proc -> Welch power per grab
+        fs_meas = None
+
+        def collect(proc):
+            nonlocal fs_meas
+            g = state.get("last_grab")
+            if g and g[1].get("proc", 0) == proc:
+                fs_meas = g[1]["ksps"] * 1e3
+                f_, p_ = welch_power(g[0], fs_meas)
+                acc[proc].append((f_, p_))
+            state["last_grab"] = None
+
+        resp_card.set_visibility(True)
+        try:
+            # 1: the noise without the filter - the reference; run_setup() grabs once
+            state["last_grab"] = None
+            await run_setup(f"noise test at {ksps} kSPS: reference (filter off)", _noise_setup(ksps, "off"))
+            collect(0)
+            for i in range(n - 1):
+                resp_lbl.text = f"reference, filter off: grab {i + 2} of {n} ..."
+                await one_cycle()
+                collect(0)
+            # 2: the same noise through the user filter
+            sp_filter_sel.value = "user"               # apply_sigproc() runs on the change ...
+            await apply_sigproc()                      # ... and here, before the grabs
+            for i in range(n):
+                resp_lbl.text = f"through the user filter: grab {i + 1} of {n} ..."
+                await one_cycle()
+                collect(4)
+            await stop_stream()
+        finally:
+            sp_user_noise_btn.props(remove="loading")
+        off, on = acc[0], acc[4]
+        if not off or not on or not info or len({len(x[0]) for x in off + on}) != 1:
+            resp_lbl.text = "noise test incomplete: " + ("no user_filter.json" if not info
+                                                         else "a grab failed - see the console")
+            return
+        f = off[0][0]
+        meas, design, st = noise_response(f, 10 * np.log10(np.mean([x[1] for x in off], axis=0) + 1e-30),
+                                          10 * np.log10(np.mean([x[1] for x in on], axis=0) + 1e-30),
+                                          info, fs_meas)
+        resp_chart.options["series"][0]["data"] = [[float(x) / 1e3, round(float(v), 2)] for x, v in zip(f, meas)]
+        resp_chart.options["series"][1]["data"] = [[float(x) / 1e3, round(float(v), 2)] for x, v in zip(f, design)]
+        resp_chart.options["xAxis"][0]["max"] = float(f[-1]) / 1e3
+        resp_chart.update()
+        fmt = (lambda v, u="dB": "-" if v is None else f"{v:.2f} {u}")
+        resp_lbl.text = (f"{info['description']}, {ksps} kSPS, {len(off)} + {len(on)} grabs, "
+                         f"Welch {WELCH_SEG} (bins of {fs_meas / WELCH_SEG:.4g} Hz) | "
+                         f"|measured - design| where the design passes (> -3 dB): median {fmt(st['pass_med'])}, "
+                         f"90 % {fmt(st['pass_p90'])} | where it blocks (< -40 dB): measured {fmt(st['stop_med'])} "
+                         f"(design {fmt(st['stop_design'])}; the floor is the ADC's noise)")
+        resp_card.set_visibility(True)
+
+    sp_user_noise_btn.on_click(user_noise_test)
     sp_filter_sel.on_value_change(apply_sigproc)
+
+    sp_last = {"filter": "user"}                      # what "on" switches back to
+
+    def sp_sel_changed(e):
+        if e.value and e.value != "off":
+            sp_last["filter"] = e.value
+        if sp_on_sw.value != (e.value not in (None, "off")):
+            sp_on_sw.set_value(e.value not in (None, "off"))
+
+    def sp_sw_changed(e):
+        want = sp_last["filter"] if e.value else "off"
+        if sp_filter_sel.value != want:
+            sp_filter_sel.value = want                # -> apply_sigproc()
+
+    sp_filter_sel.on_value_change(sp_sel_changed)
+    sp_on_sw.on_value_change(sp_sw_changed)
+    # the settings were applied before these handlers existed: line the switch up once
+    if sp_filter_sel.value not in (None, "off"):
+        sp_last["filter"] = sp_filter_sel.value
+        sp_on_sw.set_value(True)
     sp_gz_cb.on_value_change(apply_sigproc)
     sp_thr_in.on_value_change(apply_sigproc)
     if app_card:
@@ -3943,6 +4328,19 @@ def main_gui(args):
             return True
         cmd = (f"stream on {cfg['ksps']}" if cfg["mode"] == "test"
                else f"stream on {cfg['ksps']} {cfg['core']} {cfg['pinsel']} {cfg['samc']}")
+        # The test input plays the firmware's own triangle on DAC2: with the
+        # generator still on DAC2 (e.g. the noise test's noise) the firmware
+        # refuses 'stream on <ksps>' (03.10.2026, board). The test input was
+        # chosen, so the generator goes off first - said, not silent.
+        sg = state.get("siggen")
+        if cfg["mode"] == "test" and sg and sg.get("dac") == 2:
+            async with port_lock:
+                await port_cmd(t, "siggen off")
+            state["siggen"] = None
+            sg_on_sel.value = False
+            sg_msg.text = "off - the test input needs DAC2 for its triangle"
+            ui.notify("signal generator switched off: the test input plays its own triangle on DAC2",
+                      type="info")
         async with port_lock:
             ok, lines = await port_cmd(t, cmd)
         if not ok:
@@ -3976,8 +4374,27 @@ def main_gui(args):
                 return
             state["cycles"] += 1
             state["grabs"] += 1
+            state["last_grab"] = (samples, meta)       # the noise test reads it
             fs = meta["ksps"] * 1e3
             f, db = spectrum(samples, fs)
+            # the FFT average (03.10.2026): power, over the last N grabs of the same
+            # rate, length and processing - a change of any starts it over
+            # one average per (length, rate, processing): the noise test needs the
+            # one without the filter and the one with it side by side
+            if fft_avg_cb.value:
+                key = (len(f), round(fs), meta.get("proc", 0))
+                if state.get("fft_avg_rate") != key[:2]:
+                    state["fft_avg_rate"], state["fft_avg"] = key[:2], {}
+                lst = state["fft_avg"].setdefault(key, [])
+                lst.append(10.0 ** (db / 10.0))
+                del lst[:-max(2, int(fft_avg_n.value or 16))]
+                db = 10.0 * np.log10(np.mean(lst, axis=0))
+                state["fft_avg_f"] = f
+                fft_title.text = (f"spectrum · Hann window · average of {len(lst)}"
+                                  f"/{int(fft_avg_n.value or 16)}")
+            else:
+                state["fft_avg_rate"], state["fft_avg"] = None, {}
+                fft_title.text = "spectrum · Hann window"
 
             # TRG.3: with the trigger on, only the time plot changes - a
             # fixed window of L = N/2 samples from the crossing, x = 0 at
@@ -4055,7 +4472,9 @@ def main_gui(args):
                 src_txt = f"RA8: DAC2 card's triangle {lo_}..{hi_}, SLPDAT {sl_}"
             else:
                 src_txt = f"RA8: the firmware's test triangle, SLPDAT {meta['slpdat']}"
-            if meta.get("proc", 0):
+            if meta.get("proc", 0) == 4:
+                src_txt += " - the user filter in the firmware"
+            elif meta.get("proc", 0):
                 src_txt += f" - {PROC_NAMES.get(meta['proc'], 'processed')} at fs/8 in the firmware"
             sig_src_lbl.text = (f"source: {src_txt}   |   grab {state['cycles']}: "
                                 f"min {int(np.min(samples))}  max {int(np.max(samples))}")
@@ -4065,7 +4484,9 @@ def main_gui(args):
             # fs/8, the Goertzel's fs/16 - emptied, not removed, when off
             gzm = meta.get("gz")
             marks = []
-            if meta.get("proc", 0) and meta["ksps"]:
+            if meta.get("proc", 0) == 4:
+                marks += user_filter_marks(state.get("user_filter"), meta["ksps"] * 1e3)
+            elif meta.get("proc", 0) and meta["ksps"]:
                 marks.append({"xAxis": meta["ksps"] / 8.0, "label": {"formatter": "fs/8"}})
             if gzm is not None and meta["ksps"]:
                 marks.append({"xAxis": meta["ksps"] / 16.0, "label": {"formatter": "fs/16"}})
@@ -4244,6 +4665,9 @@ def main():
                     help="settings file, read at start and written by 'save' "
                          f"(default: {os.path.basename(SETTINGS_FILE)} next to this script)")
     ap.add_argument("--http-port", type=int, default=8080)
+    ap.add_argument("--sigproc", choices=list(SP_FILTERS),
+                    help="preselect the firmware's filter, e.g. 'user' for the one from "
+                         "tools/filterdesign (its dsPIC33 tab starts the GUI that way)")
     ap.add_argument("--no-browser", action="store_true", help="do not open a browser window")
     args = ap.parse_args()
     if args.selftest:

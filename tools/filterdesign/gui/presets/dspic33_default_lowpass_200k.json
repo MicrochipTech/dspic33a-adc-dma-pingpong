@@ -1,0 +1,49 @@
+{
+  "format": "fdesign-gui",
+  "version": 1,
+  "spec": {
+    "type": "lowpass",
+    "characteristic": "elliptic",
+    "fs": 200000,
+    "ap": 0.5,
+    "as": 60,
+    "edges": {
+      "lowpass": [
+        15000.0,
+        25000.0
+      ]
+    }
+  },
+  "implementation": {
+    "arithmetic": "float",
+    "section_scaling": true,
+    "auto_q": true,
+    "frac_bits": 30,
+    "c_name": "dspic33_lp"
+  },
+  "view": {
+    "dark": true,
+    "magnitude_scale": "db",
+    "frequency_axis": "lin",
+    "tolerance_scheme": true,
+    "implemented_response": true,
+    "phase": "unwrap",
+    "group_delay_unit": "ms",
+    "time_response": "impulse",
+    "test_view": "freq"
+  },
+  "test": {
+    "implementations": [
+      "float",
+      "double",
+      "fixed32",
+      "fixed16"
+    ],
+    "signal": "chirp",
+    "f1": 100.0,
+    "f2": 90000.0,
+    "amplitude": 0.9,
+    "samples": 4096,
+    "compiler": "gcc"
+  }
+}

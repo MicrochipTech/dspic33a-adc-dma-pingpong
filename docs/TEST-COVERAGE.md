@@ -97,6 +97,8 @@ that accepts `buf` and ignores it.
 |---|---|---|---|---|---|
 | `main.c` | proven | restructured - BR.6: `diag_stack_paint()` first; smoke path (`SIM_SMOKE`) preprocessor-guarded | R0 | [SMOKE] | - |
 | `sigproc.c` (core) | never (new 01.10.2026) | 02.10.2026: selectable filters at fs/8, Goertzel at fs/16 (folded) | by hand on the board, 02.10.2026 (HARDWARE-LOG): the filters against their design to three decimals, the Goertzel setups | host `test_sigproc` (91 checks: filters against the analog magnitude, Goertzel against a double DFT) | no board-run block switches the processing on |
+| `wavegen` noise, `siggen set noise` (03.10.2026) | never | white noise from an index hash, f0 0 allowed | none - not run on the board | host `test_wavegen` (2 vectors against `wavegen_ref.py` exactly, whiteness, mean, rms, error codes), `test_siggen` (names, ranges); `adc_gui.py --selftest` (5 vectors, the noise test against the design on the stand-in) | the noise on the DAC and through the ADC |
+| `user_filter.h` (core, generated) | never (new 03.10.2026) | `sigproc user`: the filter from `tools/filterdesign`, centred, Q15/Q31 for fixed point, state cleared on a gap, fixed 256-byte state | none - no board run yet | host `test_user_filter_xcheck` (sigproc.c + generated header in float, long double, fixed32, fixed16 against a model: fixed point bit-exact, float within 1 LSB; clamp and gap); smoke with the default and with a fixed32 filter (same `expected.log`); `adc_gui.py --selftest` on the fake | the filter on silicon: its cost per sample, the FFT against the design |
 | `example_main.c` (core) | never (new) | CORE.5 (02.10.2026): the core build's `main()` | none (no board-run block flashes the core build); by hand 02.10.2026: stream at 1/4/8 MSPS, `sigproc on`, the generator loop (HARDWARE-LOG) | `tools\build.bat core`/`make core`, link only | the core build in a board run |
 | `config_bits.c` | proven | none | R0 (the board boots) | build only | - |
 | `board.h`, `ev74h48a.c` | proven as `board.h` macros | restructured - P7.1: boot PLL dividers as `board_cfg` data | R0 (boot rate 7/7), R2 restore, R3 sweep/matrix | trace `b2b`, `clk`, `variants`, `stream_on*` | - |
@@ -146,6 +148,7 @@ that accepts `buf` and ignores it.
 |---|---|---|---|---|
 | `protocol.py` (`Target`, `parse_grab_frame()`) | never against a board | R4, R5 - the GUI's own grab code | `test_protocol.py` (incl. a real socket loopback) | - |
 | `adc_gui.py` | never against a board | by hand on the board 29.09.2026 (DAC cards with `force`, buffer tile, DISCONNECT during LIVE, remote and local) - no block | `--selftest` (incl. `dac force`, `buf` refused while streaming then taken), `gui_ui_test.py` (Playwright against `--fake`, incl. DISCONNECT during LIVE) | the GUI itself in a board-run block (R4 only runs its protocol code) |
+| `filterdesign/` (`gui/app.py`, `firmware.py`, `codegen.py`) | never against a board (new 03.10.2026) | - | `test_codegen.py` (5 designs x 4 arithmetics x scaling, compiled and compared, bit-exact for fixed point; the firmware fixtures), `fw_ui_test.py` (Playwright: install, build, the dsPIC33 GUI on the fake with `user`, `--flash` without a board -> "programmer not found") | flashing a board from the tab (PKOB4), the Nano's copy-to-drive flash |
 
 ## Commands no block sends
 

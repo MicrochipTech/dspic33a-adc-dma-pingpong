@@ -1,0 +1,51 @@
+{
+  "format": "fdesign-gui",
+  "version": 1,
+  "spec": {
+    "type": "bandpass",
+    "characteristic": "elliptic",
+    "fs": 8000,
+    "ap": 1.0,
+    "as": 40.0,
+    "edges": {
+      "bandpass": [
+        400.0,
+        800.0,
+        1200.0,
+        1800.0
+      ]
+    }
+  },
+  "implementation": {
+    "arithmetic": "fixed32",
+    "section_scaling": true,
+    "auto_q": true,
+    "frac_bits": 30,
+    "c_name": "iir_filter"
+  },
+  "view": {
+    "dark": true,
+    "magnitude_scale": "db",
+    "frequency_axis": "lin",
+    "tolerance_scheme": true,
+    "implemented_response": true,
+    "phase": "unwrap",
+    "group_delay_unit": "samples",
+    "time_response": "impulse",
+    "test_view": "out"
+  },
+  "test": {
+    "implementations": [
+      "float",
+      "double",
+      "fixed32",
+      "fixed16"
+    ],
+    "signal": "noise",
+    "f1": 979.796,
+    "f2": 1980.0,
+    "amplitude": 0.9,
+    "samples": 2048,
+    "compiler": "gcc"
+  }
+}

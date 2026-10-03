@@ -648,15 +648,84 @@ GUI's **setup** list has four Goertzel checks that drive the signal generator fo
 sine at fs/16 (detected), at fs/8 and 3 kHz beside fs/16 (not detected), and fs/16 with the
 high-pass on (filtered to 5 % in the plot, still detected - the Goertzel looks before the
 filter). Replace it with your own processing as you need.
+A fourth filter, `sigproc user` (03.10.2026), is not fixed: it is whatever you design in
+`tools/filterdesign` - see [Your own filter](#your-own-filter-from-the-design-tool-to-the-board).
 The firmware calls it from the main loop once per completed half - ping and pong alike -
 while a filter or the Goertzel is on (off after reset), with the half's samples, its
 length and which half it is.
 The result goes
 back into the same half: `stream grab` then sends the processed data to the GUI (the frame
-says which filter: `proc=1` low-pass, `2` high-pass, `3` band-pass), with no second buffer. It has one half period to return (1024 samples at
+says which filter: `proc=1` low-pass, `2` high-pass, `3` band-pass, `4` the user filter), with no second buffer. It has one half period to return (1024 samples at
 8 MSPS: 128 us, 25 CPU cycles per sample); `status`, the chain test's load figures and the
 GUI's "CPU load" chip (the GRAB frame's `load=`, per mille of a half period) show what it takes, and `missed` counts the halves it was too slow for. `src/core/sigproc.h` has
 the rules. `chain all` and `test` judge raw samples - switch the processing off for them.
+
+## Your own filter: from the design tool to the board
+
+`tools/filterdesign` is an IIR filter design tool (Butterworth, Chebyshev, elliptic; low-,
+high-, band-pass, band-stop) with a browser GUI. Its **dsPIC33** tab takes the filter you
+designed onto this board:
+
+```
+tools\filterdesign.bat                     the design tool, http://127.0.0.1:8090
+```
+
+1. **Design and test** on the PC: tolerance scheme, sample rate, arithmetic (float, double,
+   fixed point 32 or 16 bit). The tabs show magnitude, phase, group delay, poles/zeros,
+   impulse/step response and the quantised implementation; **C test** compiles the
+   generated C code with gcc and compares it with the reference (fixed point bit-exact).
+2. **dsPIC33 tab** - checks first: the sample rate must be a whole number of kSPS (the
+   stream's `stream on <ksps>`), the CPU budget per sample (200 MHz / fs), the
+   specification met also after quantisation, no fixed-point overflow. Then:
+   - **1 Install into firmware** writes `src/core/user_filter.h` (the generated code, made
+     `static inline`, only `sigproc.c` includes it) and `src/core/user_filter.json` (the
+     same filter described for the GUI, same id);
+   - **2 Build** runs `tools\build.bat` (or `build.bat nano`);
+   - **3 Flash**: EV74H48A through its PKOB4 with MPLAB IPE's `ipecmd` (20 to 30 s);
+     EV17P63A by copying the .hex onto the Curiosity Nano's USB drive (untested so far);
+   - **1-3 in one go**;
+   - **4 Open dsPIC33 GUI** starts `tools/adc_gui.py` with the filter `user` preselected
+     (with a COM port, or the fake target).
+3. **On the board**, in the dsPIC33 GUI's **signal processing** card: the filter `user`;
+   the row under it names the filter the board reports, warns when it is not the one in
+   `user_filter.json` (not rebuilt or flashed) or when the stream runs at another rate than
+   the filter was designed for, and **use its rate** sets the rate. The FFT then shows the
+   filtered spectrum with the band edges marked, the CPU load chip what the filter costs.
+   The switch **filter on** turns the filter off and on at run time, also while LIVE.
+4. **noise test** (the button in the same row) measures the filter's frequency response on
+   the board: the signal generator plays white noise on DAC2 -> RA8 (`siggen set noise 1`,
+   `f0 0`, 8192 entries at twice the sample rate, at most 1 MHz), the stream runs at the
+   filter's design rate, the GUI grabs N times without the filter and N times with it (N =
+   the spectrum's "grabs", 16), and draws the ratio of the two averaged spectra against the
+   design in the card **filter response**, with the median deviation where the design
+   passes and the level reached where it blocks. The spectra are Welch averages (Hann
+   segments of 512 samples): the generator's noise is a fixed table, and one FFT of it
+   scatters by several dB per bin whatever is averaged over grabs; with and without the
+   filter the same table cancels. The setups `noise_user`/`noise_raw` play the same noise at
+   200 kSPS. Against the GUI's stand-in the measured response lies within 0.1-0.7 dB
+   (median) of the design. Choosing the test input afterwards switches the generator off
+   (it needs DAC2 for its triangle).
+
+How the firmware runs it (`src/core/sigproc.c`): the 12-bit sample is centred (x - 2048),
+for fixed point placed in the top bits of the word (Q15/Q31, full scale = 1.0 as in the
+tool), filtered, shifted back with rounding, + 2048, clamped to 0..4095; on a gap in the
+stream the state is cleared. `double` becomes `long double` (XC-DSC's `double` has 32
+bits). The state has a fixed 256 bytes, so installing another filter does not change the
+memory layout. `tests/host/test_user_filter_xcheck.py` holds this path, compiled with gcc,
+to a model of each arithmetic (fixed point bit-exact).
+
+The checked-in `user_filter.h` is the default: an elliptic low-pass 15 kHz at 200 kSPS,
+float, for the signal generator's harmonics. Installing another filter changes the two
+files in `src/core` - commit them on purpose, or put the default back with
+`python tools\filterdesign\gui\firmware.py --default`. The tool's own documentation:
+[tools/filterdesign/README.md](tools/filterdesign/README.md).
+
+**On the board** (03.10.2026, docs/HARDWARE-LOG.md section 10): a user filter flashed from
+the tab, and the generator's noise read back at 2 and 8 MSPS (the DAC's hold, nulls at
+multiples of the play rate, as predicted). **Not yet measured there:** the filter's response
+and cost, the noise test itself, the Nano's copy-to-drive flash. Do not interrupt a flash - a killed ipecmd
+left the PKoB4 dead until its USB cable was plugged again; the tab now shows the output live
+and stops a hung run itself after 240 s.
 
 ## The console
 
@@ -685,7 +754,7 @@ already in the ring.
 | `siggen set <f0\|h2..h7\|decay\|amp\|lo\|hi> <value>` | one generator parameter per line (the console line is 64 characters); decimals without an exponent, `lo`/`hi` are DAC codes. Takes effect with the next `siggen on` |
 | `siggen on <dac 1\|2> <n 2..8192> <play_hz 100..1000000> [snap] [force] [oc]` | compute the table and play it on DACOUT1 = RA1 or DACOUT2 = RA8; `snap` moves f0 to a whole number of periods in the table, `force` allows `lo`/`hi` outside the DAC's 205..3890, `oc` paces SCCP2 in 32-bit output compare (dead on silicon; the default is the dual 16-bit timer). Refused while a route uses the same DAC (`stream on` on DAC2) |
 | `siggen off` \| `siggen regs` | stop the generator; dump DMA 2 and SCCP2 registers |
-| `sigproc [lp\|hp\|bp\|off]` | the filter at fs/8 on every completed half, in place (`on` = `lp`); `sigproc` alone = status: filter, Goertzel on/off, its threshold and last result |
+| `sigproc [lp\|hp\|bp\|user\|off]` | the filter on every completed half, in place: three at fs/8 (`on` = `lp`), or `user`, the one from `tools/filterdesign` - its status then adds `user:` (description), `user_fs:` (the rate it was designed for) and `user_id:`; `sigproc` alone = status: filter, Goertzel on/off, its threshold and last result |
 | `sigproc gz on\|off` \| `sigproc gz thr <lsb>` | the Goertzel detector for a tone at fs/16 on the input, and its threshold (1..4095, default 100 LSB) |
 | `route list` | the active route (source, core, pinsel, DAC, sink) and the resource table — which DMA channel, SCCP, DAC output and UREF are in use, RAM used vs. budget (`docs/DESIGN-MULTICHANNEL.md`'s routing core) |
 | `test [part] [halves]` | run a part of the measurement, or `all` — see below |
@@ -1074,6 +1143,8 @@ which file may call which. The table below is the reading order, not the full li
 | `CLAUDE.md` | working notes for continuing with Claude Code: module rules, build and verification steps, open questions |
 | `docs/*.png`, `docs/*.mmd` | the block diagrams above, with their Mermaid sources |
 | `tools/sim_trap.py` | drives the simulator build in MDB: `--smoke` for the short boot/console check (**[SMOKE]**, under a minute), the default for the ~7-minute ping-pong acceptance run (**[SIM]**); see "In the MPLAB X simulator" |
+| `src/core/user_filter.h`, `user_filter.json` | the user filter (`sigproc user`), **generated** by `tools/filterdesign` - the checked-in one is the default |
+| `tools/filterdesign/` | the IIR filter design tool: `fdesign/` (C, the design library), `gui/` (NiceGUI, with the dsPIC33 tab, `firmware.py`); `tools\filterdesign.bat` starts it |
 | `tools/` | command-line build without the IDE, the host test/trace runners, the GUI; **ignore this unless you want it** |
 
 ### The GUI: capture, plot, FFT (`tools/adc_gui.py`)
@@ -1257,3 +1328,7 @@ carries the same notice in its header.
 One exception: the command parser `src/core/cmd_parser.c/.h`, taken from
 [zabooh/cmd_parser](https://github.com/zabooh/cmd_parser), is under the Apache License 2.0;
 its own header states the terms, and they apply to those two files.
+
+A second: the filter design library and its command line front end under
+`tools/filterdesign/fdesign/` (from FilterDesign, 2019) are under the MIT license, as their
+headers state.

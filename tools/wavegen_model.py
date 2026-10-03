@@ -40,8 +40,23 @@ the out_min..out_max range, standard library math).
 import math
 
 
-def wavegen(n, play_hz, f0_hz, harm, decay, amplitude, out_min, out_max):
-    """The table as a list of n ints in out_min..out_max (script lines 35-63)."""
+def noise_u(i):
+    """lib/wavegen.c's wavegen_noise_u(): the "lowbias32" hash of the table
+    index as a uniform value in [-1, 1) - the noise of entry i (03.10.2026)."""
+    m = 0xFFFFFFFF
+    x = (i * 0x9E3779B9 + 0x7F4A7C15) & m
+    x ^= x >> 16
+    x = (x * 0x7FEB352D) & m
+    x ^= x >> 15
+    x = (x * 0x846CA68B) & m
+    x ^= x >> 16
+    return (x - (1 << 32) if x >= (1 << 31) else x) / 2147483648.0
+
+
+def wavegen(n, play_hz, f0_hz, harm, decay, amplitude, out_min, out_max, noise=0.0):
+    """The table as a list of n ints in out_min..out_max (script lines 35-63),
+    plus noise x noise_u(i) after the envelope (lib/wavegen.h, 03.10.2026);
+    f0_hz = 0 with noise > 0: the noise alone."""
     if len(harm) != 6:
         raise ValueError("harm needs the 6 factors of the 2nd..7th harmonic")
     amplitudes = [amplitude * 1.0] + [amplitude * h for h in harm]
@@ -50,9 +65,12 @@ def wavegen(n, play_hz, f0_hz, harm, decay, amplitude, out_min, out_max):
         t = i / play_hz
         env = math.exp(-decay * t)
         s = 0.0
-        for k, a in enumerate(amplitudes):
-            s += a * math.sin(2.0 * math.pi * (k + 1) * f0_hz * t)
-        y.append(env * s)
+        if f0_hz > 0.0:
+            for k, a in enumerate(amplitudes):
+                s += a * math.sin(2.0 * math.pi * (k + 1) * f0_hz * t)
+        # amplitude scales the noise like every harmonic: it cancels in the
+        # normalisation, as wavegen.c's leaving it out does
+        y.append(env * s + amplitude * noise * noise_u(i))
     lo = min(y)
     shifted = [v - lo for v in y]
     hi = max(shifted)
