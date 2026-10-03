@@ -393,6 +393,39 @@ Processing is in place on the completed half, in the main loop, never in an inte
   (the hold's -3.9 dB at half the play rate). The time plot at 8 MSPS shows the held steps,
   about 20 samples each. So the noise reaches the ADC as designed; it is flat only up to
   half the play rate, which is why the noise test plays at twice the stream rate.
+- **04.10.2026, why the noise does not look flat at high rates (`tools/path_response.py`,
+  board on COM26, filter off):** white noise (8192 entries) on DAC2, read on RA8, 16 grabs
+  per configuration, Welch spectra (512). The expected spectrum of an ideal DAC + ADC -
+  the table bit-exact from `wavegen_model`, the reported play rate, hold and aliasing - is
+  subtracted; the rest is the path's. Results, rest at 400 / 800 kHz / 1.2 MHz:
+  - **The test signal explains most of what the GUI showed**: the hold's sin(x)/x of the
+    play rate and its aliases (e.g. 400 k entries/s seen at 1 MSPS: -10 dB at 300 kHz from
+    the signal alone).
+  - **What is left is a linear low-pass of the analog path**, about -3 to -5 dB at
+    400 kHz, -6 to -8 dB at 800 kHz, -10 to -13 dB at 1.2 MHz, -16 to -25 dB at 1.6 MHz,
+    the same at 1, 2, 4 and 8 MSPS (it follows the absolute frequency, not the ADC's rate)
+    and the same at noise amplitude 1, 0.25 and 0.1 (not the DAC's slew rate). Candidates:
+    DAC2's output settling into the pin's load (RA8 carries capacitive touch pad 2; the
+    datasheet's 750 ns to 1 % alone would put -3 dB near 1 MHz, not ~450 kHz) and the ADC's
+    sample capacitor at SAMC 0 (at 2 MSPS SAMC 8 instead of 0 left ~1.5 dB less loss at
+    400-600 kHz - small, one pair). Not separated yet: needs a scope on DACOUT2 or an
+    outside source, or DAC1 -> RA1 for comparison.
+  - **Found on the way, a gap in the counters**: SAMC > 0 at high rates silently changes
+    the real sample rate - the hold's 1 MHz null moved to 1.5-1.6 MHz at "8 MSPS" with
+    SAMC 8 and 31 (effectively ~5 MSPS) and to 816 kHz at 2 MSPS with SAMC 31, while the
+    GRAB header said 8000/2000 kSPS and overrun/late/missed stayed 0. Conversions longer
+    than the trigger period are not counted anywhere.
+  - Run A (15 configurations) stopped at its 17th: `stream off` with the generator on did
+    not answer within 5 s (the board printed `[half]` lines, then answered normally;
+    fail_code 0). The script now waits 15 s, retries once and saves after every
+    configuration. Data: `build/path_response/` (A as the log, B and C as results.json,
+    summary.txt, response.png).
+  - **Part D, the rule play = min(2 fs, 1 MHz):** the raw spectrum (no model subtracted)
+    relative to 2-5 % of fs: within about +-2 dB up to 0.45 fs at 100, 250 and 500 kSPS
+    (the +-2 dB are the table's line pattern after 16 grabs, not a slope); at 1 MSPS -2 dB at
+    200 kHz and -10 dB at 400 kHz, at 2 MSPS -6 dB at 400 kHz, at 8 MSPS -16 dB at 800 kHz.
+    Flat noise from this DAC ends near 200 kHz. The GUI's "flat noise for this rate" uses the
+    rule and shades the spectrum above min(0.45 x play rate, 200 kHz).
 
 ## 11. Limits and open questions
 

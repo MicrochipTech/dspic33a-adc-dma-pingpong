@@ -286,6 +286,27 @@ def _gz_setup(f0, filt="off"):
     return cfg
 
 
+# Where the generator's noise is flat (04.10.2026, board, tools/path_response.py
+# part D): the DAC holds each entry (sin(x)/x of the play rate) and the path from
+# DACOUT2 to the ADC is a low-pass of about -3 dB at 330 kHz. Played at
+# min(2 fs, 1 MHz) the raw spectrum stays within about +-2 dB up to 0.45 fs at
+# 100..500 kSPS; at 1 MSPS it is -2 dB at 200 kHz, at 2 MSPS -6 dB at 400 kHz.
+NOISE_FLAT_HZ = 200e3
+
+
+def noise_play_hz(ksps):
+    """The play rate for flat noise at a stream rate: twice the rate - the DAC's
+    hold then costs < 1 dB at fs/2, and the table's lines (play / 8192 apart)
+    stay no farther apart than the GUI FFT's bins - at most the generator's
+    1 MHz."""
+    return int(min(2 * ksps * 1000, 1_000_000))
+
+
+def noise_flat_limit_hz(play_hz):
+    """Up to where the noise is flat within about 2 dB (measured, see above)."""
+    return min(0.45 * play_hz, NOISE_FLAT_HZ)
+
+
 def _noise_setup(ksps, filt="off"):
     """White noise from the generator on DAC2, read on RA8 at ksps - for a
     filter's frequency response (03.10.2026, lib/wavegen.h's noise): f0 0,
@@ -294,7 +315,7 @@ def _noise_setup(ksps, filt="off"):
     is flat to fs/2 within about 1 dB, and the table's period is four blocks
     of 1024 - every grab sees another piece of it, which the FFT's average
     needs. The filter as given ('user' for tools/filterdesign's)."""
-    play = int(min(2 * ksps * 1000, 1_000_000))
+    play = noise_play_hz(ksps)
     cfg = _sg_setup({}, f0=0.0, n=8192, play=play, ksps=ksps, trig=False, noise=1.0)
     cfg["siggen"]["snap"] = False
     cfg["sigproc"] = {"filter": filt, "gz": False, "thr": 100}
@@ -2859,6 +2880,8 @@ def main_gui(args):
                     sg_force_cb = ui.checkbox("force - any lo/hi", value=True).classes("text-amber-400")
                 with ui.row().classes("w-full gap-2"):
                     sg_loop_btn = ui.button("loop preset", icon="loop").props("unelevated").classes("flex-grow")
+                    sg_noise_btn = ui.button("flat noise for this rate", icon="graphic_eq") \
+                        .props("unelevated").classes("flex-grow")
                     sg_apply_btn = ui.button("apply", icon="send").props("unelevated").classes("flex-grow")
                 sg_msg = ui.label("off").classes("text-xs text-slate-400 mono")
                 sg_preview = ui.echart({
@@ -3193,6 +3216,11 @@ def main_gui(args):
                      "slightly; the DAC settles in 0.75-2 us per step, so above ~500 kHz the "
                      "steps are not clean (Table 40-42)."),
         (sg_f0_in, "Fundamental in Hz, below half the play rate. 0 = no tone, the noise alone."),
+        (sg_noise_btn, "White noise on DAC2, read on RA8, at the rate in the acquisition card: f0 0, "
+                       "noise 1, 8192 entries played at twice the rate (at most 1 MHz). Flat within about "
+                       "2 dB up to 0.45 fs at 100..500 kSPS (board, 04.10.2026); above, the DAC (1 MHz at "
+                       "most) and the path to the ADC (-3 dB near 330 kHz) roll it off - the spectrum shades "
+                       "that part. The filter stays as it is."),
         (sg_noise_in, "White noise added to the table (lib/wavegen.h, uniform, the same table every "
                       "time), relative to the fundamental's amplitude: 0 = none, 1 = as strong as the "
                       "fundamental. With f0 = 0 the table is noise alone - into a filter, with the "
@@ -4007,7 +4035,8 @@ def main_gui(args):
             f0u = float(st.get("f0_used", "0") or 0)
             table = wavegen_model.wavegen(p["n"], play, f0u, [p["h"][k] for k in range(2, 8)],
                                           p["decay"], p["amp"], p["lo"], p["hi"], p["noise"])
-            state["siggen"] = dict(dac=p["dac"], n=p["n"], play=play, f0_used=f0u, table=table)
+            state["siggen"] = dict(dac=p["dac"], n=p["n"], play=play, f0_used=f0u, table=table,
+                                   noise=p["noise"])
             sg_msg.text = (f"on: DAC{p['dac']}, {p['n']} entries at {play} Hz actual, f0 {f0u:g} Hz, "
                            f"table {st.get('table_min')}..{st.get('table_max')}, "
                            f"{st.get('transfers_per_s')} transfers/s")
@@ -4064,6 +4093,21 @@ def main_gui(args):
             old.cancel()
         await apply_siggen()
     sg_loop_btn.on_click(sg_loop_preset)
+
+    async def sg_flat_noise():
+        """White noise on DAC2 read on RA8, played at noise_play_hz() of the rate
+        in the acquisition card, the filter as it is (04.10.2026)."""
+        ksps = max(1, int(rate_in.value or 1))
+        play = noise_play_hz(ksps)
+        flat = noise_flat_limit_hz(play)
+        if flat < ksps * 1e3 * 0.45:
+            ui.notify(f"at {ksps} kSPS the generator's noise is flat only to about {flat / 1e3:.0f} kHz "
+                      f"(DAC: at most 1 MHz, path -3 dB near 330 kHz) - the spectrum marks the rest",
+                      type="warning", multi_line=True)
+        await run_setup(f"flat noise at {ksps} kSPS (played at {play / 1e3:g} kHz)",
+                        _noise_setup(ksps, sp_filter_sel.value or "off"))
+
+    sg_noise_btn.on_click(sg_flat_noise)
 
     def loop_eval(samples, fs):
         """The loop's verdict for one grab, or None when the chain does not
@@ -4495,6 +4539,18 @@ def main_gui(args):
             fft_chart.options["series"][0]["markLine"] = {
                 "silent": True, "symbol": "none",
                 "lineStyle": {"type": "dashed", "color": "#a78bfa", "width": 1}, "data": marks}
+            # the generator's noise on the input: shade where it cannot be flat
+            # (always set - the chart merges options, an old area would stay)
+            sgn = state.get("siggen")
+            area = []
+            if sgn and sgn.get("noise", 0) > 0 and sgn.get("play") and meta.get("proc", 0) == 0:
+                lim = noise_flat_limit_hz(sgn["play"])
+                if lim < meta["ksps"] * 1e3 / 2:
+                    area = [[{"xAxis": lim / 1e3, "name": "noise not flat here (DAC, path)",
+                              "label": {"color": "#9ca3af", "position": "insideTop", "fontSize": 10}},
+                             {"xAxis": meta["ksps"] / 2.0}]]
+            fft_chart.options["series"][0]["markArea"] = {
+                "silent": True, "itemStyle": {"color": "rgba(148,163,184,0.10)"}, "data": area}
             fft_chart.update()
             if app_card:
                 app_card.update(meta)

@@ -705,6 +705,11 @@ tools\filterdesign.bat                     the design tool, http://127.0.0.1:809
    200 kSPS. Against the GUI's stand-in the measured response lies within 0.1-0.7 dB
    (median) of the design. Choosing the test input afterwards switches the generator off
    (it needs DAC2 for its triangle).
+   **flat noise for this rate** in the generator card plays the same noise at twice the
+   acquisition card's rate (at most 1 MHz), without a measurement. Measured on the board
+   (04.10.2026): flat within about 2 dB up to 0.45 fs at 100-500 kSPS; above, the DAC's
+   1 MHz and the path from DACOUT2 to the ADC (-3 dB near 330 kHz, `tools/path_response.py`)
+   roll it off - the spectrum shades that part (above 200 kHz).
 
 How the firmware runs it (`src/core/sigproc.c`): the 12-bit sample is centred (x - 2048),
 for fixed point placed in the top bits of the word (Q15/Q31, full scale = 1.0 as in the
