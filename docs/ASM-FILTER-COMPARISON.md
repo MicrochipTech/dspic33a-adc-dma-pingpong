@@ -56,6 +56,26 @@ fixed32.**
 2-2.5 (45-60 against 120-130 cycles). The measured factor is 3.3, because the C float loop
 costs more per instruction than assumed.
 
+## Is C with compiler intrinsics enough?
+
+Measured on the same board with the same design, all three variants using `fmaf()`, which
+XC-DSC compiles to `mac.s`:
+
+| Variant | Cycles per sample | Compared with the assembler |
+|---|---|---|
+| C stand-in from the header: a loop over the sections, coefficients and state read and written every sample | 154 | 2.7 times slower |
+| C written like the assembler: coefficients and state in local variables, sections written out, one pass per block | 81 | 1.45 times slower |
+| **assembler** | **56** | - |
+
+**The intrinsic alone gains little: 185 -> 154 cycles.** Most of the gain comes from the
+structure: values kept in registers, one pass per block. Well-written C gets to 81 cycles.
+The remaining 25 cycles come from the compiler's register allocation and clamping:
+
+- It keeps only 10 of the 15 coefficients in FPU registers. The others, plus 0.0 and the
+  clamp limits, are reloaded as immediates inside the loop.
+- It clamps with two comparisons and branches (`cpq.s`/`fbra`). The assembler uses
+  `maxnm.s`/`minnm.s`, which need no branch.
+
 ## Arithmetic
 
 The structure is the same transposed direct form II as the C float code. The difference is

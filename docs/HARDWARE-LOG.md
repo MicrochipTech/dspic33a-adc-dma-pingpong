@@ -446,6 +446,19 @@ Processing is in place on the completed half, in the main loop, never in an inte
   and 120-130 for C float, factor 2-2.5; measured 56 and 185, factor 3.3 - the C float
   loop costs about 2 cycles per instruction (its coefficient and state loads), the
   assembler 1.7. The response against the design (the GUI's noise test) was not run.
+- **04.10.2026, does C with fmaf() reach the assembler? (same board and design, builds
+  12:54-12:55, banner `git e6f4970+local changes`):** two C versions compiled by XC-DSC
+  (-O1) in place of the assembler, `load=` at 1 and 2 MSPS:
+  - the header's C stand-in (fmaf, a loop over the sections, coefficients and state from
+    memory every sample): **154 cycles per sample**, 2 MSPS misses halves;
+  - C written like the assembler (fmaf, coefficients and state in locals, sections written
+    out, one pass per block): **81 cycles per sample**, clean at 2 MSPS;
+  - the assembler: **56** (unchanged).
+  The compiler does turn fmaf() into mac.s (12 per sample in both). The good C version
+  still loses 25 cycles: it keeps 10 of 15 coefficients in registers and reloads the
+  others plus 0.0 and the clamp constants as immediates inside the loop, and clamps with
+  two compares and branches (cpq.s/fbra) where the assembler uses maxnm.s/minnm.s.
+  Outputs at 8 kSPS identical in all three (2021..2077).
 
 ## 11. Limits and open questions
 
