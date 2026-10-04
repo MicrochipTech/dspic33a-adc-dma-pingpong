@@ -27,7 +27,10 @@ import presets
 TYPE_LABELS = {"lowpass": "Lowpass", "highpass": "Highpass", "bandpass": "Bandpass", "bandstop": "Bandstop"}
 CHAR_LABELS = {"butterworth": "Butterworth", "chebyshev": "Chebyshev (type I)", "elliptic": "Elliptic (Cauer)"}
 ARITH_LABELS = {"float": "float (32 bit)", "double": "double (64 bit)",
-                "fixed32": "fixed point 32 bit", "fixed16": "fixed point 16 bit"}
+                "fixed32": "fixed point 32 bit", "fixed16": "fixed point 16 bit",
+                "float_asm": "float (32 bit, dsPIC33A assembler)"}
+# what the C test compiles and runs on the PC (not the dsPIC33A assembler)
+TEST_LABELS = {k: v for k, v in ARITH_LABELS.items() if k in codegen.PC_TESTABLE}
 
 # edge widgets in ascending frequency order: (label, list, index)
 EDGE_LAYOUT = {
@@ -112,9 +115,11 @@ def line(name: str, data: list, color: str, dashed: bool = False, width: float =
 
 TAB_NAMES = ["Magnitude", "Phase", "Group delay", "Pole / zero", "Impulse / step", "Sections", "C code", "C test",
              "dsPIC33"]
-IMPL_COLORS = {"float": "#a78bfa", "double": "#34d399", "fixed32": "#fbbf24", "fixed16": "#f472b6"}
+IMPL_COLORS = {"float": "#a78bfa", "double": "#34d399", "fixed32": "#fbbf24", "fixed16": "#f472b6",
+               "float_asm": "#a78bfa"}
 # distinct line patterns, so that coinciding curves stay distinguishable
-IMPL_DASH = {"float": [10, 6], "double": [2, 4], "fixed32": [14, 4, 2, 4], "fixed16": "solid"}
+IMPL_DASH = {"float": [10, 6], "double": [2, 4], "fixed32": [14, 4, 2, 4], "fixed16": "solid",
+             "float_asm": [10, 6]}
 
 
 def nice_limits(values, floor_span: float = 1e-12) -> tuple[float, float]:
@@ -269,7 +274,7 @@ def index(tab: str = "magnitude") -> None:
                             c_code = ui.code("", language="c").classes("w-full text-xs")
                 with ui.tab_panel(t_test):
                     with ui.row().classes("w-full items-end gap-3"):
-                        test_impls = ui.select(ARITH_LABELS, multiple=True, value=list(ARITH_LABELS),
+                        test_impls = ui.select(TEST_LABELS, multiple=True, value=list(TEST_LABELS),
                                                label="Implementations").props("dense use-chips").classes("min-w-[340px]")
                         test_sig = ui.select(ctest.SIGNALS, value="noise", label="Signal").props("dense").classes("w-44")
                         test_f1 = ui.number("f1", value=1000, min=0, suffix="Hz", format="%.6g").props("dense").classes("w-28")
@@ -471,6 +476,7 @@ def index(tab: str = "magnitude") -> None:
         code_files["h"] = (files[0], files[1])
         code_files["c"] = (files[2], files[3])
         h_title.text, c_title.text = files[0], files[2]
+        dl_c.text = "Download " + os.path.splitext(files[2])[1]
         h_code.content, c_code.content = files[1], files[3]
         code_note.text = (f"{ARITH_LABELS[arith_sel.value]}, {len(sos)} sections"
                           + (", section scaling" if scale_chk.value else ""))
@@ -725,6 +731,12 @@ def index(tab: str = "magnitude") -> None:
         if arith == "double":
             rows.append(("warn", "double: the firmware uses long double (XC-DSC's double has 32 bits) - "
                                  "much slower than float."))
+        if arith == "float_asm":
+            rows.append(("warn", "dsPIC33A assembler: 7 FPU instructions per section and about 12 per "
+                                 "sample, fused multiply-add (not bit-exact to the C float code). The PC "
+                                 "test cannot run it; the C stand-in in the header is what the host tests "
+                                 "see, the board (or test_asm_sim.py in the MPLAB simulator) runs the "
+                                 "assembler."))
         if fixed is not None and (fixed.clipped or sat):
             rows.append(("bad", "Fixed-point overflow in the impulse test - enable section scaling."))
         rows.append(("ok" if d.spec_met and impl_ok else "warn",
@@ -868,6 +880,11 @@ def index(tab: str = "magnitude") -> None:
     def download_testbench() -> None:
         d = state["design"]
         if d is None:
+            return
+        if arith_sel.value not in codegen.PC_TESTABLE:
+            ui.notify("dsPIC33A assembler: no PC test bench - it runs on the dsPIC33A only "
+                      "(dsPIC33 tab, or tools/filterdesign/gui/test_asm_sim.py in the MPLAB simulator).",
+                      type="warning")
             return
         a = test_args()
         name = name_in.value or "iir_filter"
@@ -1136,7 +1153,7 @@ def index(tab: str = "magnitude") -> None:
             put(time_kind, pick("view", "time_response", str, lambda v: v in ("impulse", "step")))
             put(test_view, pick("view", "test_view", str, lambda v: v in ("out", "err", "freq", "dev")))
 
-            put(test_impls, pick("test", "implementations", lambda v: [a for a in v if a in ARITH_LABELS]))
+            put(test_impls, pick("test", "implementations", lambda v: [a for a in v if a in TEST_LABELS]))
             put(test_sig, pick("test", "signal", str, lambda v: v in ctest.SIGNALS))
             put(test_f1, pick("test", "f1", float, lambda v: v >= 0))
             put(test_f2, pick("test", "f2", float, lambda v: v >= 0))

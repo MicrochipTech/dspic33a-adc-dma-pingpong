@@ -7,6 +7,8 @@ second order sections:
 * fixed16 / fixed32: direct form I with a 64 bit accumulator, rounding and saturation.
   The arithmetic is bit-exact to fdcore.fixed_filter(), so the GUI shows exactly
   what the target computes.
+* float_asm: float, transposed direct form II, as dsPIC33A assembler (asmgen.py): a
+  header plus a .s file. Runs on a dsPIC33A only - no PC test bench.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import zlib
 
 import numpy as np
 
+import asmgen
 from fdcore import Design, FixedPoint
 
 ARITHMETICS = {
@@ -24,7 +27,11 @@ ARITHMETICS = {
     "double": "64 bit floating point (double)",
     "fixed32": "32 bit fixed point (int32_t data/coefficients, int64_t accumulator)",
     "fixed16": "16 bit fixed point (int16_t data/coefficients, int64_t accumulator)",
+    "float_asm": "32 bit floating point, dsPIC33A assembler (FPU, fused multiply-add)",
 }
+
+# arithmetics a PC compiler can build and test (ctest.py, test benches)
+PC_TESTABLE = ("float", "double", "fixed32", "fixed16")
 
 
 def c_identifier(name: str) -> str:
@@ -156,12 +163,49 @@ def _parts(d: Design, ident: str, arithmetic: str, sos: np.ndarray, fixed: Fixed
     return p
 
 
+ASM_STRUCTURE = (
+    " *\n * Structure   : {n} second order section(s), transposed direct form II, per section\n"
+    " *               y = b0*x + s0;  s0 = (s1 + b1*x) - a1*y;  s1 = b2*x - a2*y\n"
+    " *               every '+ c*v' one fused multiply-add (mac.s, one rounding): not\n"
+    " *               bit-exact to the C float code, but to fmaf() in this order\n"
+    " * Target      : dsPIC33A only (XC-DSC, FPU) - cannot be built or run on a PC\n */\n\n")
+
+
+def _asm_defs(d: Design, ident: str, n: int) -> str:
+    up = ident.upper()
+    return (f"#define {up}_NUM_SECTIONS {n}\n#define {up}_SAMPLE_RATE {d.spec.fs:g}\n\n"
+            f"typedef struct {{\n    float s[{up}_NUM_SECTIONS][2];   /* s0, s1 per section */\n"
+            f"}} {ident}_state_t;\n\n")
+
+
+def _generate_asm(d: Design, ident: str, sos: np.ndarray, head: str) -> tuple[str, str, str, str]:
+    """float_asm for the Code tab: <ident>.h and <ident>.s (float in, float out)."""
+    up = ident.upper()
+    header = (
+        head + ASM_STRUCTURE.format(n=len(sos)) + f"#ifndef {up}_H\n#define {up}_H\n\n"
+        "#include <stdint.h>\n#include <string.h>\n\n" + _asm_defs(d, ident, len(sos))
+        + f"/* Clears the filter state. */\n"
+        f"static inline void {ident}_init({ident}_state_t *st)\n{{\n    memset(st, 0, sizeof *st);\n}}\n\n"
+        f"/* Filters n samples ({ident}.s); in and out may point to the same buffer. */\n"
+        f"void {ident}_process_block({ident}_state_t *st, const float *in, float *out, uint32_t n);\n\n"
+        f"#endif /* {up}_H */\n")
+    lines = asmgen.kernel(f"{ident}_process_block", sos, "f32")
+    source = ("".join("; " + l[3:].rstrip() + "\n" if l.startswith(" * ") else
+                      ";" + l[2:].rstrip() + "\n" if l.startswith(" *") else ""
+                      for l in head.splitlines())
+              + "; C: void " + f"{ident}_process_block({ident}_state_t *st, const float *in, "
+              "float *out, uint32_t n)\n"
+              "; W0 = st, W1 = in, W2 = out, W3 = n; F8 and up are saved and restored\n\n"
+              + "\n".join(lines) + "\n")
+    return f"{ident}.h", header, f"{ident}.s", source
+
+
 def generate(d: Design, name: str, arithmetic: str, sos: np.ndarray,
              fixed: FixedPoint | None = None) -> tuple[str, str, str, str]:
     """Returns (header_filename, header, source_filename, source).
 
     sos is the (optionally section-scaled) cascade; for fixed point, `fixed`
-    holds its quantized coefficients.
+    holds its quantized coefficients. float_asm returns a .s file as the source.
     """
     ident = c_identifier(name)
     up = ident.upper()
@@ -171,6 +215,8 @@ def generate(d: Design, name: str, arithmetic: str, sos: np.ndarray,
         f"{_spec_comment(d)}"
         f" * Arithmetic  : {ARITHMETICS[arithmetic]}\n"
     )
+    if arithmetic == "float_asm":
+        return _generate_asm(d, ident, sos, head)
     p = _parts(d, ident, arithmetic, sos, fixed)
     header = (head + p["structure"] + f"#ifndef {up}_H\n#define {up}_H\n\n" + p["std_includes"]
               + p["defs"] + p["protos"] + f"#endif /* {up}_H */\n")
@@ -217,6 +263,32 @@ def firmware_description(d: Design, arithmetic: str) -> str:
     return f"{s.characteristic} {s.type} {edges} Hz, order {d.digital_order}, {arithmetic}"
 
 
+def _firmware_asm_parts(d: Design, ident: str, sos: np.ndarray) -> dict:
+    """float_asm in user_filter.h: the assembler routine as a file-scope __asm__ (so
+    that, as with the C variants, no build needs another source file), and for any
+    other compiler (host tests, trace builds) the same arithmetic in C."""
+    up = ident.upper()
+    asm = asmgen.as_c_asm_block(asmgen.kernel(f"{ident}_block_u12", sos, "u12"))
+    body = (
+        f"static inline void {ident}_init({ident}_state_t *st)\n{{\n    memset(st, 0, sizeof *st);\n}}\n\n"
+        "/*\n * The whole block of \"sigproc user\" (sigproc.c, user_cascade()), x in place:\n"
+        " * x - 2048 into the cascade, the result + 2048.5 clamped to 0..4095 and truncated.\n */\n"
+        f"#define {up}_ASM 1\n"
+        "#if defined(__XC_DSC__) && defined(__dsPIC33A__)\n"
+        f"void {ident}_block_u12({ident}_state_t *st, uint16_t *x, uint32_t n);\n\n"
+        + asm +
+        "#else\n"
+        "/* Host stand-in (host tests, trace builds): the same arithmetic in C, fmaf() in\n"
+        " * the order of the assembler above. Not the code the board runs. */\n"
+        + asmgen.kcoeffs_c(ident, sos)
+        + asmgen.host_reference_c("static inline ", ident, "u12")
+        + "#endif\n")
+    return {"structure": ASM_STRUCTURE.format(n=len(sos)),
+            "std_includes": "#include <stddef.h>\n#include <math.h>\n\n",
+            "includes": "#include <string.h>\n\n",
+            "defs": _asm_defs(d, ident, len(sos)), "t": "float", "body": body}
+
+
 def generate_firmware(d: Design, arithmetic: str, sos: np.ndarray,
                       fixed: FixedPoint | None = None) -> tuple[str, dict]:
     """The filter as the dsPIC33 firmware runs it ("sigproc user", src/core/sigproc.c).
@@ -225,6 +297,8 @@ def generate_firmware(d: Design, arithmetic: str, sos: np.ndarray,
     The header holds the same code generate() writes into a .c file, made static
     inline so that sigproc.c - the only file including it - needs no new source
     file in any build. "double" becomes long double: XC-DSC's double has 32 bits.
+    float_asm puts the assembler into the header as a file-scope __asm__ with a C
+    stand-in for other compilers (_firmware_asm_parts()).
     The id is a CRC-32 of the generated code; the firmware reports it ("sigproc"
     status, user_id) and the JSON carries it, so the dsPIC33 GUI can tell whether
     the board runs the filter described there.
@@ -232,7 +306,10 @@ def generate_firmware(d: Design, arithmetic: str, sos: np.ndarray,
     ident = FIRMWARE_IDENT
     up = ident.upper()
     ctype = "long double" if arithmetic == "double" else None
-    p = _parts(d, ident, arithmetic, sos, fixed, fn="static inline ", ctype=ctype)
+    if arithmetic == "float_asm":
+        p = _firmware_asm_parts(d, ident, sos)
+    else:
+        p = _parts(d, ident, arithmetic, sos, fixed, fn="static inline ", ctype=ctype)
     fid = zlib.crc32((arithmetic + "\n" + p["defs"] + p["body"]).encode("ascii")) & 0xFFFFFFFF
     desc = firmware_description(d, arithmetic)
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")

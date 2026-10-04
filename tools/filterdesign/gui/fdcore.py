@@ -317,7 +317,7 @@ def implement(design_sos: np.ndarray, fs: float, arith: str, scaled: bool = True
         f = auto_frac_bits(sos, word) if frac is None else int(max(0, min(word - 1, frac)))
         fixed = quantize(sos, word, f)
         impl_sos = fixed.as_float_sos()
-    elif arith == "float":
+    elif arith in ("float", "float_asm"):
         impl_sos = sos.astype(np.float32).astype(float)
     else:
         impl_sos = sos

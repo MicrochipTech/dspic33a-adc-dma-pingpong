@@ -127,7 +127,11 @@ python gen_core_project.py --check     core_example.X still matches adc_dma_40ms
   `tests/host/user_filter` against a fresh `firmware.py --fixtures` - "stale" -> regenerate and
   commit them) and `python tools\filterdesign\gui\fw_ui_test.py` (browser: install, build,
   dsPIC33 GUI on the fake; it puts the default `user_filter.h` back). `--flash` programs a
-  connected board: only on purpose.
+  connected board: only on purpose. A change to `asmgen.py` (arithmetic "float, dsPIC33A
+  assembler", no PC test bench) runs `python tools\filterdesign\gui\test_asm_sim.py`
+  (about 1 min, MPLAB X simulator: 1..16 sections, bit-exact to the fmaf() reference,
+  within 1 LSB of the C float path). The MDB simulator does not go on after a breakpoint,
+  and has no timers: it gives no cycle figures - the board's `load=` does.
 - **Customer handover:** `python tools\export_core.py [--rev <commit>]` builds
   `build\core-<rev>.zip` from a commit (not the working tree) and compiles it before it says PASS.
 - A change to the reply format of `version`, `help`, `status`, `regs`, `chain all` or the

@@ -210,7 +210,15 @@ void cascade(uint16_t *x, uint32_t n, float b1, float b2,
  * On a gap the state is cleared rather than settled: the generated code has
  * no "settle" of its own, and a signal centred on mid-scale - the case this
  * offset is chosen for - then starts without a step. */
-#if USER_FILTER_FIXED_BITS == 0
+#if defined(USER_FILTER_ASM)
+/* "float, dsPIC33A assembler" (04.10.2026): the generated routine does the
+ * whole block itself - x - 2048 in, + 2048.5, clamp, truncate - like the
+ * float loop below, with fused multiply-adds (so not bit-exact to it). */
+static void user_cascade(uint16_t *x, uint32_t n)
+{
+    user_filter_block_u12(&ust, x, n);
+}
+#elif USER_FILTER_FIXED_BITS == 0
 static void user_cascade(uint16_t *x, uint32_t n)
 {
     for (uint32_t i = 0; i < n; i++) {

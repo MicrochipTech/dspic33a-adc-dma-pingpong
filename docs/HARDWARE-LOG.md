@@ -426,6 +426,26 @@ Processing is in place on the completed half, in the main loop, never in an inte
     200 kHz and -10 dB at 400 kHz, at 2 MSPS -6 dB at 400 kHz, at 8 MSPS -16 dB at 800 kHz.
     Flat noise from this DAC ends near 200 kHz. The GUI's "flat noise for this rate" uses the
     rule and shades the spectrum above min(0.45 x play rate, 200 kHz).
+- **04.10.2026, the user filter as dsPIC33A assembler against C (board on COM26, EV74H48A,
+  each built with `tools\build.bat` -O1 and flashed with ipecmd/PKOB4; banner `git 82ed5d7+local
+  changes`, 12:33-12:38):** the same design (elliptic band-pass 800-1200 Hz, order 6, 3
+  sections, fs 8 kHz) in three arithmetics of tools/filterdesign, `sigproc user`, `load=` of
+  the second grab, the stream run at rates the coefficients are not meant for (the cost per
+  sample does not depend on them):
+
+  | arithmetic | load at 1 / 2 / 3 MSPS (per mille) | cycles per sample | highest rate without missed halves |
+  |---|---|---|---|
+  | float, dsPIC33A assembler (`asmgen.py`) | 281 / 562 / 848 | 56 | 3 MSPS (4 MSPS: 678 missed) |
+  | float (C) | 926 / 1855 | 185 | 1 MSPS |
+  | fixed point 32 bit (C) | 1252 / 2507 | 250 | below 1 MSPS (1 MSPS: 290 missed) |
+
+  The assembler costs 3.3 x less than the C float code and 4.5 x less than fixed32. At 8 kSPS
+  the output was filtered (2022..2076 against 992..3802 unfiltered on the same input), late/missed 0.
+  **Prediction that turned out wrong:** from the instruction counts (33 against ~90 per
+  sample) and the built-in float loop's 1.4 cycles per instruction (44 instructions, 62 cycles) I expected 45-60 cycles for the assembler
+  and 120-130 for C float, factor 2-2.5; measured 56 and 185, factor 3.3 - the C float
+  loop costs about 2 cycles per instruction (its coefficient and state loads), the
+  assembler 1.7. The response against the design (the GUI's noise test) was not run.
 
 ## 11. Limits and open questions
 
@@ -454,7 +474,7 @@ Open:
 ## 12. Not run on silicon
 
 - The EV17P63A Curiosity Nano with this firmware (build and simulator smoke run only).
-- The user filter's response and cost per sample on the board, the GUI's noise test and
+- The user filter's response on the board (its cost per sample: section 10, 04.10.2026), the GUI's noise test and
   filter switch against a board (the noise itself was seen on the board, section 10), the Nano's copy-to-drive flash (03.10.2026: all checked on the host, the
   simulator and the GUI's stand-in only).
 - `test all` on the restructured firmware (R3 skipped; it hangs the older firmware after
