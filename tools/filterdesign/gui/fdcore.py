@@ -301,16 +301,29 @@ def fixed_step_response(fp: FixedPoint, n: int, amplitude: float = 0.5) -> np.nd
 ARITHMETICS = ["float", "double", "fixed32", "fixed16"]
 
 
+def gain_factor(gain_db: float) -> float:
+    """The output gain as a factor (0 dB -> 1.0)."""
+    return 10.0 ** (float(gain_db) / 20.0)
+
+
 def implement(design_sos: np.ndarray, fs: float, arith: str, scaled: bool = True,
-              frac: int | None = None) -> tuple[np.ndarray, FixedPoint | None, np.ndarray]:
+              frac: int | None = None,
+              gain_db: float = 0.0) -> tuple[np.ndarray, FixedPoint | None, np.ndarray]:
     """Builds the implementation of a design for one arithmetic.
 
     Returns (sos, fixed, impl_sos): the (optionally scaled) cascade, its quantized
     coefficients for fixed point (else None) and the cascade with the coefficients
     the target actually uses (float32-rounded / quantized) for response plots.
     frac=None selects the fractional bits automatically.
+
+    gain_db (04.10.2026) is an output gain folded into b0..b2 of the last section:
+    no extra operation per sample in any arithmetic, and every node before the
+    output keeps the section scaling's 0 dB. The returned cascades include it.
     """
     sos = scale_sections(design_sos, fs) if scaled else design_sos.copy()
+    if gain_db:
+        sos = sos.copy()
+        sos[-1, :3] *= gain_factor(gain_db)
     fixed = None
     if arith.startswith("fixed"):
         word = int(arith[5:])

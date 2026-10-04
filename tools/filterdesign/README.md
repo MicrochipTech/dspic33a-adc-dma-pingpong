@@ -234,6 +234,22 @@ at every section output is 0 dB. Without it, internal nodes of high-order ellipt
 overflow in fixed point. The test showed several hundred saturations, and none with scaling.
 **Auto Q** chooses the largest number of fractional bits for which all coefficients fit.
 
+**Output gain** (dB, default 0) multiplies b0, b1 and b2 of the last section. No arithmetic
+needs an extra operation per sample for it, and every node before the output keeps the
+0 dB of section scaling.
+- **Above 0 dB a signal clips.** The output saturates in fixed point, and the dsPIC33
+  firmware clamps it to 0..4095. Clipping starts when the signal exceeds full scale divided
+  by the gain. Nothing counts these clipped samples.
+- **It adds no resolution.** The noise in the passband rises with the signal.
+- **How the tool shows it:** The plots and the specification check are normalised to the
+  gain. The summary names the gain. The fixed-point impulse test runs at ½ FS / gain.
+- **How the tests drive it:** The C test and the test bench drive their signal at
+  amplitude / gain, and the measured response is compared with the design times the gain.
+- **What the firmware gets:** The gain is in the generated code (comment,
+  `USER_FILTER_DESC`) and in `user_filter.json` (`gain_db`). The JSON's `sos` rows include
+  the gain, so the dsPIC33 GUI's noise test compares against the right curve. Its
+  thresholds are relative to the design's peak.
+
 ### Testing the C implementations
 
 The **C test** tab compiles the generated code of the selected implementations (float, double,

@@ -1773,7 +1773,10 @@ def noise_response(f, avg_off_db, avg_on_db, info, fs_hz):
     design = user_filter_design_db(info, f, fs_hz)
     inner = np.zeros(len(f), dtype=bool)
     inner[2:len(f) - 2] = True
-    passing, blocked = inner & (design > -3.0), inner & (design < -40.0)
+    # relative to the design's peak: 0 dB without, the output gain with one
+    # (user_filter.json "gain_db", 04.10.2026; its sos rows include the gain)
+    peak = float(np.max(design[inner])) if inner.any() else 0.0
+    passing, blocked = inner & (design > peak - 3.0), inner & (design < peak - 40.0)
     dev = np.abs(meas[passing] - design[passing])
     stats = {"pass_med": float(np.median(dev)) if dev.size else None,
              "pass_p90": float(np.percentile(dev, 90)) if dev.size else None,

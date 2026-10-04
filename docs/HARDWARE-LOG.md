@@ -459,6 +459,17 @@ Processing is in place on the completed half, in the main loop, never in an inte
   others plus 0.0 and the clamp constants as immediates inside the loop, and clamps with
   two compares and branches (cpq.s/fbra) where the assembler uses maxnm.s/minnm.s.
   Outputs at 8 kSPS identical in all three (2021..2077).
+- **04.10.2026, the filter tool's output gain on the board (EV74H48A, banner `git 99224a9+local
+  changes`):** the default design (elliptic low-pass 15 kHz, order 6, 200 kSPS) as
+  float_asm, the gain folded into the last section's b0..b2, the dsPIC33 GUI's noise test
+  (white noise DAC2 -> RA8, 16 + 16 grabs, Welch) per gain:
+  - 0 dB: passband median -0.56 dB (design -0.14), |measured - design| median 1.09 dB, p90 2.41;
+  - +6 dB: passband median +5.35 dB (design +5.86), median 1.17, p90 3.00; no sample at 0 or
+    4095 in 16 x 1024.
+  The measured passband moved by 5.91 dB for 6 dB; the stopband stayed at -65 dB. The -6 dB
+  run did not take place: after the +6 dB run the PKOB4 answered "Connection Failed"
+  twice (no other program held it); the board was left with the +6 dB firmware until it
+  is replugged.
 
 ## 11. Limits and open questions
 

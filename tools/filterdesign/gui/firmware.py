@@ -83,19 +83,20 @@ def installed_info() -> dict | None:
         return None
 
 
-def install(d, arithmetic: str, sos, fixed) -> dict:
-    """Writes the filter into the firmware's sources; returns the JSON written."""
+def install(d, arithmetic: str, sos, fixed, gain_db: float = 0.0) -> dict:
+    """Writes the filter into the firmware's sources; returns the JSON written.
+    sos/fixed already hold the output gain (fdcore.implement()); gain_db names it."""
     import codegen                           # here: firmware.py --default runs without the GUI
-    text, info = codegen.generate_firmware(d, arithmetic, sos, fixed)
+    text, info = codegen.generate_firmware(d, arithmetic, sos, fixed, gain_db)
     HEADER.write_text(text, encoding="ascii", newline="\n")
     INFO.write_text(json.dumps(info, indent=1) + "\n", encoding="utf-8", newline="\n")
     return info
 
 
-def preview_id(d, arithmetic: str, sos, fixed) -> str:
+def preview_id(d, arithmetic: str, sos, fixed, gain_db: float = 0.0) -> str:
     """The id install() would write - to tell whether the installed filter is this one."""
     import codegen
-    return codegen.generate_firmware(d, arithmetic, sos, fixed)[1]["id"]
+    return codegen.generate_firmware(d, arithmetic, sos, fixed, gain_db)[1]["id"]
 
 
 def header_id() -> str | None:

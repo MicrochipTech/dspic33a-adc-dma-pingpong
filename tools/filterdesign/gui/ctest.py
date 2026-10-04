@@ -106,7 +106,8 @@ class TestRun:
     amplitude: float
     results: list[ImplResult] = field(default_factory=list)
     f_design: np.ndarray | None = None
-    h_design: np.ndarray | None = None
+    h_design: np.ndarray | None = None      # the design's |H|, times the output gain
+    gain: float = 1.0                       # output gain as a factor (fdcore.gain_factor)
 
 
 def _write_values(path: Path, values: np.ndarray, integer: bool) -> None:
@@ -161,9 +162,10 @@ def _run(exe: Path, workdir: Path, values: np.ndarray, integer: bool, expected: 
 
 
 def test_implementation(d: fdcore.Design, arith: str, x: np.ndarray, amplitude: float, cc: str,
-                        scaled: bool = True, frac: int | None = None, n_impulse: int = 8192) -> ImplResult:
+                        scaled: bool = True, frac: int | None = None, n_impulse: int = 8192,
+                        gain_db: float = 0.0) -> ImplResult:
     res = ImplResult(arith=arith)
-    sos, fixed, _ = fdcore.implement(d.sos, d.spec.fs, arith, scaled, frac)
+    sos, fixed, _ = fdcore.implement(d.sos, d.spec.fs, arith, scaled, frac, gain_db)
     integer = fixed is not None
     with tempfile.TemporaryDirectory(prefix="fdtest_") as td:
         work = Path(td)
@@ -222,27 +224,34 @@ def test_implementation(d: fdcore.Design, arith: str, x: np.ndarray, amplitude: 
 
 def run_tests(d: fdcore.Design, ariths: list[str], kind: str, n: int, amplitude: float,
               f1: float, f2: float, cc: str, scaled: bool = True,
-              frac_override: dict[str, int] | None = None) -> TestRun:
-    """Runs the test for all requested arithmetics (blocking; call from a worker thread)."""
+              frac_override: dict[str, int] | None = None, gain_db: float = 0.0) -> TestRun:
+    """Runs the test for all requested arithmetics (blocking; call from a worker thread).
+
+    With an output gain the signal is driven at amplitude / gain, so that the output
+    stays in range instead of saturating (fixed point) or exceeding full scale."""
     x = make_signal(kind, n, d.spec.fs, f1, f2)
-    run = TestRun(signal=kind, n=n, amplitude=amplitude)
+    g = fdcore.gain_factor(gain_db)
+    run = TestRun(signal=kind, n=n, amplitude=amplitude / g, gain=g)
     n_imp = int(min(max(2 * fdcore.settle_length(d.sos), 4096), 1 << 16))
     with ThreadPoolExecutor(max_workers=max(1, len(ariths))) as pool:
-        futures = [pool.submit(test_implementation, d, a, x, amplitude, cc, scaled,
-                               (frac_override or {}).get(a), n_imp) for a in ariths]
+        futures = [pool.submit(test_implementation, d, a, x, amplitude / g, cc, scaled,
+                               (frac_override or {}).get(a), n_imp, gain_db) for a in ariths]
         run.results = [f.result() for f in futures]
     f = np.fft.rfftfreq(8192, 1.0 / d.spec.fs)
     ok = [r for r in run.results if r.ok]
     run.f_design = ok[0].f_meas if ok else f
-    run.h_design = np.abs(fdcore.response(d.sos, run.f_design, d.spec.fs))
+    run.h_design = g * np.abs(fdcore.response(d.sos, run.f_design, d.spec.fs))
     return run
 
 
 def testbench_zip(d: fdcore.Design, name: str, arith: str, kind: str, n: int, amplitude: float,
-                  f1: float, f2: float, scaled: bool = True, frac: int | None = None) -> bytes:
-    """Zip archive with filter, test bench, Makefile, input and expected output."""
-    sos, fixed, _ = fdcore.implement(d.sos, d.spec.fs, arith, scaled, frac)
-    hname, header, cname, source = codegen.generate(d, name, arith, sos, fixed)
+                  f1: float, f2: float, scaled: bool = True, frac: int | None = None,
+                  gain_db: float = 0.0) -> bytes:
+    """Zip archive with filter, test bench, Makefile, input and expected output.
+    With an output gain the signal is driven at amplitude / gain (see run_tests())."""
+    sos, fixed, _ = fdcore.implement(d.sos, d.spec.fs, arith, scaled, frac, gain_db)
+    hname, header, cname, source = codegen.generate(d, name, arith, sos, fixed, gain_db)
+    amplitude = amplitude / fdcore.gain_factor(gain_db)
     tname, tsrc = codegen.generate_testbench(name, arith)
     x = make_signal(kind, n, d.spec.fs, f1, f2)
     if fixed is not None:

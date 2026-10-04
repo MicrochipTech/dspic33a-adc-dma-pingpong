@@ -210,6 +210,10 @@ def index(tab: str = "magnitude") -> None:
                 ui.label("Implementation").classes("text-base font-semibold")
                 arith_sel = ui.select(ARITH_LABELS, value="fixed32", label="Arithmetic").props("dense").classes("w-full")
                 scale_chk = ui.checkbox("Section scaling (L∞, 0 dB per node)", value=True)
+                gain_in = ui.number("Output gain", value=0.0, min=-40, max=60, step=1, suffix="dB",
+                                    format="%.4g").props("dense").classes("w-full").tooltip(
+                    "Folded into b0..b2 of the last section: no extra cost per sample. "
+                    "Above 0 dB a signal above full scale / gain clips at 0 or 4095.")
                 with ui.row().classes("w-full no-wrap items-center gap-2"):
                     auto_q = ui.checkbox("Auto Q", value=True)
                     frac_in = ui.number("Fractional bits", value=30, min=0, max=31, step=1,
@@ -360,12 +364,19 @@ def index(tab: str = "magnitude") -> None:
         return fdcore.Spec(type=t, characteristic=char_sel.value, fs=float(fs_in.value or 0),
                            fpass=fpass, fstop=fstop, ap=float(ap_in.value or 0), as_=float(as_in.value or 0))
 
+    def gain_db() -> float:
+        """The output gain of the Implementation panel in dB (0 when empty)."""
+        try:
+            return float(gain_in.value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def implementation(d: fdcore.Design):
         arith = arith_sel.value
         frac = None
         if arith.startswith("fixed") and not auto_q.value:
             frac = int(frac_in.value or 0)
-        sos, fixed, impl_sos = fdcore.implement(d.sos, d.spec.fs, arith, scale_chk.value, frac)
+        sos, fixed, impl_sos = fdcore.implement(d.sos, d.spec.fs, arith, scale_chk.value, frac, gain_db())
         if fixed is not None and auto_q.value:
             frac_in.set_value(fixed.frac)
         return sos, fixed, impl_sos
@@ -392,6 +403,11 @@ def index(tab: str = "magnitude") -> None:
         state["design"] = d
         fs = spec.fs
         sos, fixed, impl_sos = implementation(d)
+        # plots and the specification check show the response normalised to the
+        # output gain, so the tolerance scheme and the quantisation stay readable
+        g = fdcore.gain_factor(gain_db())
+        impl_sos = impl_sos.copy()
+        impl_sos[-1, :3] /= g
 
         # ---------------- frequency domain
         f = fdcore.freq_axis(fs, N_FREQ, log=mag_xlog.value == "log")
@@ -415,8 +431,11 @@ def index(tab: str = "magnitude") -> None:
         fixed_imp = None
         fixed_time = None
         if fixed is not None:
-            fixed_imp, sat = fdcore.fixed_impulse_response(fixed, n_time)
-            fixed_time = fdcore.fixed_step_response(fixed, n_time) if time_kind.value == "step" else fixed_imp
+            # at 1/2 FS / gain: what does not clip at the output must not overflow inside
+            fixed_imp, sat = fdcore.fixed_impulse_response(fixed, n_time, 0.5 / g)
+            fixed_imp = fixed_imp / g
+            fixed_time = (fdcore.fixed_step_response(fixed, n_time, 0.5 / g) / g
+                          if time_kind.value == "step" else fixed_imp)
         render_time(d, impl_sos, fixed_time, n_time)
 
         # ---------------- sections, implementation check
@@ -446,7 +465,10 @@ def index(tab: str = "magnitude") -> None:
         if fixed is not None:
             rows.append(("Coefficient format", f"Q{fixed.word - 1 - fixed.frac}.{fixed.frac} (int{fixed.word}_t)"
                          + ("  CLIPPED!" if fixed.clipped else "")))
-            rows.append(("Impulse test (½ FS)", f"{sat} saturation(s)"))
+            rows.append(("Impulse test (½ FS" + (" / gain" if g != 1.0 else "") + ")",
+                         f"{sat} saturation(s)"))
+        if g != 1.0:
+            rows.append(("Output gain", f"{gain_db():+g} dB (x{g:.4g}), not in the plots"))
         rows.append(("Impl. passband", f"{fmt(att_impl_pass)} dB"))
         rows.append(("Impl. stopband", f"{fmt(att_impl_stop)} dB"))
         with summary:
@@ -469,17 +491,19 @@ def index(tab: str = "magnitude") -> None:
         status_chip.classes(replace="text-sm px-3 py-1 rounded " + ("bg-green-600" if ok else "bg-amber-600"))
 
         state["impl"] = (arith_sel.value, sos, fixed, sat, impl_ok)
+        state["gain_db"] = gain_db()
         render_firmware()
 
         # ---------------- code
-        files = codegen.generate(d, name_in.value or "iir_filter", arith_sel.value, sos, fixed)
+        files = codegen.generate(d, name_in.value or "iir_filter", arith_sel.value, sos, fixed, gain_db())
         code_files["h"] = (files[0], files[1])
         code_files["c"] = (files[2], files[3])
         h_title.text, c_title.text = files[0], files[2]
         dl_c.text = "Download " + os.path.splitext(files[2])[1]
         h_code.content, c_code.content = files[1], files[3]
         code_note.text = (f"{ARITH_LABELS[arith_sel.value]}, {len(sos)} sections"
-                          + (", section scaling" if scale_chk.value else ""))
+                          + (", section scaling" if scale_chk.value else "")
+                          + (f", output gain {gain_db():+g} dB" if gain_db() else ""))
         if state.get("test") is not None:
             render_test()
 
@@ -698,7 +722,7 @@ def index(tab: str = "magnitude") -> None:
         run_btn.props("loading")
         try:
             tr = await ng_run.io_bound(ctest.run_tests, d, ariths, a["kind"], a["n"], a["amplitude"],
-                                       a["f1"], a["f2"], cc, scale_chk.value, frac_override())
+                                       a["f1"], a["f2"], cc, scale_chk.value, frac_override(), gain_db())
         finally:
             run_btn.props(remove="loading")
         state["test"] = (tr, d)
@@ -731,6 +755,13 @@ def index(tab: str = "magnitude") -> None:
         if arith == "double":
             rows.append(("warn", "double: the firmware uses long double (XC-DSC's double has 32 bits) - "
                                  "much slower than float."))
+        gdb = state.get("gain_db", 0.0)
+        if gdb:
+            rows.append(("warn" if gdb > 0 else "ok",
+                         f"Output gain {gdb:+g} dB: a signal above {100 / fdcore.gain_factor(gdb):.3g} % of "
+                         f"full scale clips at 0 or 4095 (no error is counted). Digital gain lifts the "
+                         f"noise in the passband with the signal; it adds no resolution."
+                         if gdb > 0 else f"Output gain {gdb:+g} dB."))
         if arith == "float_asm":
             rows.append(("warn", "dsPIC33A assembler: 7 FPU instructions per section and about 12 per "
                                  "sample, fused multiply-add (not bit-exact to the C float code). The PC "
@@ -758,7 +789,7 @@ def index(tab: str = "magnitude") -> None:
                     ui.icon(icons[lvl]).classes(colors[lvl] + " mt-0.5")
                     ui.label(text)
         info = firmware.installed_info()
-        this_id = firmware.preview_id(d, arith, sos, fixed)
+        this_id = firmware.preview_id(d, arith, sos, fixed, state.get("gain_db", 0.0))
         if info is None:
             fw_installed.text = "nothing (src/core/user_filter.json missing)"
         else:
@@ -818,7 +849,7 @@ def index(tab: str = "magnitude") -> None:
             ui.notify("Not installed: " + bad[0], type="negative", multi_line=True)
             fw_log_add("Install", text="refused: " + "\n".join(bad))
             return False
-        info = firmware.install(d, arith, sos, fixed)
+        info = firmware.install(d, arith, sos, fixed, state.get("gain_db", 0.0))
         fw_log_add("Install", text=f"{firmware.HEADER}\n{firmware.INFO}\n{info['description']}, id {info['id']}")
         render_firmware()
         return True
@@ -890,7 +921,7 @@ def index(tab: str = "magnitude") -> None:
         name = name_in.value or "iir_filter"
         frac = frac_override().get(arith_sel.value)
         data = ctest.testbench_zip(d, name, arith_sel.value, a["kind"], a["n"], a["amplitude"],
-                                   a["f1"], a["f2"], scale_chk.value, frac)
+                                   a["f1"], a["f2"], scale_chk.value, frac, gain_db())
         ui.download.content(data, f"{codegen.c_identifier(name)}_{arith_sel.value}_testbench.zip",
                             "application/zip")
 
@@ -930,7 +961,7 @@ def index(tab: str = "magnitude") -> None:
             if r.ok:
                 pm, sm = band_masks(d_test.spec, r.f_meas)
                 with np.errstate(divide="ignore"):
-                    hd = np.abs(fdcore.response(d_test.sos, r.f_meas, d_test.spec.fs))
+                    hd = tr.gain * np.abs(fdcore.response(d_test.sos, r.f_meas, d_test.spec.fs))
                     dev = 20 * np.log10(r.h_meas + 1e-300) - 20 * np.log10(hd + 1e-300)
                 pdev = float(np.max(np.abs(dev[pm]))) if pm.any() else None
                 satt = float(np.min(-20 * np.log10(r.h_meas[sm] + 1e-300))) if sm.any() else None
@@ -990,7 +1021,7 @@ def index(tab: str = "magnitude") -> None:
                 with np.errstate(divide="ignore"):
                     y = fdcore.magnitude_db(r.h_meas)
                     if view == "dev":
-                        hd = np.abs(fdcore.response(d_test.sos, r.f_meas, spec.fs))
+                        hd = tr.gain * np.abs(fdcore.response(d_test.sos, r.f_meas, spec.fs))
                         y = 20 * np.log10(r.h_meas + 1e-300) - 20 * np.log10(hd + 1e-300)
                         dev_all.append(y)
                 s = line(f"{r.arith} (C)", xy(r.f_meas, y), IMPL_COLORS[r.arith], width=1.8)
@@ -1062,7 +1093,7 @@ def index(tab: str = "magnitude") -> None:
     theme_btn.props(f'icon={"light_mode" if dark.value else "dark_mode"}')
     type_sel.on_value_change(on_type_change)
     frac_in.on_value_change(lambda: None if auto_q.value else schedule())
-    for w in (char_sel, fs_in, ap_in, as_in, arith_sel, scale_chk, auto_q, name_in,
+    for w in (char_sel, fs_in, ap_in, as_in, arith_sel, scale_chk, gain_in, auto_q, name_in,
               mag_scale, mag_xlog, mag_mask, mag_impl, phase_wrap, gd_unit, time_kind, *edge_in):
         w.on_value_change(schedule)
     frac_in.bind_enabled_from(auto_q, "value", backward=lambda v: not v)
@@ -1080,7 +1111,7 @@ def index(tab: str = "magnitude") -> None:
             },
             "implementation": {
                 "arithmetic": arith_sel.value, "section_scaling": scale_chk.value, "auto_q": auto_q.value,
-                "frac_bits": int(frac_in.value or 0), "c_name": name_in.value,
+                "frac_bits": int(frac_in.value or 0), "c_name": name_in.value, "gain_db": gain_db(),
             },
             "view": {
                 "dark": dark.value, "magnitude_scale": mag_scale.value, "frequency_axis": mag_xlog.value,
@@ -1136,6 +1167,8 @@ def index(tab: str = "magnitude") -> None:
 
             put(arith_sel, pick("implementation", "arithmetic", str, lambda v: v in ARITH_LABELS))
             put(scale_chk, pick("implementation", "section_scaling", boolean))
+            gl = pick("implementation", "gain_db", float, lambda v: -40 <= v <= 60)
+            gain_in.set_value(0.0 if gl is None else gl)      # a set from before 04.10.2026: 0 dB
             put(auto_q, pick("implementation", "auto_q", boolean))
             put(frac_in, pick("implementation", "frac_bits", int, lambda v: 0 <= v <= 31))
             put(name_in, pick("implementation", "c_name", str))
