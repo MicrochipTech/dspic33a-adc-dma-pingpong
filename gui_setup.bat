@@ -14,7 +14,8 @@ rem  Needs: Python 3.10 or newer on the PATH (python --version), internet
 rem  access for pip. Afterwards start the GUI with adc_gui.bat.
 rem ---------------------------------------------------------------------
 setlocal
-cd /d "%~dp0"
+rem  lives in the repository root; the environment and the tools are in tools\
+cd /d "%~dp0tools"
 
 python --version >nul 2>&1
 if errorlevel 1 (

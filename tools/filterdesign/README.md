@@ -99,7 +99,7 @@ bandpass and bandstop.
 ## GUI
 
 ```sh
-tools\filterdesign.bat        # Windows: tools\.venv (gui_setup.bat) or the python on the PATH
+filterdesign.bat              # Windows, repository root: tools\.venv (gui_setup.bat) or the python on the PATH
 
 cd tools/filterdesign/gui
 pip install -r requirements.txt

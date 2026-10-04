@@ -323,7 +323,7 @@ on the EV74H48A) is what "custom input" then starts from. While the test input i
 chosen, every tile shows the loopback (core 5, AN3 · RA8, source DAC2) and its core,
 channel and source selectors are locked. The
 console port is the Nano debugger's CDC channel. Without a board:
-`tools\adc_gui.bat --fake --fake-board EV17P63A` lets the stand-in report the Nano.
+`adc_gui.bat --fake --fake-board EV17P63A` lets the stand-in report the Nano.
 
 **Programming the Nano.** None of the three ways below has been tried on a Nano yet;
 they are what the Nano's user guide and the installed tools say. The image is
@@ -667,7 +667,7 @@ high-, band-pass, band-stop) with a browser GUI. Its **dsPIC33** tab takes the f
 designed onto this board:
 
 ```
-tools\filterdesign.bat                     the design tool, http://127.0.0.1:8090
+filterdesign.bat    the design tool (in the repository root), http://127.0.0.1:8090
 ```
 
 1. **Design and test** on the PC: tolerance scheme, sample rate, arithmetic (float, double,
@@ -1149,7 +1149,7 @@ which file may call which. The table below is the reading order, not the full li
 | `docs/*.png`, `docs/*.mmd` | the block diagrams above, with their Mermaid sources |
 | `tools/sim_trap.py` | drives the simulator build in MDB: `--smoke` for the short boot/console check (**[SMOKE]**, under a minute), the default for the ~7-minute ping-pong acceptance run (**[SIM]**); see "In the MPLAB X simulator" |
 | `src/core/user_filter.h`, `user_filter.json` | the user filter (`sigproc user`), **generated** by `tools/filterdesign` - the checked-in one is the default |
-| `tools/filterdesign/` | the IIR filter design tool: `fdesign/` (C, the design library), `gui/` (NiceGUI, with the dsPIC33 tab, `firmware.py`); `tools\filterdesign.bat` starts it |
+| `tools/filterdesign/` | the IIR filter design tool: `fdesign/` (C, the design library), `gui/` (NiceGUI, with the dsPIC33 tab, `firmware.py`); `filterdesign.bat` starts it |
 | `tools/` | command-line build without the IDE, the host test/trace runners, the GUI; **ignore this unless you want it** |
 
 ### The GUI: capture, plot, FFT (`tools/adc_gui.py`)
@@ -1258,12 +1258,12 @@ about 10, lost triggers from about 16, the triggered chain measured up to about 
 MSPS.
 
 Set-up once (a private Python environment in `tools\.venv`, nothing touches the system
-Python), then start:
+Python), then start - both scripts are in the repository root:
 
 ```
-tools\gui_setup.bat            creates .venv, installs nicegui/pyserial/numpy, runs the self-test
-tools\adc_gui.bat --fake       no board: a built-in stand-in with a synthetic signal, for trying the GUI
-tools\adc_gui.bat --port COM7  the board's console port
+gui_setup.bat           creates tools\.venv, installs nicegui/pyserial/numpy, runs the self-test
+adc_gui.bat --fake      no board: a built-in stand-in with a synthetic signal, for trying the GUI
+adc_gui.bat --port COM7 the board's console port
 ```
 
 Linux/macOS: `tools/gui_setup.sh`, then `tools/.venv/bin/python tools/adc_gui.py ...`.
@@ -1283,7 +1283,7 @@ own `slp`/`dachz` fields (`chaintest.c`'s `triangle_for()`), and the actual rate
 per-cycle `overrun`/`late`/`missed` counters, highlighted red when non-zero. Every
 control has a tooltip naming the console command it sends.
 
-Try it without a board first (`tools\adc_gui.bat --fake`): the built-in stand-in answers
+Try it without a board first (`adc_gui.bat --fake`): the built-in stand-in answers
 `stream on/off` and builds a `GRAB` frame - `eval_chain.synth()`'s triangle for the test
 signal, a configured sine with harmonics and noise for any other input (so SNR/THD/
 harmonics show something meaningful) - so the whole cycle, including a PASS and a

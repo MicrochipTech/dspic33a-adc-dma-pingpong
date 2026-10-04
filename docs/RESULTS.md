@@ -247,7 +247,7 @@ sample.
 | `stream on <ksps>` / `stream` / `stream off` | the chain as a standing stream, the main loop processing every half |
 | `stream grab` (nano-board) | halt, transfer a window in binary, restart; used by the GUI |
 | `tools/eval_chain.py <log>` | re-judges every verdict from the log, evaluates dumped windows, `--png` for plots |
-| `tools/adc_gui.bat` (nano-board) | browser GUI; `--fake` to run without a board |
+| `adc_gui.bat` (nano-board) | browser GUI; `--fake` to run without a board |
 | `docs/ANALYSIS.md` | the state of the project, sorted by question |
 | `docs/HARDWARE-LOG.md` | dated record of every board run, including the predictions that turned out wrong |
 | `docs/CHAIN-TEST-PLAN.md` | plan of the chain test and the reasons behind it |

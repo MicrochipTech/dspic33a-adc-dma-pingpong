@@ -120,7 +120,7 @@ python gen_core_project.py --check     core_example.X still matches adc_dma_40ms
   `python tools\sim_trap.py --run-seconds 420` expects `[simtest] PASS`. The simulator has
   no PLL, ADC or DMA and dispatches no interrupts; it proves the ping-pong logic and
   nothing else. Keep long waits out of its path (`__delay32()` runs far slower than real time).
-- **GUI:** `tools\gui_setup.bat` once, then `tools\adc_gui.bat --fake`;
+- **GUI:** `gui_setup.bat` once, then `adc_gui.bat --fake`;
   `python tools\adc_gui.py --selftest` and `python tools\gui_ui_test.py` are its checks.
 - **Filter design tool:** a change under `tools/filterdesign/` runs
   `python tools\filterdesign\gui\test_codegen.py` (40 C builds, and the firmware fixtures

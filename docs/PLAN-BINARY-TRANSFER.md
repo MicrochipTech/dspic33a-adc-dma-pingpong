@@ -89,7 +89,7 @@ Sent to whoever has the board, with the branch name and the commit:
    terminal log from power-up.
 2. On the console: `blk 16`. Expected: a `BIN n=16 ...` line, 32 bytes of binary (looks
    like noise in a terminal), a `CRC xxxx` line, the prompt. Send the log.
-3. `tools\adc_gui.bat --port COMx`, "single" with 2048 samples: the time signal and
+3. `adc_gui.bat --port COMx`, "single" with 2048 samples: the time signal and
    the spectrum appear, the cycle line shows `2048 samples`; then "live" for a minute:
    no `cycle failed`, no CRC error. Send a screenshot and the cycle line.
 4. If step 6 is in: `baud 460800` on the console, then reconnect the terminal at

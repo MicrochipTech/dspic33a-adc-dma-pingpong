@@ -164,7 +164,7 @@ The console runs at 115200 baud (UART2). `help` lists the core's commands: `vers
 [samc]]` starts the stream, and `stream grab` sends the last completed pair as a binary
 frame with a CRC while the stream keeps running.
 
-`tools/adc_gui.py` (set up once with `tools\gui_setup.bat`, then `tools\adc_gui.bat`)
+`tools/adc_gui.py` (set up once with `gui_setup.bat`, then `adc_gui.bat`)
 works against the core build unchanged: it sends only core commands. `tools/protocol.py`
 is the wire protocol on its own, for your own host scripts.
 

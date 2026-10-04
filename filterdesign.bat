@@ -7,7 +7,7 @@ rem  else the python on the PATH (needs nicegui, numpy, scipy and a host gcc).
 rem  Arguments go through: --port 8090, --no-browser, --light, --presets DIR
 setlocal
 set "PY=python"
-if exist "%~dp0.venv\Scripts\python.exe" set "PY=%~dp0.venv\Scripts\python.exe"
-cd /d "%~dp0filterdesign\gui"
+if exist "%~dp0tools\.venv\Scripts\python.exe" set "PY=%~dp0tools\.venv\Scripts\python.exe"
+cd /d "%~dp0tools\filterdesign\gui"
 "%PY%" app.py %*
 endlocal
