@@ -169,6 +169,81 @@ def _run(cmd: list[str], cwd: Path, timeout: float, on_line=None) -> Result:
     return Result(not timed_out and p.returncode == 0, "\n".join(lines + ["", tail]), time.monotonic() - t0)
 
 
+# Flash diagnostics (04.10.2026): flashing from here failed "only sometimes" while
+# MPLAB X always worked. Every flash gets a line in build/flashlogs/history.txt, and a
+# failed one a folder with everything needed afterwards - debugtool.txt is overwritten
+# by the next attempt (ipecmd's and MPLAB X's alike), so it is copied at once.
+FLASHLOG_DIR = REPO / "build" / "flashlogs"
+DEBUGTOOL_LOG = Path.home() / "queuelogs" / "debugtool.txt"
+# programs that can hold the PKOB4: MPLAB X IDE, MPLAB IPE, MDB, a left-over ipecmd -
+# all of them Java underneath (a java.exe of another application is harmless)
+TOOL_HOLDERS = ("mplab_ide64.exe", "mplab_ipe64.exe", "mdb.exe", "ipecmd.exe", "java.exe", "javaw.exe")
+
+
+def tool_processes(with_cmdline: bool = False) -> list[str]:
+    """Running processes that can hold the PKOB4 (TOOL_HOLDERS), one line each:
+    'name pid' or, with_cmdline, 'name pid parent started: command line' (PowerShell,
+    about a second - only for the logs of a failed run). [] off Windows."""
+    if sys.platform != "win32":
+        return []
+    if not with_cmdline:
+        r = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, errors="replace")
+        out = []
+        for ln in r.stdout.splitlines():
+            parts = [p.strip('"') for p in ln.split('","')]
+            if len(parts) > 1 and parts[0].lower() in TOOL_HOLDERS:
+                out.append(f"{parts[0]} {parts[1]}")
+        return out
+    names = ",".join(f"'{n}'" for n in TOOL_HOLDERS + ("python.exe", "pythonw.exe"))
+    ps = ("Get-CimInstance Win32_Process | Where-Object { @(" + names + ") -contains $_.Name.ToLower() } | "
+          "ForEach-Object { '{0} {1} parent {2} started {3}: {4}' -f $_.Name, $_.ProcessId, "
+          "$_.ParentProcessId, $_.CreationDate, $_.CommandLine }")
+    r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                       errors="replace", timeout=30)
+    return [ln for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def _save_flash_failure(stamp: str, cmd: list[str], hexfile: Path, r: "Result", work: Path,
+                        before: list[str], t_start: float) -> Path:
+    """build/flashlogs/<stamp>/: ipecmd's output, debugtool.txt, ipecmd's own log files,
+    the processes before and after, and the facts of the run. Returns the folder."""
+    out = FLASHLOG_DIR / stamp
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "ipecmd_output.txt").write_text(r.log, encoding="utf-8")
+    note = "missing"
+    if DEBUGTOOL_LOG.is_file():
+        age = t_start - DEBUGTOOL_LOG.stat().st_mtime
+        shutil.copy2(DEBUGTOOL_LOG, out / "debugtool.txt")
+        note = ("written during this run" if age < 0 else
+                f"NOT written during this run (last change {age:.0f} s before it started)")
+    for f in work.glob("*"):                          # ipecmd writes its log files into its cwd
+        if f.is_file():
+            shutil.copy2(f, out / ("ipecmd_cwd_" + f.name))
+    try:
+        after = tool_processes(with_cmdline=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        after = [f"(process list failed: {e})"]
+    st = hexfile.stat() if hexfile.is_file() else None
+    (out / "info.txt").write_text(
+        f"time        : {stamp}\n"
+        f"command     : {subprocess.list2cmdline(cmd)}\n"
+        f"hex         : {hexfile} ({st.st_size if st else '?'} bytes, "
+        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.st_mtime)) if st else '?'})\n"
+        f"duration    : {r.seconds:.1f} s\n"
+        f"debugtool   : {DEBUGTOOL_LOG} - {note}\n\n"
+        "processes that can hold the PKOB4, before the run:\n  " + ("\n  ".join(before) or "(none)") +
+        "\n\nprocesses after the run (with command lines):\n  " + ("\n  ".join(after) or "(none)") + "\n",
+        encoding="utf-8")
+    return out
+
+
+def _flash_history(stamp: str, ok: bool, seconds: float, hexfile: Path, before: list[str], extra: str = "") -> None:
+    FLASHLOG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(FLASHLOG_DIR / "history.txt", "a", encoding="utf-8") as f:
+        f.write(f"{stamp}  {'OK  ' if ok else 'FAIL'}  {seconds:5.1f} s  {hexfile.name}  "
+                f"holders before: {', '.join(before) or 'none'}{('  ' + extra) if extra else ''}\n")
+
+
 def mplab_ide_running() -> bool:
     """MPLAB X IDE open (mplab_ide64.exe): it may hold the PKOB4, and ipecmd then fails."""
     if sys.platform != "win32":
@@ -249,15 +324,27 @@ def flash(board: str, on_line=None) -> Result:
     if not ipe:
         return Result(False, "ipecmd.exe not found (MPLAB X ...\\mplab_platform\\mplab_ipe) - set IPECMD", 0.0)
     work = Path(tempfile.mkdtemp(prefix="ipecmd_"))    # ipecmd writes its log files into the cwd
-    r = _run([ipe, "-TPPKOB4", f"-P{BOARDS[board]['device']}", "-M", f"-F{hexfile}", "-OL"],
-             work, timeout=240, on_line=on_line)   # a run killed while programming wedged the PKOB4 (03.10.2026): generous
-    shutil.rmtree(work, ignore_errors=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    before = tool_processes()
+    if before and on_line:
+        on_line("NOTE: running before the flash: " + ", ".join(before) + " - MPLAB X, IPE or MDB "
+                "with this board's tool can make ipecmd fail or break off half-way.")
+    cmd = [ipe, "-TPPKOB4", f"-P{BOARDS[board]['device']}", "-M", f"-F{hexfile}", "-OL"]
+    t_start = time.time()
+    r = _run(cmd, work, timeout=240, on_line=on_line)   # a run killed while programming wedged the PKOB4 (03.10.2026): generous
     # ipecmd's exit code is not enough: "Connection Failed" / "Programming Target Failed"
     # have been seen with an exit code of 0 (03.10.2026)
     if re.search(r"Failed|failed \(err", r.log):
         r.ok = False
+    wedged = "err = -10121" in r.log
     if "exit code 9" in r.log:
         r.log += "\n-> programmer not found: is the board's PKOB4 USB port connected?"
+    elif wedged:
+        # 04.10.2026: after a run broke off half-way every later attempt failed this way,
+        # from here and from MPLAB X alike, until the USB cable was replugged
+        r.log += ("\n-> the PKOB4's USB link is stuck (err -10121): unplug the board's USB cable, "
+                  "plug it in again, then flash. Retrying without that does not help - MPLAB X fails "
+                  "the same way. The chip may be erased now: it runs nothing until a flash succeeds.")
     elif not r.ok:
         hint = ["\n-> the PKOB4 did not answer or is held by another program."]
         if mplab_ide_running():
@@ -265,6 +352,17 @@ def flash(board: str, on_line=None) -> Result:
                         "the PKOB4, a debug session), close the project or MPLAB X, then flash again.")
         hint.append("Otherwise unplug the board's USB cable, plug it in again and retry.")
         r.log += " ".join(hint)
+    saved = ""
+    try:
+        if not r.ok:
+            folder = _save_flash_failure(stamp, cmd, hexfile, r, work, before, t_start)
+            saved = folder.name + "/"
+            r.log += f"\n-> diagnostics saved: {folder} (ipecmd output, debugtool.txt, processes)"
+        _flash_history(stamp, r.ok, r.seconds, hexfile, before,
+                       ("stuck -10121 " if wedged else "") + (f"-> {saved}" if saved else ""))
+    except OSError as e:                              # the diagnostics must not hide the result
+        r.log += f"\n(saving the flash diagnostics failed: {e})"
+    shutil.rmtree(work, ignore_errors=True)
     return r
 
 

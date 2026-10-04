@@ -210,6 +210,10 @@ python gen_core_project.py --check     core_example.X still matches adc_dma_40ms
   reads the arguments from that header.
 - Never kill `ipecmd` while it programs (03.10.2026): its java child keeps the PKoB4 and the
   tool needs a USB re-plug. Stop it only through `firmware.py` (whole tree, after 240 s).
+  Every flash from the tool adds a line to `build/flashlogs/history.txt`; a failed one
+  saves `build/flashlogs/<time>/` (ipecmd output, `~/queuelogs/debugtool.txt` - overwritten by
+  the next attempt - and the processes that can hold the PKOB4). `err = -10121`: the PKOB4
+  is stuck until the USB cable is replugged, MPLAB X fails the same way (04.10.2026).
 - `sigproc` and `chain`/`test`/`dactest` judge samples themselves: run the latter with
   processing off. Measuring commands run inside `console_quiet_begin()/_end()` (polled UART
   output); a new measuring command gets the same wrapper.

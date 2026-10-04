@@ -470,6 +470,15 @@ Processing is in place on the completed half, in the main loop, never in an inte
   run did not take place: after the +6 dB run the PKOB4 answered "Connection Failed"
   twice (no other program held it); the board was left with the +6 dB firmware until it
   is replugged.
+- **04.10.2026, flashing from the filter tool "only sometimes":** debugtool.txt of the 16:36
+  failure: after EraseChip, WriteProgmem got no USB answer for 64 s (`com.Send returned
+  false`). From then on every attempt failed at its first command (`err = -10121`), from
+  the tool and, by the user's account, from MPLAB X alike, until the USB cable was replugged.
+  At that time `mplab_ide64.exe` and `java.exe` were still running although MPLAB X's
+  window had been closed. After the replug, with MPLAB X gone and the tool restarted with
+  the new flash diagnostics (`build/flashlogs/`), five flashes from the tool between 17:09
+  and 17:33 were all OK (28-30 s), with no process that could hold the PKOB4.
+  Not settled: whether MPLAB X in the background caused the 16:36 break-off.
 
 ## 11. Limits and open questions
 
