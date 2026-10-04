@@ -63,3 +63,6 @@ MPLABXLog.xml*
 # (fdcore.build_fdesign(), or make in tools/filterdesign/fdesign)
 tools/filterdesign/fdesign/fdesign.exe
 tools/filterdesign/fdesign/fdesign
+
+# ipecmd/MPLAB debugger logs
+queuelogs/
