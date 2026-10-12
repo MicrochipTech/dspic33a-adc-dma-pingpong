@@ -1154,6 +1154,8 @@ which file may call which. The table below is the reading order, not the full li
 
 ### The GUI: capture, plot, FFT (`tools/adc_gui.py`)
 
+**How to operate it** (and FilterDesign), step by step: `docs/GUI-MANUAL.md`. This section is the reference behind it.
+
 **Settings.** Every value the page can set is in a JSON file. At every start the GUI
 reads **`tools/adc_gui_defaults.json`** - the standard, tracked in git, every key with
 its default - and then **`tools/adc_gui_settings.json`** on top of it, the personal
