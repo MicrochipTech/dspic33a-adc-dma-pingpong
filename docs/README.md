@@ -9,7 +9,7 @@ the rest you can leave alone.
 |---|---|
 | [GUI-MANUAL.md](GUI-MANUAL.md) | How to operate the two PC tools, FilterDesign and the dsPIC33 GUI, task by task, with a picture of every card and a demo video. **Start here** if you want to see the example run. |
 | [CONSOLE.md](CONSOLE.md) | Every console command, what a test run looks like, and the chain test (`chain all`). |
-| [HOW-IT-WORKS.md](HOW-IT-WORKS.md) | Clock tree, ADC, DMA and CPU; the sample rates you can get; what to measure; errata and the device's traps. Much of it describes the old back-to-back mode - its first note says which parts. |
+| [HOW-IT-WORKS.md](HOW-IT-WORKS.md) | Clock tree, ADC, DMA and CPU; the sample rates you can get; what to measure; errata and the device's traps, for the triggered chain; the old back-to-back mode in an appendix. |
 | [EV17P63A.md](EV17P63A.md) | The second board profile, the dsPIC33AK512MPS506 Curiosity Nano: pins, build, how to try it. Not yet run on a board. |
 | [PROJECT-FILES.md](PROJECT-FILES.md) | What is where: the source files, the `tools/` folder, the MPLAB X simulator. |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Debugging guide, symptom first: console silent, clock wrong, ADC or DMA not doing what it should. |
