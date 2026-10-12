@@ -1,5 +1,11 @@
 # dsPIC33AK512MPS512: continuous ADC acquisition through the DMA at a selectable rate
 
+> **Superseded (13.10.2026).** This is the report of 25.09.2026, kept as it was written.
+> The current state - runs 18 to 20 and the board checks up to 04.10.2026 - is in
+> `ANALYSIS.md` section E. Since this report: the processing loop costs 3.0 instead of
+> 23 cycles per sample (12.3 % instead of 92 % at 8 MSPS), the GUI grabs without halting
+> the stream, and the 10 MSPS result was not reproduced in run 20.
+
 Results report, 25.09.2026. Evidence from master `fbfd883` (run 19, `chain all`) and
 nano-board `8861adc` (GUI live test); the code described is master `c3bc644` / nano-board
 `0e7244f`, which adds the corrected test verdict and the faster processing loop (not yet

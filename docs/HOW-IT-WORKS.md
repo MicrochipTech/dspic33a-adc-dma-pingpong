@@ -1,6 +1,6 @@
 # How the example works, and what it can and cannot do
 
-Clock tree, ADC, DMA and CPU, the sample rates you can get, what to measure, and the device's traps. Moved out of the top-level README on 13.10.2026, unchanged apart from the two notes marked 13.10.2026; only links were adjusted to the new place.
+Clock tree, ADC, DMA and CPU, the sample rates you can get, what to measure, and the device's traps. Moved out of the top-level README on 13.10.2026, unchanged apart from the notes marked 13.10.2026; only links were adjusted to the new place.
 
 > **Note (13.10.2026): much of this document describes the old back-to-back mode.** It was
 > written for runs 1 to 13: the ADC in Integration mode, bursts of 2048 conversions, a
@@ -229,7 +229,13 @@ divided clock should be F_IN / (2 · (`INTDIV` + `FRACDIV`/512)) per Example 12-
 every ratio is written, read back and confirmed by `DIVSWEN` and `CLKRDY` — with the
 generator switched off around the write and with it left running as the example
 prescribes. The conversion rate does not move at any of them, and the ADC keeps
-converting with CLKGEN6 switched off entirely (`test clkoff`). It is kept in the firmware
+converting with CLKGEN6 switched off entirely (`test clkoff`).
+
+> **Note (13.10.2026): this result was withdrawn.** It was measured in the wrong DMA mode
+> (`TRMODE = 3`, runs 1 to 18). Run 19 measured the divider at the generator: it divides,
+> 320/160/80 MHz; `ON = 0` does not stop it (`ANALYSIS.md` section E). The example still
+> sets its rate through PLL1, not through this divider.
+ It is kept in the firmware
 so the behaviour can be reproduced, not because it is useful. Two datasheet details
 apply if you try it anyway: "FRACDIV will not work if INTDIV is configured to 0" (12.4.2
 4b), so no ratio between 1 and 2 exists at all; and the divider is changed with the
@@ -240,6 +246,10 @@ piezo grain sensor, use Single Conversion mode with a PWM trigger as `TRG1SRC`: 
 transfer per conversion works exactly the same way and the burst restart disappears.
 That goes down to a few Hz. Note that the SCCP1 trigger did not work on this board — a
 PWM trigger has not been tried.
+
+> **Note (13.10.2026): out of date.** Single Conversion mode triggered by SCCP1 (trigger
+> code 32, timer mode) is how the example samples at every rate today, down to 100 kSPS
+> and below; run 7 had used code 34, which is SCCP3.
 
 Three caveats:
 
@@ -342,6 +352,9 @@ setting channels have a second accumulator for second-order filters.
   samples. If that matters, the datasheet's hardware ping-pong across two DMA channels
   and a second ADC channel alternating bursts would close the gap — a different
   example.
+  *Note (13.10.2026): out of date - the example does exactly that now. The triggered chain
+  with DMA channels 0 and 1 as a hardware ping-pong pair streams without a gap: 8 MSPS for
+  15 s, 120 M samples, nothing lost (run 19).*
 
 ## Errata
 

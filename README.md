@@ -15,7 +15,7 @@ signal, the spectrum and whether a sample was lost.
 Where it stands: on the board the stream runs without loss up to about 8 MSPS with the CPU
 processing; DMA overruns appear from about 10 MSPS and lost triggers from about 16 MSPS.
 Every board run, the newest last: [docs/HARDWARE-LOG.md](docs/HARDWARE-LOG.md); sorted by
-question, what holds and what is open (status 25.09.2026): [docs/ANALYSIS.md](docs/ANALYSIS.md).
+question, what holds and what is open: [docs/ANALYSIS.md](docs/ANALYSIS.md).
 Which of the documents in `docs/` you need: [docs/README.md](docs/README.md).
 
 ## Contents

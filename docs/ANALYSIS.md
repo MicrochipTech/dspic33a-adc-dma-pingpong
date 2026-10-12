@@ -1,8 +1,10 @@
 # Where this example stands, what was measured, and how much of it holds
 
-Status of 25.09.2026: sections A to E as of master `e2bd11a` (run 16); section F
-describes the chain test that implements sections C.8 to C.12 (`chain all`, not yet run
-on the board). Written to be read without the chat history
+**Status of 13.10.2026.** Sections A to D are the account up to run 16 (master `e2bd11a`,
+25.09.2026) and stay as written. Section E is brought up to the last board run in
+`docs/HARDWARE-LOG.md` (04.10.2026): runs 18 to 20 and the hand checks after them.
+Section F lists what is still open and what the next run settles. `docs/RESULTS.md` is
+the report of 25.09.2026 and is superseded by section E. Written to be read without the chat history
 behind it, and without reading `docs/HARDWARE-LOG.md` end to end - that file is a
 diary, this one is sorted by question.
 
@@ -857,6 +859,47 @@ example exists for. Fixed in `2c8137f`.
 
 ## E. What holds, what is likely, what is open
 
+**In one paragraph (13.10.2026).** The example's sentence holds up to 8 MSPS: the ADC,
+triggered by SCCP1, streams through the DMA's hardware ping-pong pair into RAM without a
+lost or repeated sample, at a rate you choose, while the CPU processes every half - 15 s
+and 120 M samples with overrun, late and missed at 0 (run 19), with the processing loop
+at 12.3 % of the half period at 8 MSPS (run 20). Above that it degrades: overruns from
+about 10 MSPS, lost triggers from about 16 MSPS, and the ADC converts at only 18 to
+20 MSPS in this mode, so the 40 MSPS of the datasheet is not reached by the triggered
+chain. The sections below give the evidence, each with its entry in `docs/HARDWARE-LOG.md`.
+
+**Since run 19 (26.09 to 04.10.2026), on silicon:**
+
+- **The processing loop costs 3.0 CPU cycles per sample**, 12.3 % of the half period at
+  8 MSPS (run 19: 92 %); `chain all` S6 overrun, late and missed 0 at 1, 4 and 8 MSPS
+  (run 20, 29.09.2026, HARDWARE-LOG section 5).
+- **Two ping-pong pairs, grab without stopping.** DMA channels 0 and 1 as the hardware
+  pair (DS70005591D 13.4.11); `stream grab` moves the waiting channels to the other pair
+  and sends the completed one while the stream runs on. 72 grabs at 1 to 10 MSPS, overrun,
+  late and missed 0; no sample lost at the pair switch at 1, 4, 8, 10 and 16 MSPS
+  (01-02.10.2026, section 9).
+- **Above 10 MSPS in pair mode:** 16 MSPS 7 overruns and no missed half, but the flag is
+  stochastic (390 in one build, 0 in the next); 20 MSPS 56 overruns and 59 missed halves;
+  the transfers themselves stay exact (1 000 010 of 1 000 010, section 9).
+- **The console's transmit ring** (8 KB, interrupt-driven) ended the `missed` halves that
+  a long reply caused (68/274/550 at 1/4/8 MSPS before), and a race in `main()` behind
+  `fail 8` was found and fixed: 1 in 9 before, 0 in 120 after (01.10.2026, section 8).
+- **What the processing costs**, measured as `load=` on the board (section 10): the
+  built-in low-, high- and band-pass about 63 CPU cycles per sample (clean to about
+  2 MSPS), the Goertzel detector about 7; the user filter from `tools/filterdesign` as
+  generated dsPIC33A assembler 56 cycles (clean to 3 MSPS), as C float 185, as fixed32 C
+  250 (04.10.2026; `docs/ASM-FILTER-COMPARISON.md`). The IDE build at -O0 doubles the load.
+- **The DAC test triangle loses its lower end** below about 600 to 780 codes; with
+  `TRI_LOW = 0x400` the triangle passes at 1, 4 and 8 MSPS (slip 0.01 to 0.06), and the
+  half of run 20's 300 grabs that failed the verdict is explained - they were not lost
+  samples (section 5).
+- **The signal generator** (table -> DMA -> DAC, paced by SCCP2 in timer mode) plays at
+  100 k, 250 k, 500 k and 1 M transfers/s exactly, and 30 s at 4 MSPS beside it stayed at
+  overrun, late and missed 0 (section 7).
+- **A gap in the counters:** a sample time `SAMC` > 0 lowers the real rate silently - at a
+  set 8 MSPS with SAMC 8 or 31 the spectrum showed about 5 MSPS - while the frame header
+  still says 8000 kSPS and every counter stays at 0 (04.10.2026, section 10).
+
 **Run 19 (25.09.2026), the first with the DMA in the right mode - the sentence holds up
 to 8 MSPS:**
 
@@ -903,7 +946,9 @@ to 8 MSPS:**
   40 MSPS.
 - Clock-register writes arrive and are confirmed.
 
-**Corrected in the firmware on 25.09.2026, effect not yet seen on silicon:**
+**Corrected in the firmware on 25.09.2026 - seen on silicon since (13.10.2026):** the DAC
+clock and its update trigger in run 19 (the triangle's slope against the model is 1.000
+at every rate); the `CCP1RB` fix is not named in the log.
 
 - The DAC was clocked at 320 MHz, below its 400 MHz minimum, and SCCP1 at 320 MHz, above
   its 200 MHz maximum (C.12.1). Now 400 MHz (PLL1 VCO divider) and 160 MHz (CLKGEN13 / 2).
@@ -919,30 +964,57 @@ to 8 MSPS:**
 - The DMA's ceiling is about 33 M transfers/s. This is a Microchip support statement,
   with 20 MSPS confirmed stable by another customer on the same device, not our own
   measurement.
-- The overruns seen at 4 MSPS are not a bandwidth limit - the arithmetic does not
-  allow it - but what they are instead is not established.
 
-**Open:**
+**Open (13.10.2026):**
 
-- Whether the rate is selectable **in continuous streaming**, which is the example's
-  central claim.
-- Whether the converter speeds up under streaming or each conversion lands in the
-  buffer more than once.
-- Whether the CLKGEN6 divider sets the rate, and whether the ADC really converts with
-  CLKGEN6 switched off - both only ever observed with withdrawn instruments; every
-  document says CLKGEN6 is the ADC's clock (section C.3).
-- Whether any variant can stream without loss while the CPU processes. **No variant
-  has ever done so in any run.**
-- The whole triggered family - SCCP as first trigger, as second trigger, and PWM -
-  is untested, because the three errors above meant it was never really tried. Since
-  back-to-back is ruled out as a continuous path (section C.7), **this family is the only
-  candidate left for the example's sentence.**
+- **The 10 MSPS boundary.** Run 19 had the triangle clean at 10 MSPS; run 20 failed it in
+  both builds (slip 3.00 and 2.03). Not reproduced, not explained (section 5).
+- Why OVERRUN rises at 16 to 20 MSPS in pair mode, and why 20 MSPS misses halves.
+- What clips the DAC's output below about 600 to 780 codes.
+- Output-compare mode of SCCP1/SCCP2 raises no event, and the clock monitor's CNTSEL
+  codes read other clocks than documented.
+- In the generator loop some grabs show RA8 nearly still for 2 ms or more.
+- The analog path DAC2 -> RA8 -> ADC acts as a low-pass (about -3 to -5 dB at 400 kHz,
+  -10 to -13 dB at 1.2 MHz, the same at every sample rate): DAC settling, the pin's load
+  or the ADC's sample capacitor - needs a scope or the path DAC1 -> RA1.
+- The counters do not see a rate lowered by `SAMC` (above).
+
+**Answered since 25.09.2026** (the open list of that day):
+
+- *Rate selectable in continuous streaming?* Yes: 100 kSPS, 1 and 4 MSPS exact, 8 MSPS
+  400 004 of 400 011 (run 19).
+- *Converter faster under streaming, or results repeated?* Repeated: `TRMODE = 3` (run 18).
+- *CLKGEN6 divider?* It divides, 320/160/80 MHz; `ON = 0` does not stop it (run 19, S8).
+- *Any variant streaming without loss while the CPU processes?* Yes, the triggered chain,
+  8 MSPS for 15 s (run 19), at 12.3 % load since run 20.
+- *The triggered family untested?* SCCP1 in timer mode, trigger code 32, is the example's
+  trigger since run 18. The overruns once seen at 4 MSPS belonged to the wrong DMA mode.
+
+**Never run on silicon** (`docs/HARDWARE-LOG.md` section 12): the EV17P63A Curiosity Nano
+with this firmware, and its copy-to-drive flash; the user filter's frequency response
+against its design on the board (only its load); `test all` on the restructured firmware
+and `sweep` at the current revision; DAC1 as the generator's output and `decay` > 0; rates
+above 8 MSPS with processing on, and long runs at 16 to 20 MSPS in pair mode; every card of
+the dsPIC33 GUI against a board.
 
 ## F. What the next run settles
 
-`chain all` on master after 25.09.2026 - the chain test of `docs/CHAIN-TEST-PLAN.md`,
-which implements sections C.8 to C.12 as one command of under a minute. The old
-`test all` (back-to-back, above) stays in the firmware but is no longer the run to make.
+**Status 13.10.2026.** The next board run should, in this order:
+
+1. Repeat `chain all` on the current master, to settle the 10 MSPS boundary (run 19 clean,
+   run 20 not) with the triangle starting at `TRI_LOW = 0x400`.
+2. Measure the user filter's response against its design with the dsPIC33 GUI's noise
+   test - so far it has only been measured against the GUI's stand-in.
+3. Run the example on the EV17P63A Curiosity Nano at all, including the copy-to-drive flash.
+4. Look at the DAC's lower end and at the DAC2 -> RA8 path on a scope, or compare with
+   DAC1 -> RA1.
+5. Stream 16 and 20 MSPS in pair mode for longer, to separate the stochastic overruns
+   from a limit.
+
+**The chain test as it was run in runs 18 to 20** - `chain all`, the chain test of
+`docs/CHAIN-TEST-PLAN.md`, which implements sections C.8 to C.12 as one command of under a
+minute. The old `test all` (back-to-back, above) stays in the firmware but is no longer
+the run to make.
 
 | Stage | Question it answers | Sections |
 |---|---|---|

@@ -26,8 +26,8 @@ the rest you can leave alone.
 | Document | What it is |
 |---|---|
 | [HARDWARE-LOG.md](HARDWARE-LOG.md) | Every run on the board, dated, including the predictions that turned out wrong. The newest entries are the current state. |
-| [ANALYSIS.md](ANALYSIS.md) | Sorted by question: what was checked, with which instrument, which results were withdrawn, what holds and what is open. Its status line is of 25.09.2026; later board runs are in the hardware log. |
-| [RESULTS.md](RESULTS.md) | Results report of 25.09.2026 (run 19, the first `chain all`). |
+| [ANALYSIS.md](ANALYSIS.md) | Sorted by question: what was checked, with which instrument, which results were withdrawn, what holds and what is open. Brought up to the last board run on 13.10.2026: section E is the current state, section F what the next run settles. |
+| [RESULTS.md](RESULTS.md) | Results report of 25.09.2026 (run 19, the first `chain all`), superseded by `ANALYSIS.md` section E. |
 | [TEST-COVERAGE.md](TEST-COVERAGE.md) | Per module: which board run tests it and what no run reaches (as of run 20, 29.09.2026). |
 | [ASM-FILTER-COMPARISON.md](ASM-FILTER-COMPARISON.md) | The user filter as generated dsPIC33A assembler against the C variants, measured on the board (04.10.2026). |
 | [ADC-DSP-DAC-ANALYSIS.md](ADC-DSP-DAC-ANALYSIS.md) | Analysis and proposal for a continuous output path ADC -> processing -> DAC (04.10.2026). Not built. |
