@@ -6,7 +6,8 @@ product is split out as the **core**. This project builds from the same core fil
 (`tools\build.bat core`), so the core is the same code that was tested on the board.
 
 You receive it as `core-<revision>.zip` (made by this project's `tools/export_core.py`):
-the folders below, the MPLAB X project `core_example.X`, this document and the GUI. The
+the folders below, the MPLAB X project `core_example.X`, this document, the GUI with its
+manual (`GUI-MANUAL.md`) and the console reference (`CONSOLE.md`). The
 revision is in the file name and in the board's boot banner (`version`), so a question
 about a behaviour can always name the code it is about.
 

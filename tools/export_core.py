@@ -28,7 +28,8 @@
 What goes in (docs/CORE.md, "What to copy"): the core - src/drivers, src/port,
 src/lib, src/core - the glue as a template - src/app (without main.c, the lab's
 main()) and src/boards - the MPLAB X project core_example.X, docs/CORE.md with
-the architecture pages, and the GUI (tools/adc_gui.py and the modules it
+the architecture pages, the GUI manual (docs/GUI-MANUAL.md, docs/gui/) and the
+console reference (docs/CONSOLE.md), and the GUI (tools/adc_gui.py and the modules it
 imports, its setup and start scripts). Nothing of src/lab/ or src/sim/.
 
 Taken from the commit with `git archive`, never from the working tree, so the
@@ -60,7 +61,7 @@ MCU = "33AK512MPS512"
 PATHS = ["src/drivers", "src/port", "src/lib", "src/core", "src/app", "src/boards",
          "core_example.X/Makefile", "core_example.X/nbproject/project.xml",
          "core_example.X/nbproject/configurations.xml",
-         "docs/CORE.md", "docs/ARCHITECTURE.md",
+         "docs/CORE.md", "docs/ARCHITECTURE.md", "docs/CONSOLE.md", "docs/GUI-MANUAL.md", "docs/gui",
          "docs/architecture_layers.svg", "docs/architecture_layers_dark.svg",
          "docs/architecture_datapath.svg", "docs/architecture_datapath_dark.svg",
          "tools/adc_gui.py", "tools/boards.py", "tools/eval_chain.py", "tools/pins128.py",
@@ -83,7 +84,8 @@ where your processing goes (sigproc_block() in src/core/sigproc.c), how to build
 
 - MPLAB X: open core_example.X (configurations EV74H48A and EV17P63A, -O1).
 - GUI: gui_setup.bat once, then adc_gui.bat; console on the board's
-  USB-UART at 115200 baud.
+  USB-UART at 115200 baud. How to use the GUI and the filter design tool:
+  docs/GUI-MANUAL.md; every console command: docs/CONSOLE.md.
 
 src/app/version.h names revision {rev}; the boot banner shows it.
 """
