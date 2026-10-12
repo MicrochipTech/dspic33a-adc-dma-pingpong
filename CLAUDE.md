@@ -16,6 +16,7 @@ are not equally far along. Do not describe the example as working without readin
 | Document | What it is |
 |---|---|
 | `docs/ANALYSIS.md` | **Start here.** Sorted by question: what was checked, with what instrument, what the instrument can and cannot say, which earlier results were withdrawn, what holds, what is open. |
+| `docs/README.md` | Signpost of `docs/`: every document sorted by reader (using, hand-over, status, design/history). A new or retired document updates it. |
 | `docs/HARDWARE-LOG.md` | Condensed, dated record of what was measured on silicon, including predictions that turned out wrong. A new board run gets its entry there. |
 | `README.md` | What the example does, how to build it, how to drive the console. |
 | `docs/TROUBLESHOOTING.md` | Debugging guide, symptom first. |

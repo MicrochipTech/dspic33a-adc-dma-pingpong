@@ -1,20 +1,22 @@
 # dsPIC33AK512MPS512 on the dsPIC33 Curiosity Platform — ADC at 40 MSPS into RAM via DMA
 
 **In short.** A bare-metal example for the dsPIC33AK512MPS512 on the EV74H48A dsPIC33
-Curiosity Platform (and the EV17P63A Curiosity Nano): the ADC samples at a rate you choose,
-the DMA writes the samples into a ping-pong buffer in RAM, and the CPU processes each
-completed half - a filter, a tone detector - while the DMA fills the other one. A console on
-the board's USB-UART controls it. Two PC tools come with it: **FilterDesign** designs an IIR
-filter and puts it into the firmware (install, build, flash), and the **dsPIC33 GUI** streams
-from the board and shows the time signal, the spectrum and whether a sample was lost.
+Curiosity Platform (a build for the EV17P63A Curiosity Nano exists, not yet run on a
+board): the ADC samples at a rate you choose, the DMA writes the samples into a ping-pong
+buffer in RAM, and the CPU processes each completed half - a filter, a tone detector -
+while the DMA fills the other one. A console on the board's USB-UART controls it. Two PC
+tools come with it: **FilterDesign** designs an IIR filter and puts it into the firmware
+(install, build, flash), and the **dsPIC33 GUI** streams from the board and shows the time
+signal, the spectrum and whether a sample was lost.
 
 **How to use the two tools, step by step, with a demo video:
 [docs/GUI-MANUAL.md](docs/GUI-MANUAL.md).**
 
 Where it stands: on the board the stream runs without loss up to about 8 MSPS with the CPU
 processing; DMA overruns appear from about 10 MSPS and lost triggers from about 16 MSPS.
-What holds and what is still open: [docs/ANALYSIS.md](docs/ANALYSIS.md); every board run:
-[docs/HARDWARE-LOG.md](docs/HARDWARE-LOG.md).
+Every board run, the newest last: [docs/HARDWARE-LOG.md](docs/HARDWARE-LOG.md); sorted by
+question, what holds and what is open (status 25.09.2026): [docs/ANALYSIS.md](docs/ANALYSIS.md).
+Which of the documents in `docs/` you need: [docs/README.md](docs/README.md).
 
 ## Contents
 
