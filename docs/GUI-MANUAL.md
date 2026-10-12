@@ -8,10 +8,15 @@ open a page in your browser:
 | **dsPIC33 GUI** (`tools/adc_gui.py`) | `adc_gui.bat` | http://localhost:8080 | drive the board's console: stream the ADC, grab buffers, show time signal and spectrum, set the DACs, the signal generator and the firmware's filter |
 | **FilterDesign** (`tools/filterdesign/gui/app.py`) | `filterdesign.bat` | http://127.0.0.1:8090 | design an IIR filter, check it, generate C code, and put it into the firmware as the `user` filter: install, build, flash, then open the dsPIC33 GUI |
 
-This manual says how to operate them, task by task. Background on why things work the
-way they do is in `README.md` ("The GUI: capture, plot, FFT", "The triangle verdict",
-the settings key table) and in `tools/filterdesign/README.md`. Every control in the
-dsPIC33 GUI also has a tooltip naming the console command it sends.
+This manual says how to operate them, task by task, with a picture of every card. The
+yellow numbers in a picture match the numbered list under it. Background on why things
+work the way they do is in `README.md` ("The GUI: capture, plot, FFT", "The triangle
+verdict", the settings key table) and in `tools/filterdesign/README.md`. Every control in
+the dsPIC33 GUI also has a tooltip naming the console command it sends.
+
+The pictures are made with `python docs/gen_gui_screenshots.py` (dsPIC33 GUI against its
+`--fake` stand-in, no board). Values in them (rates, filter, version string) are examples.
+A change to a card changes the generator's marker list and this manual's legend together.
 
 Contents:
 
@@ -60,7 +65,10 @@ then `tools/.venv/bin/python tools/adc_gui.py ...`.
 The GUI talks to the firmware's console over the board's virtual COM port (115200 baud).
 Every command waits for the firmware's acknowledgement before the next one goes out, so
 the GUI and the board never talk over each other. You can watch the traffic in the
-**console** pane at the bottom of the page.
+**console** card at the bottom of the page.
+
+The page has a header, a narrow left column with the settings (what the board does) and a
+wide right column with the results (what came back).
 
 ### 2.1 Quick start without a board
 
@@ -114,131 +122,271 @@ you know the page.
 
 #### Header
 
-| Control | What it does |
-|---|---|
-| **documentation** | shows `docs/ARCHITECTURE.md` in a dialog |
-| **tooltips** | tooltips on/off (saved with the settings) |
-| **port** | `fake` (stand-in), `remote` (a remote bench, see `README.md` "Optional: remote bench"), or a COM port |
-| **connect / disconnect** | opens or closes the connection |
-| status chip | grey "not connected", green with firmware version, board and RTT, red "connect failed: ..." |
+![header](gui/adc_header.png)
 
-#### Left column
+1. **documentation** - shows `docs/ARCHITECTURE.md` (block diagrams) in a dialog.
+2. **tooltips** - all tooltips on/off (saved with the settings).
+3. **port** - `fake` (the built-in stand-in), `remote` (a remote bench, see `README.md`
+   "Optional: remote bench"), or one of the PC's COM ports.
+4. **connect / disconnect** - opens or closes the connection. Disconnect stops a running
+   stream first.
+5. **Status chip** - grey "not connected"; green with the firmware's version line, the
+   board and the round trip time; red "connect failed: ..." with the reason.
 
-**settings file** - every value on the page lives in a JSON file.
+#### settings file
 
-- **save** writes the current page to the file shown (default `tools/adc_gui_settings.json`,
-  private, not in git). It is read at the next start.
-- **save as** writes to another file, which then becomes the file shown.
-- **standard** puts every control back to `tools/adc_gui_defaults.json` (the standard
-  in git). Press **save** to keep it.
-- **setup** applies a ready-made configuration at once (and to the board, if connected):
-  input, rate, DACs, generator, filter, trigger. Everything a setup does not name stays.
-  The last entry, **from a file ...**, loads a settings file.
+![settings file](gui/adc_settings.png)
 
-**acquisition · triggered chain** - what the ADC samples and how fast.
+Every value on the page lives in a JSON file.
 
-| Control | Meaning |
-|---|---|
-| **rate, kSPS (1..40000)** | sample rate. The board uses the nearest rate it can make; the **actual rate** chip shows what it made. A change while live is taken over before the next grab. |
-| **input** | **RA8 / DAC2 test triangle** (core 5, PINSEL 3, the firmware's own signal) or **custom input** |
-| **core (1..5)**, **PINSEL**, **SAMC** | the custom input: ADC core, its input channel, sample time. Locked while the test input is selected. The info line under PINSEL names the pin; the **chip · pinout** and **board · where to wire it** cards show where it is. |
-| **grab interval, ms** | pause between two grabs in live mode |
-| **trigger**, **level**, **edge**, **hysteresis** | make the time plot stand still like an oscilloscope: the plot starts where the signal crosses *level* on the chosen *edge*. Display only - the stream, the FFT and the verdict are not affected. |
-| **single** | start the stream if needed, grab once, stop the stream |
-| **live / stop** | grab repeatedly until **stop**; **stop** sends `stream off` |
+1. **The file in use** - by default `tools/adc_gui_settings.json` (private, not in git).
+   It is read at every start, on top of the standard `tools/adc_gui_defaults.json`.
+2. **save** - writes the current page into that file.
+3. **save as** - writes to another file, which then becomes the file in use.
+4. **standard** - puts every control back to `tools/adc_gui_defaults.json`. Press
+   **save** to keep it.
+5. **setup** - applies a ready-made configuration at once (and to the board, if
+   connected): input, rate, DACs, generator, filter, trigger. Everything a setup does not
+   name stays. The last entry, **from a file ...**, loads a settings file.
+
+#### acquisition · triggered chain
+
+![acquisition](gui/adc_acquisition.png)
+
+What the ADC samples, how fast, and the two buttons that start it.
+
+1. **rate, kSPS** - the sample rate, 1..40000. The board makes the nearest rate it can;
+   the **actual rate** chip shows it. A change while live is taken over before the next
+   grab.
+2. **Guidance** - what this rate did on the board so far (cyan: clean, amber: close to
+   overruns/lost triggers, red: beyond what was reached). Not a limit.
+3. **input** - **RA8 / DAC2 test triangle** (core 5, PINSEL 3: the firmware's own
+   triangle, read back inside the chip) or **custom input**.
+4. **core (1..5)** - the ADC core for a custom input.
+5. **PINSEL** - that core's input channel; the line below names the device pin and where
+   it is on the board. Locked (like 4 and 6) while the test input is selected.
+6. **SAMC** - sample time, 0..31 ADC clocks; raise it for a high-impedance source.
+7. **grab interval, ms** - pause between two grabs in live mode.
+8. **trigger** - makes the time plot stand still like an oscilloscope. Display only: the
+   stream, the FFT and the verdict are not affected.
+9. **level** - the trigger level in ADC counts (dashed line in the plot).
+10. **edge** - rising or falling.
+11. **hysteresis, LSB** - the signal must first go this far to the other side of the
+    level, so noise on a slow slope does not fire the trigger early.
+12. **single** - starts the stream if needed, grabs once, stops the stream.
+13. **live / stop** - grabs repeatedly until **stop**; **stop** sends `stream off`.
 
 While live runs the stream never stops: each grab sends the buffer pair just completed
 while the DMA carries on in the other one.
 
-**signal processing** - the filter running in the firmware on every buffer half.
+#### signal processing
 
-| Control | Meaning |
-|---|---|
-| **filter on** | switches between off and the last filter chosen |
-| **filter (in the firmware)** | **off**, **low-pass / high-pass / band-pass at fs/8** (built in, they scale with the rate), **user filter** (from FilterDesign, valid at its design rate only) |
-| **Goertzel at fs/16**, **threshold, LSB** | a tone detector at fs/16; the chip beside it says DETECTED or not detected |
-| **use its rate** | (user filter, only when the rate differs) sets the rate to the filter's design rate |
-| **noise test** | (user filter) measures the filter's frequency response on the board, see 2.4 |
+![signal processing](gui/adc_sigproc.png)
 
-When the user filter is selected the card shows its description from the board. An amber
-"NOT the filter in src/core/user_filter.json" means the board runs a different filter
-than the one installed in the source tree: build and flash.
+The filter that runs in the firmware on every buffer half, and a tone detector.
 
-**fake target signal** - only for `--fake`: what the stand-in plays on a custom input
-(sine with frequency, amplitude, noise and 2nd/3rd harmonic, or one of the DAC triangles).
+1. **filter on** - switches between off and the filter chosen last.
+2. **filter (in the firmware)** - **off**, **low-pass / high-pass / band-pass at fs/8**
+   (built in, they follow the rate), **user filter** (from FilterDesign, valid at its
+   design rate only).
+3. **Goertzel at fs/16** - a tone detector at a quarter of the Nyquist frequency.
+4. **threshold, LSB** - amplitude above which the tone counts as detected.
+5. **User filter description** (only with the user filter) - what the board reports
+   about it. Amber when the stream rate is not the filter's rate, or "NOT the filter in
+   src/core/user_filter.json" when the board runs a different filter than the source
+   tree holds (build and flash).
+6. **use its rate** - sets the stream rate to the user filter's design rate.
+7. **noise test** - measures the user filter's frequency response on the board (see
+   2.4 and the **filter response** card).
+8. **Goertzel chip** - frequency, amplitude and share of the signal at fs/16; green
+   "DETECTED" or grey "not detected".
 
-**dac1 · triangle (RA1)** and **dac2 · triangle (RA8)** - each DAC can make a triangle
-between **low** and **high** with the slope **SLPDAT**. The period is shown under the
-fields. A change goes to the board by itself 0.8 s after the last edit; **apply** sends at
-once. DAC2's **auto** is the firmware's own test triangle. **force** lets values outside
-the datasheet's limits through. DAC1 (RA1) is only read through a custom input (core 5,
-PINSEL 1).
+#### fake target signal
 
-**signal generator · table -> DMA2 -> DAC** - an arbitrary waveform from a table played
-by DMA channel 2 onto a DAC.
+![fake target signal](gui/adc_fake.png)
 
-| Control | Meaning |
-|---|---|
-| **generator**, **output** | on/off, DAC1 (RA1) or DAC2 (RA8) |
-| **n**, **play rate** | table length and how many table entries per second; the table repeats every n / play rate |
-| **f0** | fundamental; with **snap f0 to the table** it is moved to fit a whole number of periods into the table. 0 = no tone |
-| **h2 .. h7** | harmonics as multiples of f0's amplitude |
-| **noise** | white noise, in multiples of f0's amplitude (f0 0 = noise alone) |
-| **decay** | envelope exp(-decay x t) in 1/s from the table's start; 0 = steady tone. To fall to 1 % within T: decay = 4.6 / T |
-| **amp**, **lo**, **hi** | amplitude and the DAC code range (800..3500 by default: the DAC does not follow below about 780) |
-| **loop preset** | 1 kHz + 3rd harmonic on DAC2, read back on RA8 (core 5, PINSEL 3): the time plot then overlays the expected curve and the **loop** chip shows how well it matches |
-| **flat noise for this rate** | white noise on DAC2, played at twice the sample rate (max. 1 MHz) |
-| **apply** | send now (otherwise 0.8 s after the last edit) |
+Only for `--fake`: what the stand-in plays on a custom input.
 
-The plot under the card is a preview of the table. The generator and the DAC card share
-the DAC: while the generator plays, the DAC card leaves the DAC alone. The test input
-needs DAC2 for its own triangle, so selecting it switches a generator on DAC2 off.
+1. **signal** - sine generator (fields below), DAC2 triangle or DAC1 triangle.
+2. **frequency, kHz**
+3. **amplitude, counts (pk)**
+4. **noise, counts** - standard deviation; sets the SNR.
+5. **2nd harmonic** and
+6. **3rd harmonic**, counts (pk) - give THD and H2/H3 something to show.
 
-**buffer** - **buffer size, total** is one ping-pong pair (both halves), even, 32 to the
-board's maximum (2048). **apply** sends `buf`; a running stream restarts with the next
-grab.
+#### dac1 · triangle (RA1) and dac2 · triangle (RA8)
 
-#### Right column
+![dac2](gui/adc_dac2.png)
 
-**Grab line and chips** (top): grab number, length, the actual rate, the CPU cycles per
-sample, grabs/s, then chips:
+Each DAC can make a triangle on its pin. The DAC1 card is the same without **auto**.
 
-| Chip | Meaning |
-|---|---|
-| **overrun / late / missed** | errors since the previous grab: DMA overruns, late interrupts, halves the processing was too slow for. Green = 0. |
-| **actual rate** | the sample rate the board really ran; the plots use it |
-| **CPU load** | share of a half period the processing took; green below 70 %, red above 100 % |
-| **trig @ k / no trigger** | where the trigger fired |
-| **loop** | in the generator loop: rms difference to the expected curve, gain, table entry |
+1. **Mode** - **on**, **off**, and for DAC2 **auto** = the firmware's own test triangle.
+2. **low** and
+3. **high** - the turning points in DAC codes (0..4095, high > low).
+4. **SLPDAT** - the slope, codes per DAC clock (8 = about 22 kHz).
+5. **force** - lets values outside the datasheet's limits through.
+6. **Period** - the resulting triangle period and frequency.
+7. **apply dac2** - sends at once. Any change is also sent by itself 0.8 s after the last
+   edit.
 
-**time signal** - samples over time. Left axis ADC counts (0..4095), right axis volts
-(set **reference voltage, V**, default 3.3), top axis time. The line above the plot says
-what the input is and the min/max of this grab. Hover for single values. The plot can be
-zoomed with the mouse.
+DAC1 (RA1) is only read through a custom input (core 5, PINSEL 1). While the signal
+generator plays on a DAC, the card leaves that DAC alone; switching the card to **on**
+replaces the generator with the triangle.
 
-**spectrum · Hann window** - FFT of the grab in dBFS (0 dB = full scale). **average**
-with **grabs** averages the power of the last N grabs (useful for noise); it starts over
-when the rate, length or filter changes. Dashed lines mark fs/8 (filter corner) and fs/16
-(Goertzel).
+#### signal generator · table -> DMA2 -> DAC
 
-**filter response · noise test** - appears after a noise test (see 2.4): measured and
-designed response of the user filter.
+![signal generator](gui/adc_siggen.png)
 
-**signal evaluation** - fundamental frequency, level, noise floor, SNR (green from 40 dB),
-THD (harmonics 2..5) and H2..H5 in dBc. Meaningful for a sine; for a triangle the
-harmonics are of course large.
+An arbitrary waveform: a table computed from the fields, played by DMA channel 2 onto a
+DAC.
 
-**triangle verdict · test input only** - checks the firmware's test triangle sample by
-sample, with the same code as the firmware's own chain test: a lost or repeated sample
-moves the turning points off the grid (**slip**) and gives **FAIL**. Hidden when there is
-no triangle to check (custom input, filter on, DAC2 off).
+1. **generator** - on/off.
+2. **output** - DAC1 (RA1) or DAC2 (RA8).
+3. **n, table entries** - table length.
+4. **play rate, Hz** - table entries per second; the table repeats every n / play rate.
+5. **f0, Hz** - the fundamental (0 = no tone).
+6. **noise** - white noise in multiples of f0's amplitude (with f0 = 0: noise alone).
+7. **h2 .. h7** - harmonics as multiples of f0's amplitude.
+8. **decay, 1/s** - envelope exp(-decay x t) from the table's start; 0 = steady tone. To
+   fall to 1 % within T: decay = 4.6 / T.
+9. **amp** - overall amplitude, 0..1.
+10. **lo** and
+11. **hi** - the DAC code range (800..3500 by default: the DAC does not follow below
+    about code 780).
+12. **snap f0 to the table** - moves f0 so a whole number of periods fits the table.
+13. **force** - any lo/hi.
+14. **loop preset** - 1 kHz + 3rd harmonic on DAC2, read back on RA8 (core 5,
+    PINSEL 3): the time plot overlays the expected curve and the **loop** chip shows the
+    match (picture under "time signal").
+15. **flat noise for this rate** - white noise on DAC2 at twice the sample rate
+    (max. 1 MHz).
+16. **apply** - sends now (otherwise 0.8 s after the last edit).
+17. **Status** - what the board plays, with the actual play rate.
+18. **Preview** of the table.
 
-**chip · pinout** and **board · where to wire it** - the package and the evaluation board
-with the selected input and the DAC outputs marked. Hover a pin for all its functions.
-Changing core/channel/source here changes the acquisition card too.
+The test input needs DAC2 for its own triangle: selecting it switches a generator on DAC2
+off.
 
-**console** - every line sent to and received from the board, with time stamps (last 1000
-lines). First place to look when something does not do what you expect.
+#### buffer
+
+![buffer](gui/adc_buffer.png)
+
+1. **buffer size, total** - one ping-pong pair (both halves), even, 32 to the board's
+   maximum (2048).
+2. **apply** - sends `buf`; a running stream restarts with the next grab.
+3. **What the board took** - "buf: N (half N/2)".
+
+#### Grab line and status chips (top of the right column)
+
+![grab line and chips](gui/adc_chips.png)
+
+1. **Grab line** - grab number, samples, start index, the actual rate, CPU cycles used of
+   the cycles available per sample, grabs per second. Red on an error.
+2. **overrun**,
+3. **late** and
+4. **missed** - errors since the previous grab: DMA overruns, interrupts a whole half
+   late, halves the processing was too slow for. Green = 0, red otherwise.
+5. **actual rate** - the sample rate the board really ran; the plots use it.
+6. **halves / xfer** - buffer halves and DMA transfers.
+7. **CPU load** - share of a half period the processing took; green below 70 %, red above
+   100 %.
+8. **trigger** - "trig @ k" where the trigger fired, or "no trigger".
+9. **loop** - in the generator loop: rms difference to the expected curve, gain, table
+   entry.
+
+#### time signal
+
+![time signal, test triangle](gui/adc_time_triangle.png)
+
+1. **reference voltage, V** - full scale (4096 counts) in volts; sets the right axis and
+   the tooltip.
+2. **Source line** - what is on the input, and min/max of this grab.
+3. **Plot** - samples over time: left axis ADC counts, right axis volts, bottom axis
+   sample number, top axis time. Hover for single values; mouse wheel and drag zoom.
+
+With **trigger** on, the plot starts at the crossing of the level (dashed line) and shows
+half the grab:
+
+![time signal with trigger](gui/adc_time_trigger.png)
+
+With the generator's **loop preset**, the expected curve is drawn over the measured one,
+and the **loop** chip above the card says how well they match:
+
+![time signal in the generator loop](gui/adc_time_loop.png)
+
+#### spectrum · Hann window
+
+![spectrum](gui/adc_spectrum.png)
+
+1. **average** - averages the power of the last N grabs (for noise and small lines); it
+   starts over when the rate, length or filter changes.
+2. **grabs** - N.
+3. **Plot** - FFT of the grab in dBFS (0 dB = full scale). Dashed lines mark fs/8 (corner
+   of the built-in filters) and fs/16 (Goertzel) when they are on.
+
+#### filter response · noise test
+
+![noise test](gui/adc_noise_test.png)
+
+Appears once a noise test has run (button 7 in **signal processing**).
+
+1. **Summary** - filter, rate, number of grabs, and how far the measured response lies
+   from the design: median and 90 % deviation where the design passes, the level where it
+   blocks (the floor there is the ADC's own noise).
+2. **Plot** - measured response (solid) and design (dashed) in dB over kHz.
+
+#### signal evaluation
+
+![signal evaluation](gui/adc_evaluation.png)
+
+1. **fundamental** - frequency of the strongest line.
+2. **level** - its level in dBFS.
+3. **noise floor** - median of the spectrum outside the fundamental and its harmonics.
+4. **SNR** - green from 40 dB.
+5. **THD** - harmonics 2..5 against the fundamental.
+6. **H2** (and H3..H5 beside it) - each harmonic in dBc.
+
+Meaningful for a sine; for a triangle the harmonics are of course large.
+
+#### triangle verdict · test input only
+
+![triangle verdict](gui/adc_verdict.png)
+
+Checks the firmware's test triangle sample by sample, with the same code as the
+firmware's own chain test.
+
+1. **PASS / FAIL** - FAIL means a sample was lost or repeated somewhere in the grab.
+2. **turning points** - number of corners found.
+3. **up** and
+4. **down** - number and length (samples) of the rising and falling slopes.
+5. **slip** - how far the corners lie off the expected grid; a lost sample moves them by
+   a whole sample.
+6. **slope/model** - measured slope against the one expected for this rate (1.000 =
+   exact).
+
+Hidden when there is no triangle to check (custom input, filter on, DAC2 off).
+
+#### chip · pinout and board · where to wire it
+
+![chip pinout](gui/adc_pinout.png)
+
+1. **eval kit** - EV74H48A or EV17P63A.
+2. **core**,
+3. **channel (PINSEL)** and
+4. **signal source** - the same selection as in the acquisition card (changing it here
+   changes it there). Cyan = the selected input, violet = DAC outputs, red = supply,
+   grey = ground. Hover a pin for all its functions.
+
+The board card shows the same on the evaluation board, with the connector pad to wire to:
+
+![board](gui/adc_board.png)
+
+#### console
+
+![console](gui/adc_console.png)
+
+Every line sent to and received from the board, with time stamps (last 1000 lines). The
+first place to look when something does not do what you expect.
 
 ### 2.4 Typical tasks
 
@@ -261,8 +409,7 @@ press **loop preset**. The time plot shows the measured signal and the expected 
    offered (the filter's coefficients hold only at its design rate).
 2. Press **noise test**. The GUI stops live, plays white noise on DAC2, grabs N times with
    the filter off (reference), N times with the filter on, and draws the measured
-   response against the design in **filter response · noise test**. The summary line gives
-   the deviation in the pass band and the stop band level.
+   response against the design in **filter response · noise test**.
 
 The setups "noise - white noise on DAC2, the user filter, 200 kSPS" and "... no filter"
 show the same by hand. Above 500 kSPS the generator cannot play the noise fast enough.
@@ -301,110 +448,186 @@ adc_gui.bat [options]
 filterdesign.bat
 ```
 
-The page opens at http://127.0.0.1:8090 with the last saved parameter set
-(`presets/default.json`). On the very first design the tool compiles its design program
-`fdesign` with gcc (a few seconds); without gcc a red box says so.
+The page opens at http://127.0.0.1:8090 with the parameter set `presets/default.json`.
+On the very first design the tool compiles its design program `fdesign` with gcc (a few
+seconds); without gcc a red box says so.
 
-1. In **Specification** choose **Filter type** (Lowpass, Highpass, Bandpass, Bandstop) and
-   **Characteristic** (Butterworth, Chebyshev, Elliptic).
-2. Enter the **Sampling rate** and the band edges (Hz), the **Passband ripple** and the
-   **Stopband atten.** (dB). The filter order follows from these - there is no order field.
+1. In **Specification** choose **Filter type** and **Characteristic**.
+2. Enter the **Sampling rate**, the band edges, the **Passband ripple** and the
+   **Stopband atten.** The filter order follows from these - there is no order field.
 3. Every change redesigns the filter after 0.3 s. The chip at the top right says
    "specification met" (green), "check result" (amber) or "design failed" (red).
 4. Look at the **Magnitude** tab: the red shaded areas are the tolerance scheme, the curve
-   must stay out of them. The dashed curve is the implementation with the chosen
-   arithmetic.
+   must stay out of them.
 
 Or simply load a ready-made set: **Parameter set** -> **Load from presets folder**, e.g.
 `dspic33_default_lowpass_200k` (the firmware's default user filter).
 
 ### 3.2 The page
 
-#### Left panel
+The left panel holds the specification, the right panel the results in tabs.
 
-**Parameter set** - load and save complete designs as JSON files in
-`tools/filterdesign/gui/presets/`.
+#### Header
 
-- **Load from presets folder** (with the refresh button to rescan the folder).
-- **Save** overwrites the current file, **Save as** asks for a name, **Load file** loads
-  any `.json` without copying it into the folder.
-- "• modified" behind the name means unsaved changes; loading another set then asks
-  before discarding them.
+![FilterDesign header](gui/fd_header.png)
 
-**Specification** - see 3.1. The edge fields change with the filter type and are always
-in ascending frequency order.
+1. **Light / dark mode**.
+2. **Status chip** - characteristic, type, order, and whether the specification is met.
 
-**Implementation** - how the filter is computed.
+#### Parameter set
 
-| Control | Meaning |
-|---|---|
-| **Arithmetic** | float (32 bit), double (64 bit), fixed point 32 bit, fixed point 16 bit, float (32 bit, dsPIC33A assembler) |
-| **Section scaling** | scales each biquad section to 0 dB at every node; keep it on for fixed point, otherwise high-order filters overflow |
-| **Output gain** | dB, folded into the last section at no cost. Above 0 dB the output clips at 0/4095 for large signals. The plots are shown without it. |
-| **Auto Q / Fractional bits** | fixed point only: the Q format of the coefficients, normally chosen automatically |
-| **C name** | prefix of the generated functions (`<name>_init`, `<name>_process`, `<name>_process_block`) and files |
+![parameter set](gui/fd_paramset.png)
 
-#### Right panel
+Complete designs as JSON files in `tools/filterdesign/gui/presets/`.
 
-**Summary** - order and number of sections, achieved pass band and stop band
-attenuation (against the specification), largest pole radius, settling time, group delay,
-for fixed point the coefficient format and the overflow test, and the pass/stop band of the
-quantized implementation. A red or amber warning below says when the fixed-point version
-overflows or misses the specification.
+1. **Current file** - "• modified" behind it means unsaved changes; loading another set
+   then asks before discarding them.
+2. **Load from presets folder** (the button beside it rescans the folder).
+3. **Save** - overwrites the current file.
+4. **Save as** - asks for a name.
+5. **Load file** - loads any `.json` from disk without copying it into the folder.
 
-**Tabs:**
+#### Specification
 
-| Tab | Content |
-|---|---|
-| **Magnitude** | dB/linear, linear/log frequency, tolerance scheme, the implemented (quantized) response |
-| **Phase** | unwrapped or wrapped |
-| **Group delay** | in samples or ms |
-| **Pole / zero** | z plane with the unit circle, and the lists of poles and zeros |
-| **Impulse / step** | design and implementation |
-| **Sections** | the biquad coefficients b0..b2, a1, a2 per section, pole radius/frequency/Q, peak gain and L1 norm |
-| **C code** | the generated `.h` and `.c` (or `.s` for the assembler); **Download .h / .c** saves them to the browser's download folder |
-| **C test** | compiles and runs the generated code on the PC, see below |
-| **dsPIC33** | puts the filter onto the board, see 3.3 |
+![specification](gui/fd_spec.png)
 
-All plots: mouse wheel or the box tool to zoom, restore button, save as image.
+1. **Filter type** - Lowpass, Highpass, Bandpass, Bandstop.
+2. **Characteristic** - Butterworth (flat, widest transition), Chebyshev type I (ripple
+   in the pass band, steeper), Elliptic/Cauer (ripple in both bands, steepest for a given
+   order).
+3. **Sampling rate**, Hz.
+4. **Band edges**, Hz - two (low/high-pass) or four (band-pass/-stop), always in
+   ascending frequency order; the labels say which edge is which.
+5. **Passband ripple**, dB - how much the pass band may vary.
+6. **Stopband atten.**, dB - how far the stop band must be down.
 
-**C test tab.** Choose the **Implementations** (float, double, fixed 32, fixed 16), the
-**Signal** (impulse, step, sine, chirp, white noise, multitone), **f1/f2**, **Amplitude**
-and **Samples**, then **Compile & run**. The table shows per implementation whether it
-built, whether it matches the bit-exact model, saturations, the error against the double
-precision reference, SNR, and the measured pass/stop band. The plot shows the output, the
-error, or the measured magnitude. **Test bench (.zip)** downloads the filter with a test
-program, input and expected output, and a Makefile: `make test` prints PASS or FAIL on any
-machine with gcc. The assembler variant cannot be tested on the PC.
+#### Implementation
+
+![implementation](gui/fd_impl.png)
+
+How the filter is computed in C.
+
+1. **Arithmetic** - float (32 bit), double (64 bit), fixed point 32 bit, fixed point
+   16 bit, float (32 bit, dsPIC33A assembler).
+2. **Section scaling** - scales each biquad section to 0 dB at every node. Keep it on for
+   fixed point, otherwise high-order filters overflow.
+3. **Output gain**, dB - folded into the last section at no cost. Above 0 dB the output
+   clips at 0/4095 for large signals. The plots are shown without it.
+4. **Auto Q** and
+5. **Fractional bits** - fixed point only: the Q format of the coefficients, normally
+   chosen automatically.
+6. **C name** - prefix of the generated functions (`<name>_init`, `<name>_process`,
+   `<name>_process_block`) and of the downloaded files.
+
+#### Summary
+
+![summary](gui/fd_summary.png)
+
+1. **Order** - digital order and number of biquad sections.
+2. **Passband atten.** and
+3. **Stopband atten.** - achieved, with the limit from the specification in brackets.
+   Also in the summary: largest pole radius, settling time, group delay.
+4. **Coefficient format** (fixed point) - Q format and integer type; "CLIPPED!" when a
+   coefficient does not fit. Beside it the impulse test's saturations.
+5. **Impl. passband / stopband** - the same figures for the quantized implementation.
+
+A red or amber warning below the summary says when the fixed-point version overflows or
+misses the specification.
+
+#### Magnitude tab
+
+![magnitude](gui/fd_tab_magnitude.png)
+
+1. **dB / linear** magnitude.
+2. **linear f / log f** frequency axis.
+3. **Tolerance scheme** - shades the forbidden areas red; the curve must stay out of them.
+4. **Implemented (quantized)** - draws the response with the chosen arithmetic (dashed)
+   over the ideal design.
+5. **Plot** - zoom with the mouse wheel or the box tool (top right), restore, save as
+   image. The same holds for every plot in this tool.
+
+**Phase**, **Group delay** and **Impulse / step** look alike: one toggle (wrapped /
+unwrapped, samples / ms, impulse / step) and the plot.
+
+#### Pole / zero tab
+
+![pole zero](gui/fd_tab_polezero.png)
+
+1. **z plane** - poles (x) and zeros (o) with the unit circle. Poles close to the circle
+   mean a sharp filter and a long settling time.
+2. **Lists** of poles and zeros with radius, frequency and multiplicity.
+
+#### Sections tab
+
+![sections](gui/fd_tab_sections.png)
+
+1. **Q format and scaling** in words, with the headroom needed.
+2. **Coefficients** b0..b2, a1, a2 of each biquad section (integers for fixed point),
+   pole radius, frequency and Q, peak gain and L1 norm at each section's output.
+
+#### C code tab
+
+![C code](gui/fd_tab_ccode.png)
+
+1. **Download .h** and
+2. **Download .c** (**.s** for the assembler) - the generated files, into the browser's
+   download folder. Both are shown below the buttons.
+
+#### C test tab
+
+![C test](gui/fd_tab_ctest.png)
+
+Compiles the generated code on the PC and compares it with a double-precision reference.
+
+1. **Implementations** - which arithmetic variants to test (the assembler cannot run on
+   the PC).
+2. **Signal** - impulse, step, sine, chirp, white noise, multitone (sine/chirp/multitone
+   add the frequency fields f1/f2).
+3. **Amplitude**, in full scale.
+4. **Samples**.
+5. **C compiler** - default `gcc` (or `CC`).
+6. **Compile & run**.
+7. **Test bench (.zip)** - the filter, a test program, input and expected output and a
+   Makefile for the arithmetic chosen in Implementation: `make test` prints PASS or FAIL
+   on any machine with gcc.
+8. **Result line** - what was tested; it says so when the design changed since.
+9. **Result table** - per implementation: built, test bench PASS/FAIL, bit-exact against
+   the model, format, saturations, error against the reference, SNR, measured pass band
+   and stop band.
+10. **View** - output, error, measured magnitude, deviation from the design. Click a
+    legend entry to hide or show a curve.
 
 ### 3.3 Putting a filter onto the board (dsPIC33 tab)
 
 The firmware has a slot for one designed filter, `sigproc user` (`src/core/user_filter.h`).
-The dsPIC33 tab fills it and gets it running in four steps.
+The dsPIC33 tab fills it and gets it running.
 
-**Before you start:**
+![dsPIC33 tab](gui/fd_tab_dspic33.png)
 
-- The **Sampling rate** must be a whole number of kHz (1 kHz .. 40 MHz): the board streams
-  at whole kSPS. The filter is valid only at that rate.
-- The **Checks** list on the left must not show a red line. It also gives the CPU budget
-  (cycles per sample at this rate) - below 60 cycles the install is refused; above about
-  8 MSPS the stream itself starts to lose samples.
-- An amber "misses the specification" is only a warning.
-- Close MPLAB X's project (or MPLAB X) if it holds the board's programmer.
+1. **Sample rate check** - the rate must be a whole number of kHz (1 kHz .. 40 MHz): the
+   board streams at whole kSPS. The filter is valid only at that rate.
+2. **CPU budget check** - cycles per sample at this rate against the filter's cost.
+   Below 60 cycles the install is refused; above about 8 MSPS the stream itself loses
+   samples. A red line in **Checks** blocks the install; an amber "misses the
+   specification" is only a warning.
+3. **Installed in the firmware** - what `src/core/user_filter.json` holds now, and
+   whether it is this design ("not this design" in the picture: another filter is
+   installed).
+4. **Board** - EV74H48A (flashed through the on-board PKOB4 with `ipecmd`) or EV17P63A
+   Curiosity Nano (flashed by copying the .hex onto its USB drive).
+5. **Progress** - installed / built / flashed, ticked for the current design.
+6. **1 Install into firmware** - writes `src/core/user_filter.h` and `.json`.
+7. **2 Build** - runs `tools\build.bat` (or `build.bat nano`), about 20 s.
+8. **3 Flash** - programs the board, 20 to 40 s. **Do not unplug the board or close the
+   page meanwhile.** Close MPLAB X's project first if it holds the programmer.
+9. **1-3 in one go** - all three, stops at the first failure.
+10. **4 Open dsPIC33 GUI** - starts `adc_gui.py` in its own window with the `user` filter
+    preselected.
+11. **COM port** for it (empty: choose in the GUI),
+12. **HTTP port** for it (default 8080), and
+13. **fake target (no board)** - start it against the stand-in.
 
-**Select the Board:** EV74H48A (flashed through the on-board PKOB4 with `ipecmd`) or
-EV17P63A Curiosity Nano (flashed by copying the .hex onto its USB drive).
-
-| Button | What it does |
-|---|---|
-| **1 Install into firmware** | writes `src/core/user_filter.h` and `src/core/user_filter.json` |
-| **2 Build** | runs `tools\build.bat` (or `build.bat nano`), about 20 s |
-| **3 Flash** | programs the board, 20 to 40 s. **Do not unplug the board or close the page meanwhile.** |
-| **1-3 in one go** | all three, stops at the first failure |
-| **4 Open dsPIC33 GUI** | starts `adc_gui.py` in its own window with the `user` filter preselected; fill in the **COM port** (or leave it empty and choose in the GUI), or tick **fake target (no board)** |
-
-The status line shows "installed / built / flashed" with a tick for each step done for
-the current design. The log below shows the output of every step, newest on top.
+The log below the buttons shows the output of every step, newest on top.
 
 **In the dsPIC33 GUI:** signal processing card -> **user filter** -> **use its rate** ->
 **filter on**, then **live**; or press **noise test** to measure the response against
@@ -437,7 +660,7 @@ filterdesign.bat [--port 8090] [--host 0.0.0.0] [--no-browser] [--light] [--pres
 | `adc_gui.bat`: "No tools\.venv yet" | run `gui_setup.bat` once |
 | COM port missing in the list | plugged in after the page was built: reload the page (F5). Check the Device Manager. |
 | "connect failed" | wrong port, or the port is open in another program (terminal, MPLAB X data visualizer). Close it and connect again. |
-| connected, but **single** gives "stream on refused" | look at the **console** pane for the firmware's reply; an old firmware may lack the command - flash the current one |
+| connected, but **single** gives "stream on refused" | look at the **console** card for the firmware's reply; an old firmware may lack the command - flash the current one |
 | overrun / late / missed red | the rate is too high for the stream or for the filter; lower it, or switch the filter off |
 | "NOT the filter in src/core/user_filter.json" | the board runs an older user filter: build and flash |
 | user filter response looks wrong | the stream rate is not the filter's design rate: **use its rate** |
