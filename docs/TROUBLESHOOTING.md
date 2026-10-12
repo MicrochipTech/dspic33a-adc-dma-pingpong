@@ -14,7 +14,7 @@ waste time on the parts that are solid.
 
 **Revision 2026-09-22:** a review against the datasheet and the silicon errata found
 four real mistakes in the previous version (ADC trigger mode, DMA address limits, status
-flag clearing, buffer switching). They are fixed; the README has the list. The code was
+flag clearing, buffer switching). They are fixed; `HISTORY.md` has the list. The code was
 then cut to the EV74H48A board: it runs a self-test on the ADC's internal reference before it
 touches the external pin, every wait loop is bounded, and **LED0 tells you where it
 stopped** — so most of this guide starts from what the LED shows.
@@ -39,7 +39,7 @@ multisample modes, and Integration mode stops after `CNT` conversions (max 65535
 This code sets `CNT = 2048` = one full DMA buffer and restarts the burst with a software
 trigger from the DMA `DONE` interrupt. That keeps ADC and DMA in lock-step, but it is
 **our own construction — no Microchip example combines an ADC burst, a continuous DMA
-transfer and a restart from the ISR** (the README section "What comes from where" lists
+transfer and a restart from the ISR** (`HISTORY.md`, "What comes from where", lists
 what was taken from which example). It rests on two things we could not test:
 
 - **The restart is accepted.** Datasheet Example 16-6 (p1331) retriggers a finished
@@ -150,7 +150,7 @@ So you do not hunt here first. Each was read from a primary source and cross-che
   package (Table 16-2), the datasheet samples it the same way (Example 16-3).
 - **The command parser** — `cmd_parser.c` is unchanged from its repository, where it
   has a PC test harness and has run on two other microcontrollers.
-- **`FICD_NOBTSWP` and `FWDT_RCLKSEL` values** — read from both pack versions, see the README.
+- **`FICD_NOBTSWP` and `FWDT_RCLKSEL` values** — read from both pack versions, see `HOW-IT-WORKS.md`, "One trap worth knowing about".
 
 ---
 
@@ -169,7 +169,7 @@ The symbolic names changed between pack versions (`ON`/`OFF` in 1.3.x,
 `BTSWP_ENABLED`/`BTSWP_DISABLED` in 1.4.x; likewise `FWDT_RCLKSEL` is `BFRC256` in
 1.3.x and `BFRC244` in 1.4.x). If MCC generated the file against one pack
 and your build uses another, you get this. The fix is either to align the versions or
-to write the bit numerically, which is what this project does — see the README.
+to write the bit numerically, which is what this project does — see `HOW-IT-WORKS.md`, "One trap worth knowing about".
 
 Other build failures worth knowing:
 
@@ -345,8 +345,8 @@ window registers contain `0x4000` and `0x13FFF`.
 
 **This is not a bug — it is the measurement.** It means the DMA channel was triggered
 again before it had finished the previous transfer (p816), i.e. the DMA bus could not
-keep up with the ADC — exactly the question this example exists to answer (see the
-README section on the shared DMA bus).
+keep up with the ADC — exactly the question this example exists to answer (see
+`HOW-IT-WORKS.md`, "The point of the whole thing", on the shared DMA bus).
 
 **But it has a second effect that will bite you long before the numbers do.** Every
 overrun raises the DMA channel interrupt, and the event has no enable bit of its own
@@ -370,7 +370,7 @@ What to do with the result:
 1. Note at what rate it starts. That number is the answer.
 2. Reduce the rate with `pll <p1> <p2>` and confirm the overruns disappear. Do **not**
    use `SAMC` or `clk` for this — neither changes the rate on this silicon.
-3. Then decide: average inside the ADC (`ACCNUM`, see README) or use fewer channels.
+3. Then decide: average inside the ADC (`ACCNUM`, see `HOW-IT-WORKS.md`, "If the bandwidth is not enough") or use fewer channels.
 
 **Before reporting it as the bus limit, rule out the trivial causes:** with one channel
 and nothing else running, an overrun means the bus lost against something — check that
@@ -422,8 +422,8 @@ For the external input, after the self-test passed:
 - **Commands echo but nothing happens.** The receive interrupt is not running: check
   `IEC3bits.U2RXIE`, `IPC12bits.U2RXIP` (must be 1 … 7) and that `_U2RXInterrupt` is in
   the vector table (IRQ 102).
-- **`proc_missed` rises while you type.** Expected during a long reply — see the
-  README, "The console".
+- **`proc_missed` rises while you type.** Expected during a long reply — see
+  `CONSOLE.md`.
 
 ### 2.5 `late_service` or `proc_missed` is counting up
 

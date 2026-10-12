@@ -98,7 +98,7 @@ A fourth filter, `sigproc user`, runs whatever IIR filter you design in
 flashes and opens the GUI. The filter holds at its design rate only (`sigproc` prints it).
 The same generated code is what the tool's C test compiled and compared - for fixed point
 bit-exact to its model - so a filter can also leave this example for your own processing as
-it is. The README's "Your own filter" section has the whole way.
+it is. `GUI-MANUAL.md` (chapter 2, and "Your own filter: the firmware side" in chapter 5) has the whole way.
 
 ## 4. Building
 
@@ -160,7 +160,7 @@ that lands between the two widens the window around RAM the DMA must not write.
 
 The console runs at 115200 baud (UART2). `help` lists the core's commands: `version`,
 `status`, `regs`, `route`, `siggen`, `sigproc`, `stats`, `dump`, `clear`, `led`, `buf`,
-`dac`, `stream`, `reset`. `README.md` describes each. `stream on <ksps> [core pinsel
+`dac`, `stream`, `reset`. `CONSOLE.md` describes each. `stream on <ksps> [core pinsel
 [samc]]` starts the stream, and `stream grab` sends the last completed pair as a binary
 frame with a CRC while the stream keeps running.
 

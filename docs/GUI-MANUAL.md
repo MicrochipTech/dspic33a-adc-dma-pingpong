@@ -20,8 +20,8 @@ or none at all.
 
 This manual says how to operate them, task by task, with a picture of every card. The
 yellow numbers in a picture match the numbered list under it. Background on why things
-work the way they do is in `README.md` ("The GUI: capture, plot, FFT", "The triangle
-verdict", the settings key table) and in `tools/filterdesign/README.md`. Every control in
+work the way they do is in chapter 5, [Reference](#5-reference) (the firmware side of the
+user filter, the settings key table, the triangle verdict) and in `tools/filterdesign/README.md`. Every control in
 the dsPIC33 GUI also has a tooltip naming the console command it sends.
 
 The pictures are made with `python docs/gen_gui_screenshots.py` (dsPIC33 GUI against its
@@ -43,6 +43,7 @@ Contents:
    - [Typical tasks](#34-typical-tasks)
    - [Command line](#35-command-line)
 4. [When something goes wrong](#4-when-something-goes-wrong)
+5. [Reference](#5-reference)
 
 ---
 
@@ -685,3 +686,235 @@ adc_gui.bat [options]
 Every flash from FilterDesign adds a line to `build/flashlogs/history.txt`; a failed one
 also saves `build/flashlogs/<time>/` with the programmer's output and the processes that
 were running. More on the firmware side: `docs/TROUBLESHOOTING.md`.
+
+---
+
+## 5. Reference
+
+The background behind chapters 2 and 3, moved here from the top-level README on 13.10.2026 unchanged: the firmware side of the user filter, every key of the settings file, the triangle verdict in detail.
+
+### Your own filter: the firmware side
+
+`tools/filterdesign` is an IIR filter design tool (Butterworth, Chebyshev, elliptic; low-,
+high-, band-pass, band-stop) with a browser GUI. Its **dsPIC33** tab takes the filter you
+designed onto this board:
+
+```
+filterdesign.bat    the design tool (in the repository root), http://127.0.0.1:8090
+```
+
+1. **Design and test** on the PC: tolerance scheme, sample rate, arithmetic (float, double,
+   fixed point 32 or 16 bit). The tabs show magnitude, phase, group delay, poles/zeros,
+   impulse/step response and the quantised implementation; **C test** compiles the
+   generated C code with gcc and compares it with the reference (fixed point bit-exact).
+2. **dsPIC33 tab** - checks first: the sample rate must be a whole number of kSPS (the
+   stream's `stream on <ksps>`), the CPU budget per sample (200 MHz / fs), the
+   specification met also after quantisation, no fixed-point overflow. Then:
+   - **1 Install into firmware** writes `src/core/user_filter.h` (the generated code, made
+     `static inline`, only `sigproc.c` includes it) and `src/core/user_filter.json` (the
+     same filter described for the GUI, same id);
+   - **2 Build** runs `tools\build.bat` (or `build.bat nano`);
+   - **3 Flash**: EV74H48A through its PKOB4 with MPLAB IPE's `ipecmd` (20 to 30 s);
+     EV17P63A by copying the .hex onto the Curiosity Nano's USB drive (untested so far);
+   - **1-3 in one go**;
+   - **4 Open dsPIC33 GUI** starts `tools/adc_gui.py` with the filter `user` preselected
+     (with a COM port, or the fake target).
+3. **On the board**, in the dsPIC33 GUI's **signal processing** card: the filter `user`;
+   the row under it names the filter the board reports, warns when it is not the one in
+   `user_filter.json` (not rebuilt or flashed) or when the stream runs at another rate than
+   the filter was designed for, and **use its rate** sets the rate. The FFT then shows the
+   filtered spectrum with the band edges marked, the CPU load chip what the filter costs.
+   The switch **filter on** turns the filter off and on at run time, also while LIVE.
+4. **noise test** (the button in the same row) measures the filter's frequency response on
+   the board: the signal generator plays white noise on DAC2 -> RA8 (`siggen set noise 1`,
+   `f0 0`, 8192 entries at twice the sample rate, at most 1 MHz), the stream runs at the
+   filter's design rate, the GUI grabs N times without the filter and N times with it (N =
+   the spectrum's "grabs", 16), and draws the ratio of the two averaged spectra against the
+   design in the card **filter response**, with the median deviation where the design
+   passes and the level reached where it blocks. The spectra are Welch averages (Hann
+   segments of 512 samples): the generator's noise is a fixed table, and one FFT of it
+   scatters by several dB per bin whatever is averaged over grabs; with and without the
+   filter the same table cancels. The setups `noise_user`/`noise_raw` play the same noise at
+   200 kSPS. Against the GUI's stand-in the measured response lies within 0.1-0.7 dB
+   (median) of the design. Choosing the test input afterwards switches the generator off
+   (it needs DAC2 for its triangle).
+   **flat noise for this rate** in the generator card plays the same noise at twice the
+   acquisition card's rate (at most 1 MHz), without a measurement. Measured on the board
+   (04.10.2026): flat within about 2 dB up to 0.45 fs at 100-500 kSPS; above, the DAC's
+   1 MHz and the path from DACOUT2 to the ADC (-3 dB near 330 kHz, `tools/path_response.py`)
+   roll it off - the spectrum shades that part (above 200 kHz).
+
+How the firmware runs it (`src/core/sigproc.c`): the 12-bit sample is centred (x - 2048),
+for fixed point placed in the top bits of the word (Q15/Q31, full scale = 1.0 as in the
+tool), filtered, shifted back with rounding, + 2048, clamped to 0..4095; on a gap in the
+stream the state is cleared. `double` becomes `long double` (XC-DSC's `double` has 32
+bits). The state has a fixed 256 bytes, so installing another filter does not change the
+memory layout. `tests/host/test_user_filter_xcheck.py` holds this path, compiled with gcc,
+to a model of each arithmetic (fixed point bit-exact).
+
+The checked-in `user_filter.h` is the default: an elliptic low-pass 15 kHz at 200 kSPS,
+float, for the signal generator's harmonics. Installing another filter changes the two
+files in `src/core` - commit them on purpose, or put the default back with
+`python tools\filterdesign\gui\firmware.py --default`. The tool's own documentation:
+[tools/filterdesign/README.md](../tools/filterdesign/README.md).
+
+**On the board** (03.10.2026, docs/HARDWARE-LOG.md section 10): a user filter flashed from
+the tab, and the generator's noise read back at 2 and 8 MSPS (the DAC's hold, nulls at
+multiples of the play rate, as predicted). **Not yet measured there:** the filter's response
+and cost, the noise test itself, the Nano's copy-to-drive flash. Do not interrupt a flash - a killed ipecmd
+left the PKoB4 dead until its USB cable was plugged again; the tab now shows the output live
+and stops a hung run itself after 240 s.
+
+### The GUI: capture, plot, FFT (`tools/adc_gui.py`)
+
+**How to operate it** (and FilterDesign), step by step: `docs/GUI-MANUAL.md`. This section is the reference behind it.
+
+Demo video (4 min): from a filter design in FilterDesign to the measurement on the board.
+
+https://github.com/user-attachments/assets/15efaf7b-7e51-49cd-bec7-51955e771a89
+
+
+**Settings.** Every value the page can set is in a JSON file. At every start the GUI
+reads **`tools/adc_gui_defaults.json`** - the standard, tracked in git, every key with
+its default - and then **`tools/adc_gui_settings.json`** on top of it, the personal
+state (git-ignored; "save" writes it, a key it lacks keeps the standard's value).
+**standard** in the settings tile puts every value back to the standard file; "save
+as" writes another file, and the **setup** list's last entry, "from a file ...", reads
+one; `--settings <file>` starts with one. The list's other entries are ready-made setups
+(`SETUPS` in `adc_gui.py`), applied at once and to the board when connected: the
+firmware's test triangle; four DAC triangles (DAC2 slow / 35 kHz / 390 kHz small swing,
+DAC1 on RA1), each read on its own pin through a custom input on core 5; and eight
+signal-generator shapes on DAC2 (sine, 1 kHz + h3 as in the loop preset, square-,
+sawtooth- and triangle-like from their harmonic series, pulse train, a damped tone, a 50 kHz tone with h2..h4 that decays to zero within 1 ms) plus
+a sine on DAC1. A setup only sets what it names - input, rate, DACs, generator, trigger -
+the rest of the page stays.
+
+| Key | What it sets |
+|---|---|
+| `board` | board profile: `EV74H48A` or `EV17P63A` (switched on connect to what the firmware reports) |
+| `connection.port` | COM port preselected at start (empty: none) |
+| `view.dac_source` | signal source shown on the pinout tiles for a custom input: 0 none, 1 DAC1, 2 DAC2 |
+| `view.tooltips` | tooltips on (`true`) or off - the header checkbox |
+| `view.vref` | reference voltage in V: 4096 ADC counts = this voltage, the time chart's right axis and tooltip |
+| `view.collapsed` | titles of the tiles that are folded - written at once on every fold, without "save" |
+| `acquisition.mode` | `test` (DAC2 loopback: core 5, AN3 = RA8, the firmware's triangle) or `custom` |
+| `acquisition.ksps` | sample rate in kSPS; the board uses the nearest 160 MHz / N |
+| `acquisition.core`, `.pinsel`, `.samc` | the custom input: ADC core 1..5, PINSEL 0..15, sample time 0..31 |
+| `acquisition.interval_ms` | pause between two grabs in LIVE |
+| `trigger.on`, `.level`, `.slope`, `.hyst` | the time plot's trigger: on/off, level in ADC counts (2048), `rising`/`falling`, hysteresis in LSB (16) |
+| `buffer.size` | one ping-pong pair (`buf` = half of it), even, 32..the board's maximum (2048 since 01.10.2026) |
+| `dac.1`, `dac.2` | `on`, `low`, `high`, `slpdat` of each DAC's triangle (DAC tiles). A change goes to the board by itself 0.8 s after the last one. DAC2's `on` can also be `"auto"` (standard): with the test input, `auto` is the firmware's own triangle (slope chosen per rate), `true` the card's triangle on RA8, `false` DAC2 off - a quiet channel; the card's state is resent after every `stream on` |
+| `siggen` | the signal generator card: `on`, `dac`, `n`, `play_hz`, `f0`, `h2`..`h7`, `decay`, `amp`, `lo`, `hi`, `snap`, `force` (also in `tools/adc_gui_defaults.json`) |
+| `fake.source` | what the stand-in plays in `--fake`, on either input: `dac2` (the test input: what RA8 carries; standard), `sine` or `dac1`. Switching the input picks `dac2` (test) or `sine` (custom); it can be changed after |
+| `fake.*` | the sine's parameters: `signal_khz`, `amplitude`, `noise`, `harmonic2`, `harmonic3` |
+| `version` | settings format (3) |
+
+A browser front end for the console, for looking at what the triggered chain
+delivers. The back-to-back burst mode (`pll`/`snap`/`dump`/`blk`, the old sweep tile)
+is retired from this tool as of 25.09.2026 - decided: the triggered chain
+(`stream on`/`off`/`grab`, `chaintest.c`) is the only data path the GUI shows now. The
+firmware keeps the back-to-back commands for a terminal; the GUI simply no longer sends
+them.
+
+The **acquisition** card sets the rate in kSPS and the input: either the built-in test
+signal (core 5, PINSEL 3 = RA8, the firmware's own DAC2 triangle, `stream on <ksps>`) or
+a custom core/PINSEL/SAMC (`stream on <ksps> <core> <pinsel> <samc>`, the DAC left
+alone - switch a DAC on in its own card if it should drive that pin). **live** starts the
+chain if it is not already running at that rate/input (a change while live is picked up
+before the next grab) and then repeats `stream grab` at the interval shown - since
+01.10.2026 without stopping anything: the stream moves on to the other of the buffer's two
+ping-pong pairs, and the pair just completed (ping and pong, 2048 samples at the default)
+goes out as one binary frame while acquisition and processing carry on - plot the time signal and its spectrum (Hann window, dBFS, frequency axis from the
+frame's own actual rate), evaluate, repeat - until **stop**, which sends `stream off`
+and restores the boot configuration. **single** does the same for one grab: if the chain
+is not already streaming it starts it, grabs once, and stops it again; it is disabled
+while live is running. With the test signal, an additional card shows the triangle
+verdict (see below); with any other input that card is hidden, since there is nothing to
+judge against a model.
+
+**trigger** (in the same card) makes the time plot stand still, like an oscilloscope:
+with it ticked, each grab is shown from the first point where the signal crosses the
+**level** (ADC counts, a dashed line in the plot) on the chosen **edge**; the
+**hysteresis** (LSB) must first be exceeded on the other side, so noise on a slow slope
+does not fire early. The plot then shows a fixed window of half the grabbed samples,
+x[k..k+N/2), with the crossing searched only in the first half - always a contiguous
+piece of the signal, never the end joined to the start. The x axis starts at the
+interpolated crossing. A chip reads `trig @ k`, or `no trigger` when the level is not
+crossed; the plot then shows the untriggered start (auto mode). Display only: the
+firmware, the stream, the FFT and the triangle verdict are untouched and keep the whole
+half; a change takes effect with the next grab (`tools/trigger.py`).
+
+The **signal generator** card drives `siggen`: on/off, DAC 1 or 2, table size `n`, play
+rate, `f0`, the harmonic factors `h2`..`h7`, `decay`, `amp`, the output range `lo`/`hi`,
+`snap` and `force`, with the table's preview. The defaults are `tab_wave_gen.py`'s, with
+the range **800..3500** rather than the DAC's nominal 205..3890, because on the board the
+DAC did not follow below about code 780. A change goes out 0.8 s after the last one as
+one `siggen set` line per parameter, then `siggen on`. **loop preset** sets the loop
+DAC2 -> RA8 -> ADC core 5 (custom input, core 5 / PINSEL 3): 1 kHz plus h3 = 0.3. In the
+loop the time plot overlays the fitted table (also inside the trigger's window) and a
+**loop chip** reports rms, gain and start entry of the match, and the harmonic factors
+fitted in the time domain against the set ones (an FFT of one period has no bins for
+them). The model is `tools/wavegen_model.py`; `--fake` plays the table on the generator's
+pin. The test input (`stream on <ksps>` with the firmware's triangle) is refused while
+the generator plays on DAC2; switching the generator on while the test input streams
+sends `stream off` first.
+
+`decay` is the rate of the envelope exp(-decay x t), in 1/s, with t counted from the
+start of the table: the time constant is 1/decay, the amplitude is down to a fraction r
+after ln(1/r)/decay - so decay = ln(100)/T makes the pulse fall to 1 % in T (921 for
+5 ms). The table repeats every n / play rate, so a pulse needs a table clearly longer
+than its decay; `decay` 0 is a steady tone.
+
+A DAC card and the generator share the DAC: while the generator plays on a DAC, the GUI
+does not send that DAC's card by itself (a `dac` command would stop the generator -
+`siggen_release_dac()`); only switching the card to **on** replaces the generator with
+the triangle, and the generator card then says so. **loop preset** sets DAC2's card to
+**auto**. At start the card is filled from the settings file but nothing is sent to the
+board: **apply** (or any change in the card) starts the generator.
+
+Board limits from the last hardware run are shown as guidance under the rate field, not
+enforced: clean to about 8 MSPS with the CPU processing, occasional DMA overruns from
+about 10, lost triggers from about 16, the triggered chain measured up to about 18-20
+MSPS.
+
+Set-up once (a private Python environment in `tools\.venv`, nothing touches the system
+Python), then start - both scripts are in the repository root:
+
+```
+gui_setup.bat           creates tools\.venv, installs nicegui/pyserial/numpy, runs the self-test
+adc_gui.bat --fake      no board: a built-in stand-in with a synthetic signal, for trying the GUI
+adc_gui.bat --port COM7 the board's console port
+```
+
+Linux/macOS: `tools/gui_setup.sh`, then `tools/.venv/bin/python tools/adc_gui.py ...`.
+The page opens at http://127.0.0.1:8080. Every command goes through the console and
+waits for the parser's ACK/NAK byte, so the tool never talks over the board.
+
+### The triangle verdict
+
+Each grab's window is plotted and, when it carries the test signal (`slp > 0` in the
+`GRAB` frame), evaluated with `tri_eval` - the very function `chaintest.c`'s own chain
+test uses, ported once in `tools/eval_chain.py` and reused here rather than
+re-implemented, so a **PASS/FAIL** verdict here means the same thing it means in a
+`chain all` log: a lost or repeated sample shifts the triangle's turning points off the
+grid by a whole sample (`slip`), and that is what fails it. Chips show the turning-point
+count, the up/down slope lengths, the slope against the model computed from the frame's
+own `slp`/`dachz` fields (`chaintest.c`'s `triangle_for()`), and the actual rate plus the
+per-cycle `overrun`/`late`/`missed` counters, highlighted red when non-zero. Every
+control has a tooltip naming the console command it sends.
+
+Try it without a board first (`adc_gui.bat --fake`): the built-in stand-in answers
+`stream on/off` and builds a `GRAB` frame - `eval_chain.synth()`'s triangle for the test
+signal, a configured sine with harmonics and noise for any other input (so SNR/THD/
+harmonics show something meaningful) - so the whole cycle, including a PASS and a
+deliberately induced FAIL, can be seen without hardware. `python tools\adc_gui.py
+--selftest` exercises the same path headlessly: a grab refused before `stream on`, a
+clean triangle grab that passes the grid check with the actual rate used as the FFT's
+fs, the second grab landing in the other buffer half (`from > 0`), a lost-sample grab
+that correctly fails, a custom-input grab with `slp=0` and a real FFT peak, a corrupted
+frame caught by its CRC, a truncated frame caught by the frame parser, a target that
+never answers at all timing out rather than hanging, and the trigger (a sine of known
+phase, two stand-in grabs at different phases lining up, the hysteresis on a noisy
+slope, a level outside the signal, the triangle verdict unchanged). `tools/gui_ui_test.py` drives the
+page itself with a headless browser against `--fake` (see the header comment there for
+how to run it).
