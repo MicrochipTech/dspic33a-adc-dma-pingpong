@@ -349,8 +349,8 @@ you know the page.
 
 1. **documentation** - shows `docs/ARCHITECTURE.md` (block diagrams) in a dialog.
 2. **tooltips** - all tooltips on/off (saved with the settings).
-3. **port** - `fake` (the built-in stand-in), `remote` (a remote bench, see `README.md`
-   "Optional: remote bench"), or one of the PC's COM ports.
+3. **port** - `fake` (the built-in stand-in), `remote` (a remote bench: a relay drives the board,
+   see the header of `tools/remote.py`), or one of the PC's COM ports.
 4. **connect / disconnect** - opens or closes the connection. Disconnect stops a running
    stream first.
 5. **Status chip** - grey "not connected"; green with the firmware's version line, the
@@ -654,7 +654,7 @@ adc_gui.bat [options]
 | `--port COM7` | connect to this port at start |
 | `--fake` | connect to the built-in stand-in |
 | `--fake-board EV17P63A` | the stand-in reports the Curiosity Nano |
-| `--remote`, `--bench-client PATH` | connect through a remote bench (`README.md`, "Optional: remote bench") |
+| `--remote`, `--bench-client PATH` | connect through a remote bench (header of `tools/remote.py`) |
 | `--settings FILE` | settings file to read and save |
 | `--sigproc off\|lp\|hp\|bp\|user` | preselect the firmware filter (FilterDesign starts the GUI with `user`) |
 | `--http-port N` | page port (default 8080) |
