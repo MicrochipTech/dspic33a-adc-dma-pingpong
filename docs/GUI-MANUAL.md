@@ -8,6 +8,11 @@ open a page in your browser:
 | **dsPIC33 GUI** (`tools/adc_gui.py`) | `adc_gui.bat` | http://localhost:8080 | drive the board's console: stream the ADC, grab buffers, show time signal and spectrum, set the DACs, the signal generator and the firmware's filter |
 | **FilterDesign** (`tools/filterdesign/gui/app.py`) | `filterdesign.bat` | http://127.0.0.1:8090 | design an IIR filter, check it, generate C code, and put it into the firmware as the `user` filter: install, build, flash, then open the dsPIC33 GUI |
 
+**Demo video** (4 min, with narration): a filter is designed in FilterDesign, installed,
+built and flashed from its dsPIC33 tab, and measured on the board in the dsPIC33 GUI.
+
+https://github.com/user-attachments/assets/15efaf7b-7e51-49cd-bec7-51955e771a89
+
 This manual says how to operate them, task by task, with a picture of every card. The
 yellow numbers in a picture match the numbered list under it. Background on why things
 work the way they do is in `README.md` ("The GUI: capture, plot, FFT", "The triangle
