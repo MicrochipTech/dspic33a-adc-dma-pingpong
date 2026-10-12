@@ -1,5 +1,62 @@
 # dsPIC33AK512MPS512 on the dsPIC33 Curiosity Platform — ADC at 40 MSPS into RAM via DMA
 
+**In short.** A bare-metal example for the dsPIC33AK512MPS512 on the EV74H48A dsPIC33
+Curiosity Platform (and the EV17P63A Curiosity Nano): the ADC samples at a rate you choose,
+the DMA writes the samples into a ping-pong buffer in RAM, and the CPU processes each
+completed half - a filter, a tone detector - while the DMA fills the other one. A console on
+the board's USB-UART controls it. Two PC tools come with it: **FilterDesign** designs an IIR
+filter and puts it into the firmware (install, build, flash), and the **dsPIC33 GUI** streams
+from the board and shows the time signal, the spectrum and whether a sample was lost.
+
+**How to use the two tools, step by step, with a demo video:
+[docs/GUI-MANUAL.md](docs/GUI-MANUAL.md).**
+
+Where it stands: on the board the stream runs without loss up to about 8 MSPS with the CPU
+processing; DMA overruns appear from about 10 MSPS and lost triggers from about 16 MSPS.
+What holds and what is still open: [docs/ANALYSIS.md](docs/ANALYSIS.md); every board run:
+[docs/HARDWARE-LOG.md](docs/HARDWARE-LOG.md).
+
+## Contents
+
+- [What this example is](#what-this-example-is)
+- [Existing examples we looked at first](#existing-examples-we-looked-at-first)
+  - [What comes from where](#what-comes-from-where)
+- [Read this first](#read-this-first)
+- [Getting started](#getting-started)
+  - [The board](#the-board)
+  - [The other board: dsPIC33AK512MPS506 Curiosity Nano (EV17P63A)](#the-other-board-dspic33ak512mps506-curiosity-nano-ev17p63a)
+- [First run on hardware](#first-run-on-hardware)
+  - [Step 1 — the console answers](#step-1--the-console-answers)
+  - [Step 2 — run the parts of a test](#step-2--run-the-parts-of-a-test)
+  - [Step 3 — read the LED](#step-3--read-the-led)
+  - [If it does not work](#if-it-does-not-work)
+- [The chain test - one command, one board run](#the-chain-test---one-command-one-board-run)
+- [How it works](#how-it-works)
+  - [1. Clock tree](#1-clock-tree)
+  - [2. ADC — one core, one channel, bursts of 2048 conversions back-to-back](#2-adc--one-core-one-channel-bursts-of-2048-conversions-back-to-back)
+  - [3. DMA into one buffer with two halves](#3-dma-into-one-buffer-with-two-halves)
+  - [4. What the CPU does, and what to measure](#4-what-the-cpu-does-and-what-to-measure)
+- [Your own filter: from the design tool to the board](#your-own-filter-from-the-design-tool-to-the-board)
+- [The console](#the-console)
+  - [The parts of a test, and what each one proves](#the-parts-of-a-test-and-what-each-one-proves)
+  - [What a run looks like](#what-a-run-looks-like)
+  - [The DAC test measures inside the chip](#the-dac-test-measures-inside-the-chip)
+- [Which sample rates you can get](#which-sample-rates-you-can-get)
+- [The point of the whole thing](#the-point-of-the-whole-thing)
+- [What to measure](#what-to-measure)
+- [If the bandwidth is not enough](#if-the-bandwidth-is-not-enough)
+- [What this code does not do](#what-this-code-does-not-do)
+- [Errata](#errata)
+- [One trap worth knowing about](#one-trap-worth-knowing-about)
+- [In the MPLAB X simulator](#in-the-mplab-x-simulator)
+- [Files](#files)
+  - [The GUI: capture, plot, FFT (tools/adc_gui.py)](#the-gui-capture-plot-fft-toolsadc_guipy)
+  - [The triangle verdict](#the-triangle-verdict)
+  - [About tools/](#about-tools)
+- [License](#license)
+
+## What this example is
+
 A small, complete MPLAB X project showing **how to configure the device** so the
 ADC runs at its maximum rate and the DMA moves the samples into RAM — and **how to
 measure whether it really keeps up**. A command console on the board's USB-UART

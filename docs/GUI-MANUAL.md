@@ -5,13 +5,18 @@ open a page in your browser:
 
 | Tool | Start | Page | What it is for |
 |---|---|---|---|
-| **dsPIC33 GUI** (`tools/adc_gui.py`) | `adc_gui.bat` | http://localhost:8080 | drive the board's console: stream the ADC, grab buffers, show time signal and spectrum, set the DACs, the signal generator and the firmware's filter |
 | **FilterDesign** (`tools/filterdesign/gui/app.py`) | `filterdesign.bat` | http://127.0.0.1:8090 | design an IIR filter, check it, generate C code, and put it into the firmware as the `user` filter: install, build, flash, then open the dsPIC33 GUI |
+| **dsPIC33 GUI** (`tools/adc_gui.py`) | `adc_gui.bat` | http://localhost:8080 | drive the board's console: stream the ADC, grab buffers, show time signal and spectrum, set the DACs, the signal generator and the firmware's filter |
 
 **Demo video** (4 min, with narration): a filter is designed in FilterDesign, installed,
 built and flashed from its dsPIC33 tab, and measured on the board in the dsPIC33 GUI.
 
 https://github.com/user-attachments/assets/15efaf7b-7e51-49cd-bec7-51955e771a89
+
+The chapters follow the order of the work, as the video does: design a filter in
+FilterDesign and put it onto the board (chapter 2), then measure on the board with the
+dsPIC33 GUI (chapter 3). The dsPIC33 GUI also works on its own, with the built-in filters
+or none at all.
 
 This manual says how to operate them, task by task, with a picture of every card. The
 yellow numbers in a picture match the numbered list under it. Background on why things
@@ -26,17 +31,17 @@ A change to a card changes the generator's marker list and this manual's legend 
 Contents:
 
 1. [Installation](#1-installation)
-2. [dsPIC33 GUI](#2-dspic33-gui-adc_guipy)
-   - [Quick start without a board](#21-quick-start-without-a-board)
-   - [First measurement on the board](#22-first-measurement-on-the-board)
-   - [The page, card by card](#23-the-page-card-by-card)
-   - [Typical tasks](#24-typical-tasks)
-   - [Command line](#25-command-line)
-3. [FilterDesign](#3-filterdesign)
-   - [Quick start](#31-quick-start)
-   - [The page](#32-the-page)
-   - [Putting a filter onto the board (dsPIC33 tab)](#33-putting-a-filter-onto-the-board-dspic33-tab)
-   - [Command line](#34-command-line)
+2. [FilterDesign](#2-filterdesign)
+   - [Quick start](#21-quick-start)
+   - [The page](#22-the-page)
+   - [Putting a filter onto the board (dsPIC33 tab)](#23-putting-a-filter-onto-the-board-dspic33-tab)
+   - [Command line](#24-command-line)
+3. [dsPIC33 GUI](#3-dspic33-gui-adc_guipy)
+   - [Quick start without a board](#31-quick-start-without-a-board)
+   - [First measurement on the board](#32-first-measurement-on-the-board)
+   - [The page, card by card](#33-the-page-card-by-card)
+   - [Typical tasks](#34-typical-tasks)
+   - [Command line](#35-command-line)
 4. [When something goes wrong](#4-when-something-goes-wrong)
 
 ---
@@ -65,7 +70,220 @@ then `tools/.venv/bin/python tools/adc_gui.py ...`.
 
 ---
 
-## 2. dsPIC33 GUI (`adc_gui.py`)
+## 2. FilterDesign
+
+### 2.1 Quick start
+
+```
+filterdesign.bat
+```
+
+The page opens at http://127.0.0.1:8090 with the parameter set `presets/default.json`.
+On the very first design the tool compiles its design program `fdesign` with gcc (a few
+seconds); without gcc a red box says so.
+
+1. In **Specification** choose **Filter type** and **Characteristic**.
+2. Enter the **Sampling rate**, the band edges, the **Passband ripple** and the
+   **Stopband atten.** The filter order follows from these - there is no order field.
+3. Every change redesigns the filter after 0.3 s. The chip at the top right says
+   "specification met" (green), "check result" (amber) or "design failed" (red).
+4. Look at the **Magnitude** tab: the red shaded areas are the tolerance scheme, the curve
+   must stay out of them.
+
+Or simply load a ready-made set: **Parameter set** -> **Load from presets folder**, e.g.
+`dspic33_default_lowpass_200k` (the firmware's default user filter).
+
+### 2.2 The page
+
+The left panel holds the specification, the right panel the results in tabs.
+
+#### Header
+
+![FilterDesign header](gui/fd_header.png)
+
+1. **Light / dark mode**.
+2. **Status chip** - characteristic, type, order, and whether the specification is met.
+
+#### Parameter set
+
+![parameter set](gui/fd_paramset.png)
+
+Complete designs as JSON files in `tools/filterdesign/gui/presets/`.
+
+1. **Current file** - "• modified" behind it means unsaved changes; loading another set
+   then asks before discarding them.
+2. **Load from presets folder** (the button beside it rescans the folder).
+3. **Save** - overwrites the current file.
+4. **Save as** - asks for a name.
+5. **Load file** - loads any `.json` from disk without copying it into the folder.
+
+#### Specification
+
+![specification](gui/fd_spec.png)
+
+1. **Filter type** - Lowpass, Highpass, Bandpass, Bandstop.
+2. **Characteristic** - Butterworth (flat, widest transition), Chebyshev type I (ripple
+   in the pass band, steeper), Elliptic/Cauer (ripple in both bands, steepest for a given
+   order).
+3. **Sampling rate**, Hz.
+4. **Band edges**, Hz - two (low/high-pass) or four (band-pass/-stop), always in
+   ascending frequency order; the labels say which edge is which.
+5. **Passband ripple**, dB - how much the pass band may vary.
+6. **Stopband atten.**, dB - how far the stop band must be down.
+
+#### Implementation
+
+![implementation](gui/fd_impl.png)
+
+How the filter is computed in C.
+
+1. **Arithmetic** - float (32 bit), double (64 bit), fixed point 32 bit, fixed point
+   16 bit, float (32 bit, dsPIC33A assembler).
+2. **Section scaling** - scales each biquad section to 0 dB at every node. Keep it on for
+   fixed point, otherwise high-order filters overflow.
+3. **Output gain**, dB - folded into the last section at no cost. Above 0 dB the output
+   clips at 0/4095 for large signals. The plots are shown without it.
+4. **Auto Q** and
+5. **Fractional bits** - fixed point only: the Q format of the coefficients, normally
+   chosen automatically.
+6. **C name** - prefix of the generated functions (`<name>_init`, `<name>_process`,
+   `<name>_process_block`) and of the downloaded files.
+
+#### Summary
+
+![summary](gui/fd_summary.png)
+
+1. **Order** - digital order and number of biquad sections.
+2. **Passband atten.** and
+3. **Stopband atten.** - achieved, with the limit from the specification in brackets.
+   Also in the summary: largest pole radius, settling time, group delay.
+4. **Coefficient format** (fixed point) - Q format and integer type; "CLIPPED!" when a
+   coefficient does not fit. Beside it the impulse test's saturations.
+5. **Impl. passband / stopband** - the same figures for the quantized implementation.
+
+A red or amber warning below the summary says when the fixed-point version overflows or
+misses the specification.
+
+#### Magnitude tab
+
+![magnitude](gui/fd_tab_magnitude.png)
+
+1. **dB / linear** magnitude.
+2. **linear f / log f** frequency axis.
+3. **Tolerance scheme** - shades the forbidden areas red; the curve must stay out of them.
+4. **Implemented (quantized)** - draws the response with the chosen arithmetic (dashed)
+   over the ideal design.
+5. **Plot** - zoom with the mouse wheel or the box tool (top right), restore, save as
+   image. The same holds for every plot in this tool.
+
+**Phase**, **Group delay** and **Impulse / step** look alike: one toggle (wrapped /
+unwrapped, samples / ms, impulse / step) and the plot.
+
+#### Pole / zero tab
+
+![pole zero](gui/fd_tab_polezero.png)
+
+1. **z plane** - poles (x) and zeros (o) with the unit circle. Poles close to the circle
+   mean a sharp filter and a long settling time.
+2. **Lists** of poles and zeros with radius, frequency and multiplicity.
+
+#### Sections tab
+
+![sections](gui/fd_tab_sections.png)
+
+1. **Q format and scaling** in words, with the headroom needed.
+2. **Coefficients** b0..b2, a1, a2 of each biquad section (integers for fixed point),
+   pole radius, frequency and Q, peak gain and L1 norm at each section's output.
+
+#### C code tab
+
+![C code](gui/fd_tab_ccode.png)
+
+1. **Download .h** and
+2. **Download .c** (**.s** for the assembler) - the generated files, into the browser's
+   download folder. Both are shown below the buttons.
+
+#### C test tab
+
+![C test](gui/fd_tab_ctest.png)
+
+Compiles the generated code on the PC and compares it with a double-precision reference.
+
+1. **Implementations** - which arithmetic variants to test (the assembler cannot run on
+   the PC).
+2. **Signal** - impulse, step, sine, chirp, white noise, multitone (sine/chirp/multitone
+   add the frequency fields f1/f2).
+3. **Amplitude**, in full scale.
+4. **Samples**.
+5. **C compiler** - default `gcc` (or `CC`).
+6. **Compile & run**.
+7. **Test bench (.zip)** - the filter, a test program, input and expected output and a
+   Makefile for the arithmetic chosen in Implementation: `make test` prints PASS or FAIL
+   on any machine with gcc.
+8. **Result line** - what was tested; it says so when the design changed since.
+9. **Result table** - per implementation: built, test bench PASS/FAIL, bit-exact against
+   the model, format, saturations, error against the reference, SNR, measured pass band
+   and stop band.
+10. **View** - output, error, measured magnitude, deviation from the design. Click a
+    legend entry to hide or show a curve.
+
+### 2.3 Putting a filter onto the board (dsPIC33 tab)
+
+The firmware has a slot for one designed filter, `sigproc user` (`src/core/user_filter.h`).
+The dsPIC33 tab fills it and gets it running.
+
+![dsPIC33 tab](gui/fd_tab_dspic33.png)
+
+1. **Sample rate check** - the rate must be a whole number of kHz (1 kHz .. 40 MHz): the
+   board streams at whole kSPS. The filter is valid only at that rate.
+2. **CPU budget check** - cycles per sample at this rate against the filter's cost.
+   Below 60 cycles the install is refused; above about 8 MSPS the stream itself loses
+   samples. A red line in **Checks** blocks the install; an amber "misses the
+   specification" is only a warning.
+3. **Installed in the firmware** - what `src/core/user_filter.json` holds now, and
+   whether it is this design ("not this design" in the picture: another filter is
+   installed).
+4. **Board** - EV74H48A (flashed through the on-board PKOB4 with `ipecmd`) or EV17P63A
+   Curiosity Nano (flashed by copying the .hex onto its USB drive).
+5. **Progress** - installed / built / flashed, ticked for the current design.
+6. **1 Install into firmware** - writes `src/core/user_filter.h` and `.json`.
+7. **2 Build** - runs `tools\build.bat` (or `build.bat nano`), about 20 s.
+8. **3 Flash** - programs the board, 20 to 40 s. **Do not unplug the board or close the
+   page meanwhile.** Close MPLAB X's project first if it holds the programmer.
+9. **1-3 in one go** - all three, stops at the first failure.
+10. **4 Open dsPIC33 GUI** - starts `adc_gui.py` in its own window with the `user` filter
+    preselected.
+11. **COM port** for it (empty: choose in the GUI),
+12. **HTTP port** for it (default 8080), and
+13. **fake target (no board)** - start it against the stand-in.
+
+The log below the buttons shows the output of every step, newest on top.
+
+**In the dsPIC33 GUI** (chapter 3): signal processing card -> **user filter** -> **use
+its rate** -> **filter on**, then **live**; or press **noise test** to measure the
+response against the design (section 3.4).
+
+**Back to the default filter.** Installing changes two files tracked in git. To restore
+the default (elliptic low-pass, 200 kSPS, 15/25 kHz):
+
+```
+python tools\filterdesign\gui\firmware.py --default
+```
+
+then build and flash again. Or load the preset `dspic33_default_lowpass_200k` and run
+steps 1-3.
+
+### 2.4 Command line
+
+```
+filterdesign.bat [--port 8090] [--host 0.0.0.0] [--no-browser] [--light] [--presets DIR]
+```
+
+`?tab=<name>` in the URL opens a tab directly (e.g. `?tab=ctest`, `?tab=dspic33`).
+
+---
+
+## 3. dsPIC33 GUI (`adc_gui.py`)
 
 The GUI talks to the firmware's console over the board's virtual COM port (115200 baud).
 Every command waits for the firmware's acknowledgement before the next one goes out, so
@@ -75,7 +293,7 @@ the GUI and the board never talk over each other. You can watch the traffic in t
 The page has a header, a narrow left column with the settings (what the board does) and a
 wide right column with the results (what came back).
 
-### 2.1 Quick start without a board
+### 3.1 Quick start without a board
 
 ```
 adc_gui.bat --fake
@@ -96,7 +314,7 @@ chip turns green. Then:
 
 `--fake --fake-board EV17P63A` makes the stand-in report the Curiosity Nano instead.
 
-### 2.2 First measurement on the board
+### 3.2 First measurement on the board
 
 1. Flash the firmware (`tools\build.bat`, then MPLAB X/IPE, or from FilterDesign's
    dsPIC33 tab). Plug in the board's USB. On the EV74H48A the console is the MCP2221A's
@@ -119,7 +337,7 @@ chip turns green. Then:
 7. Press **stop** before you unplug, or press **disconnect**: the GUI stops the stream
    (`stream off`) and closes the port.
 
-### 2.3 The page, card by card
+### 3.3 The page, card by card
 
 Clicking a card's title folds it away (▸) or opens it again (▾). The folded cards are
 remembered at once. The **tooltips** checkbox in the header turns all tooltips off once
@@ -202,7 +420,7 @@ The filter that runs in the firmware on every buffer half, and a tone detector.
    tree holds (build and flash).
 6. **use its rate** - sets the stream rate to the user filter's design rate.
 7. **noise test** - measures the user filter's frequency response on the board (see
-   2.4 and the **filter response** card).
+   3.4 and the **filter response** card).
 8. **Goertzel chip** - frequency, amplitude and share of the signal at fs/16; green
    "DETECTED" or grey "not detected".
 
@@ -393,7 +611,7 @@ The board card shows the same on the evaluation board, with the connector pad to
 Every line sent to and received from the board, with time stamps (last 1000 lines). The
 first place to look when something does not do what you expect.
 
-### 2.4 Typical tasks
+### 3.4 Typical tasks
 
 **Measure an external signal.** Set **input** to **custom input**, pick **core** and
 **PINSEL** so that the info line (and the board card) show the pin you wired to. Keep the
@@ -425,7 +643,7 @@ show the same by hand. Above 500 kSPS the generator cannot play the noise fast e
 **Keep a configuration.** **save** (personal default for the next start) or **save as**
 (a named file; load it again with setup -> **from a file ...** or `--settings <file>`).
 
-### 2.5 Command line
+### 3.5 Command line
 
 ```
 adc_gui.bat [options]
@@ -442,219 +660,6 @@ adc_gui.bat [options]
 | `--http-port N` | page port (default 8080) |
 | `--no-browser` | do not open a browser window |
 | `--selftest` | no page: run the stand-in through a cycle and print PASS/FAIL |
-
----
-
-## 3. FilterDesign
-
-### 3.1 Quick start
-
-```
-filterdesign.bat
-```
-
-The page opens at http://127.0.0.1:8090 with the parameter set `presets/default.json`.
-On the very first design the tool compiles its design program `fdesign` with gcc (a few
-seconds); without gcc a red box says so.
-
-1. In **Specification** choose **Filter type** and **Characteristic**.
-2. Enter the **Sampling rate**, the band edges, the **Passband ripple** and the
-   **Stopband atten.** The filter order follows from these - there is no order field.
-3. Every change redesigns the filter after 0.3 s. The chip at the top right says
-   "specification met" (green), "check result" (amber) or "design failed" (red).
-4. Look at the **Magnitude** tab: the red shaded areas are the tolerance scheme, the curve
-   must stay out of them.
-
-Or simply load a ready-made set: **Parameter set** -> **Load from presets folder**, e.g.
-`dspic33_default_lowpass_200k` (the firmware's default user filter).
-
-### 3.2 The page
-
-The left panel holds the specification, the right panel the results in tabs.
-
-#### Header
-
-![FilterDesign header](gui/fd_header.png)
-
-1. **Light / dark mode**.
-2. **Status chip** - characteristic, type, order, and whether the specification is met.
-
-#### Parameter set
-
-![parameter set](gui/fd_paramset.png)
-
-Complete designs as JSON files in `tools/filterdesign/gui/presets/`.
-
-1. **Current file** - "• modified" behind it means unsaved changes; loading another set
-   then asks before discarding them.
-2. **Load from presets folder** (the button beside it rescans the folder).
-3. **Save** - overwrites the current file.
-4. **Save as** - asks for a name.
-5. **Load file** - loads any `.json` from disk without copying it into the folder.
-
-#### Specification
-
-![specification](gui/fd_spec.png)
-
-1. **Filter type** - Lowpass, Highpass, Bandpass, Bandstop.
-2. **Characteristic** - Butterworth (flat, widest transition), Chebyshev type I (ripple
-   in the pass band, steeper), Elliptic/Cauer (ripple in both bands, steepest for a given
-   order).
-3. **Sampling rate**, Hz.
-4. **Band edges**, Hz - two (low/high-pass) or four (band-pass/-stop), always in
-   ascending frequency order; the labels say which edge is which.
-5. **Passband ripple**, dB - how much the pass band may vary.
-6. **Stopband atten.**, dB - how far the stop band must be down.
-
-#### Implementation
-
-![implementation](gui/fd_impl.png)
-
-How the filter is computed in C.
-
-1. **Arithmetic** - float (32 bit), double (64 bit), fixed point 32 bit, fixed point
-   16 bit, float (32 bit, dsPIC33A assembler).
-2. **Section scaling** - scales each biquad section to 0 dB at every node. Keep it on for
-   fixed point, otherwise high-order filters overflow.
-3. **Output gain**, dB - folded into the last section at no cost. Above 0 dB the output
-   clips at 0/4095 for large signals. The plots are shown without it.
-4. **Auto Q** and
-5. **Fractional bits** - fixed point only: the Q format of the coefficients, normally
-   chosen automatically.
-6. **C name** - prefix of the generated functions (`<name>_init`, `<name>_process`,
-   `<name>_process_block`) and of the downloaded files.
-
-#### Summary
-
-![summary](gui/fd_summary.png)
-
-1. **Order** - digital order and number of biquad sections.
-2. **Passband atten.** and
-3. **Stopband atten.** - achieved, with the limit from the specification in brackets.
-   Also in the summary: largest pole radius, settling time, group delay.
-4. **Coefficient format** (fixed point) - Q format and integer type; "CLIPPED!" when a
-   coefficient does not fit. Beside it the impulse test's saturations.
-5. **Impl. passband / stopband** - the same figures for the quantized implementation.
-
-A red or amber warning below the summary says when the fixed-point version overflows or
-misses the specification.
-
-#### Magnitude tab
-
-![magnitude](gui/fd_tab_magnitude.png)
-
-1. **dB / linear** magnitude.
-2. **linear f / log f** frequency axis.
-3. **Tolerance scheme** - shades the forbidden areas red; the curve must stay out of them.
-4. **Implemented (quantized)** - draws the response with the chosen arithmetic (dashed)
-   over the ideal design.
-5. **Plot** - zoom with the mouse wheel or the box tool (top right), restore, save as
-   image. The same holds for every plot in this tool.
-
-**Phase**, **Group delay** and **Impulse / step** look alike: one toggle (wrapped /
-unwrapped, samples / ms, impulse / step) and the plot.
-
-#### Pole / zero tab
-
-![pole zero](gui/fd_tab_polezero.png)
-
-1. **z plane** - poles (x) and zeros (o) with the unit circle. Poles close to the circle
-   mean a sharp filter and a long settling time.
-2. **Lists** of poles and zeros with radius, frequency and multiplicity.
-
-#### Sections tab
-
-![sections](gui/fd_tab_sections.png)
-
-1. **Q format and scaling** in words, with the headroom needed.
-2. **Coefficients** b0..b2, a1, a2 of each biquad section (integers for fixed point),
-   pole radius, frequency and Q, peak gain and L1 norm at each section's output.
-
-#### C code tab
-
-![C code](gui/fd_tab_ccode.png)
-
-1. **Download .h** and
-2. **Download .c** (**.s** for the assembler) - the generated files, into the browser's
-   download folder. Both are shown below the buttons.
-
-#### C test tab
-
-![C test](gui/fd_tab_ctest.png)
-
-Compiles the generated code on the PC and compares it with a double-precision reference.
-
-1. **Implementations** - which arithmetic variants to test (the assembler cannot run on
-   the PC).
-2. **Signal** - impulse, step, sine, chirp, white noise, multitone (sine/chirp/multitone
-   add the frequency fields f1/f2).
-3. **Amplitude**, in full scale.
-4. **Samples**.
-5. **C compiler** - default `gcc` (or `CC`).
-6. **Compile & run**.
-7. **Test bench (.zip)** - the filter, a test program, input and expected output and a
-   Makefile for the arithmetic chosen in Implementation: `make test` prints PASS or FAIL
-   on any machine with gcc.
-8. **Result line** - what was tested; it says so when the design changed since.
-9. **Result table** - per implementation: built, test bench PASS/FAIL, bit-exact against
-   the model, format, saturations, error against the reference, SNR, measured pass band
-   and stop band.
-10. **View** - output, error, measured magnitude, deviation from the design. Click a
-    legend entry to hide or show a curve.
-
-### 3.3 Putting a filter onto the board (dsPIC33 tab)
-
-The firmware has a slot for one designed filter, `sigproc user` (`src/core/user_filter.h`).
-The dsPIC33 tab fills it and gets it running.
-
-![dsPIC33 tab](gui/fd_tab_dspic33.png)
-
-1. **Sample rate check** - the rate must be a whole number of kHz (1 kHz .. 40 MHz): the
-   board streams at whole kSPS. The filter is valid only at that rate.
-2. **CPU budget check** - cycles per sample at this rate against the filter's cost.
-   Below 60 cycles the install is refused; above about 8 MSPS the stream itself loses
-   samples. A red line in **Checks** blocks the install; an amber "misses the
-   specification" is only a warning.
-3. **Installed in the firmware** - what `src/core/user_filter.json` holds now, and
-   whether it is this design ("not this design" in the picture: another filter is
-   installed).
-4. **Board** - EV74H48A (flashed through the on-board PKOB4 with `ipecmd`) or EV17P63A
-   Curiosity Nano (flashed by copying the .hex onto its USB drive).
-5. **Progress** - installed / built / flashed, ticked for the current design.
-6. **1 Install into firmware** - writes `src/core/user_filter.h` and `.json`.
-7. **2 Build** - runs `tools\build.bat` (or `build.bat nano`), about 20 s.
-8. **3 Flash** - programs the board, 20 to 40 s. **Do not unplug the board or close the
-   page meanwhile.** Close MPLAB X's project first if it holds the programmer.
-9. **1-3 in one go** - all three, stops at the first failure.
-10. **4 Open dsPIC33 GUI** - starts `adc_gui.py` in its own window with the `user` filter
-    preselected.
-11. **COM port** for it (empty: choose in the GUI),
-12. **HTTP port** for it (default 8080), and
-13. **fake target (no board)** - start it against the stand-in.
-
-The log below the buttons shows the output of every step, newest on top.
-
-**In the dsPIC33 GUI:** signal processing card -> **user filter** -> **use its rate** ->
-**filter on**, then **live**; or press **noise test** to measure the response against
-the design (section 2.4).
-
-**Back to the default filter.** Installing changes two files tracked in git. To restore
-the default (elliptic low-pass, 200 kSPS, 15/25 kHz):
-
-```
-python tools\filterdesign\gui\firmware.py --default
-```
-
-then build and flash again. Or load the preset `dspic33_default_lowpass_200k` and run
-steps 1-3.
-
-### 3.4 Command line
-
-```
-filterdesign.bat [--port 8090] [--host 0.0.0.0] [--no-browser] [--light] [--presets DIR]
-```
-
-`?tab=<name>` in the URL opens a tab directly (e.g. `?tab=ctest`, `?tab=dspic33`).
 
 ---
 
