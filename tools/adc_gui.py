@@ -3004,10 +3004,33 @@ def main_gui(args):
                     ui.space()
                     # 03.10.2026: a noise input's spectrum scatters by several dB per
                     # bin; averaged over grabs it shows the filter's response
-                    fft_avg_cb = ui.checkbox("average", value=False).props("dense")
+                    # 13.10.2026: the dB axis fitted to the plotted spectrum (10 dB steps)
+                    # instead of the fixed -100..0 dBFS
+                    fft_auto_cb = ui.checkbox("autoscale", value=False).props("dense")
+                    fft_avg_cb = ui.checkbox("average", value=False).props("dense").classes("ml-4")
                     fft_avg_n = ui.number("grabs", value=16, min=2, max=256, step=1,
                                           format="%d").props("dense outlined").classes("w-20")
                 fft_chart = chart("", "kHz", "dBFS", -100, 0, ACCENT2)
+
+                def fft_yscale():
+                    """-100..0 dBFS, or with autoscale the plotted data's range
+                    rounded out to 10 dB, at least 20 dB tall."""
+                    y = fft_chart.options["yAxis"]
+                    data = [d for _, d in fft_chart.options["series"][0]["data"] if np.isfinite(d)]
+                    if fft_auto_cb.value and data:
+                        lo = 10.0 * np.floor(min(data) / 10.0)
+                        hi = 10.0 * np.ceil(max(data) / 10.0)
+                        if hi - lo < 20.0:
+                            lo = hi - 20.0
+                        y["min"], y["max"] = float(lo), float(hi)
+                    else:
+                        y["min"], y["max"] = -100, 0
+
+                def fft_auto_changed():
+                    fft_yscale()
+                    fft_chart.update()
+
+                fft_auto_cb.on_value_change(lambda _: fft_auto_changed())
             # 03.10.2026: the user filter's noise test - measured against design
             with ui.card().classes("tile w-full rounded-xl p-2") as resp_card:
                 ui.label("filter response · noise test (with / without the filter)").classes("card-title px-2 pt-1")
@@ -3229,6 +3252,8 @@ def main_gui(args):
                       "fundamental. With f0 = 0 the table is noise alone - into a filter, with the "
                       "FFT averaged, it shows the filter's frequency response (setup 'noise ...', or "
                       "'noise test' at the user filter)."),
+        (fft_auto_cb, "Fit the dB axis to the spectrum shown (rounded out to 10 dB, at least 20 dB); "
+                      "off: the fixed -100..0 dBFS."),
         (fft_avg_cb, "Average the spectrum's power over the last N grabs (rate, length and processing "
                      "unchanged; a change starts over). For noise: one grab scatters by several dB "
                      "per bin, 16 grabs about +-1 dB."),
@@ -4287,7 +4312,7 @@ def main_gui(args):
                                           info, fs_meas)
         resp_chart.options["series"][0]["data"] = [[float(x) / 1e3, round(float(v), 2)] for x, v in zip(f, meas)]
         resp_chart.options["series"][1]["data"] = [[float(x) / 1e3, round(float(v), 2)] for x, v in zip(f, design)]
-        resp_chart.options["xAxis"][0]["max"] = float(f[-1]) / 1e3
+        resp_chart.options["xAxis"][0]["max"] = round(float(f[-1]) / 1e3, 6)
         resp_chart.update()
         fmt = (lambda v, u="dB": "-" if v is None else f"{v:.2f} {u}")
         resp_lbl.text = (f"{info['description']}, {ksps} kSPS, {len(off)} + {len(on)} grabs, "
@@ -4526,7 +4551,9 @@ def main_gui(args):
             sig_src_lbl.text = (f"source: {src_txt}   |   grab {state['cycles']}: "
                                 f"min {int(np.min(samples))}  max {int(np.max(samples))}")
             fft_chart.options["series"][0]["data"] = [[float(fx) / 1e3, float(d)] for fx, d in zip(f, db)]
-            fft_chart.options["xAxis"][0]["max"] = float(f[-1]) / 1e3 if len(f) else 1
+            # rounded: fs/2 from ksps * 1e3 / 2 came out as 99.99999999999999 on the axis
+            fft_chart.options["xAxis"][0]["max"] = round(float(f[-1]) / 1e3, 6) if len(f) else 1
+            fft_yscale()
             # the signal processing's frequencies (sigproc.c): the filter's
             # fs/8, the Goertzel's fs/16 - emptied, not removed, when off
             gzm = meta.get("gz")

@@ -246,7 +246,7 @@ def adc_gui(p):
                                                       ("field", "amplitude"), ("field", "noise"),
                                                       ("field", "2nd"), ("field", "3rd")], "adc_fake")
         sp = card(page, "spectrum")
-        shot(page, sp, [("cb", "average"), ("field", "grabs"), ("chart", None)], "adc_spectrum")
+        shot(page, sp, [("cb", "autoscale"), ("cb", "average"), ("field", "grabs"), ("chart", None)], "adc_spectrum")
         shot(page, card(page, "signal evaluation"), [
             ("chip", "fundamental"), ("chip", "level"), ("chip", "noise floor"), ("chip", "SNR"),
             ("chip", "THD"), ("chip", "H2")], "adc_evaluation")

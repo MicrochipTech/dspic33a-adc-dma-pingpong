@@ -542,10 +542,12 @@ and the **loop** chip above the card says how well they match:
 
 ![spectrum](gui/adc_spectrum.png)
 
-1. **average** - averages the power of the last N grabs (for noise and small lines); it
+1. **autoscale** - fits the dB axis to the spectrum shown (rounded out to 10 dB, at least
+   20 dB tall); off, the axis is the fixed -100..0 dBFS.
+2. **average** - averages the power of the last N grabs (for noise and small lines); it
    starts over when the rate, length or filter changes.
-2. **grabs** - N.
-3. **Plot** - FFT of the grab in dBFS (0 dB = full scale). Dashed lines mark fs/8 (corner
+3. **grabs** - N.
+4. **Plot** - FFT of the grab in dBFS (0 dB = full scale). Dashed lines mark fs/8 (corner
    of the built-in filters) and fs/16 (Goertzel) when they are on.
 
 #### filter response · noise test
