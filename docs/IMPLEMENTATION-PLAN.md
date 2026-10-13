@@ -108,6 +108,10 @@ not counted.
 | SG.7 GUI tests | done | this commit | Opus | selftest + Playwright |
 | SG.8 Board run | open | | | fallback TMR2, then timer ISR ("A2 not met") |
 | SG.9 Documentation | done | this commit | Sonnet agent | CLAUDE.md, architecture, DESIGN 4.2 corrected |
+| ADCP.1 Sample time and ADC clock shown | open | | | GUI only |
+| ADCP.2 Calibration warning chip | open | | | firmware: one `status` line; reply-format rule |
+| ADCP.3 Oversampling (MODE 3, ACCNUM) | open | | | firmware + GUI + board run |
+| ADCP.4 Differential input (DIFF, NINSEL) | open | | | driver + GUI + board run; last |
 
 ### Decisions taken during the work
 
@@ -1208,6 +1212,61 @@ own. Open from that run, not CORE's: the generator loop's grabs where DAC2 stand
 Not done: a board run of the core build (`example_main.c`'s box stays
 grey until one is made or it is marked by hand).
 
+## ADCP: further ADC parameters in the GUI
+
+Added 13.10.2026, from a review of `src/drivers/adc.c` against the acquisition card. The
+GUI already sets the rate, the core (`core (1..5)`), PINSEL and SAMC. Of the channel's
+remaining fields, four are worth bringing out; the cards are sorted by cost, the first
+two need no board.
+
+**Deliberately not in the GUI:** IRQSEL, TRG1SRC/TRG2SRC and the CLKGEN6 divider (`clk`).
+They belong to the trigger chain (SCCP1 -> ADC -> DMA pair); set wrongly they stop the
+stream, and the divider is the rate path CLAUDE.md says not to build on.
+
+### ADCP.1 Sample time and ADC clock shown (GUI only)
+
+- Under the SAMC field: the sample time `(2*SAMC + 0.5) * TAD` in ns, with TAD from the
+  ADC clock that `status` already reports (`adc clock Hz`, cli.c); the GUI parses that
+  line in `tools/protocol.py`.
+- A hint when the sample time does not fit into one trigger period at the chosen rate.
+  The rule (sample + conversion time against 1/fs) is taken from DS70005591D section 16
+  and the page goes into the code comment; until then the hint says "unchecked".
+- `adc_gui.py --selftest`: the formula against a few hand-computed values; FakeTarget
+  reports an `adc clock Hz` like the board.
+
+### ADCP.2 Calibration warning chip
+
+- `adc_cal_bits()` (ACALEN, CALREQ, CALRATE of ADnCON, 16.4.13 p1326) must be 0 for the
+  triggered chain: a periodic calibration between two triggers could delay the next one.
+  Firmware: one more `status` line (`adc cal bits`), no new command. The GUI shows a
+  warning chip when it is not 0.
+- A change to `status`'s reply: `tools/protocol.py`, `tools/eval_chain.py`, the GUI and the
+  smoke `expected*.log` (`--update-expected`, on purpose) in the same commit.
+
+### ADCP.3 Oversampling (MODE 3, ACCNUM)
+
+- `adc_set_mode_oversample()` exists but is used only by the variant matrix. Brought out
+  as a sub-command (`stream on ... ` parameter or `stream ovs <accnum>`; no new top-level
+  command, the parser has 32 slots).
+- Open question that decides the card's worth: whether, in the SCCP1-triggered stream,
+  the DMA sees only every ACCNUM-th event (adc.c's comment on `adc_set_mode_oversample()`
+  says it is unmeasured). The firmware reports what it set; the board run measures the
+  sample rate actually reaching RAM (`load=`, frame count) at ACCNUM 0..3.
+- GUI: an "oversampling" select; the result is wider than 12 bits - the y axis, the
+  dBFS reference (4096) and the triangle evaluation scale with it, or the firmware shifts
+  it back to 12 bits (decide in the card, say which).
+- Trace scenario for the register writes; [SMOKE]; board run with a HARDWARE-LOG entry.
+
+### ADCP.4 Differential input (DIFF, NINSEL)
+
+- `adc_init()` fixes `NINSEL = 0` (AVSS) and `DIFF = 0`. A differential input needs the
+  driver (a parameter of `adc_set_input()`), the routing check (which NINSEL pairs a core
+  has - the GUI's `Package` model knows positive inputs only, the ADnANNm pins are
+  still to add), signed results
+  through the DMA and the whole GUI chain (axes, dBFS, triangle check, trigger level).
+- The largest of the four; only once a customer needs it. Board run with a
+  HARDWARE-LOG entry.
+
 ## Order and dependencies
 
 ```
@@ -1229,6 +1288,8 @@ P0 ──► P1 ──► P2 ──► P3
 - **SG**: SG.0 first (docs only). SG.1/SG.2 in parallel, then SG.3-SG.5. SG.6/SG.7 can
   start after SG.4's command syntax is fixed, against `FakeTarget`. SG.8 goes into a B
   image after DBG's, SG.9 with each card and closed at the end.
+- **ADCP**: ADCP.1 any time (`tools/` only). ADCP.2 and ADCP.3 change firmware and go into
+  the next board-run image; ADCP.4 last, on demand.
 - The only real risk of changing timing lies in P8.1 (DMA ISR), now in N+2. It is checked with
   `fncmp` (no indirect call, instruction count recorded), but only a board run can
   confirm it.
