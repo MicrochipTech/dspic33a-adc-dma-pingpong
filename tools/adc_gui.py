@@ -1846,8 +1846,30 @@ def analyze_spectrum(f: np.ndarray, db: np.ndarray, n_harmonics: int = 5, exclud
     noise_db = float(np.median(db[mask])) if mask.any() else float(db.min())
     fund_power = 10 ** (fund_db / 10.0)
     thd_pct = 100.0 * math.sqrt(harmonic_power / fund_power) if fund_power > 0 else float("nan")
+    # the noise integrated over the band (14.10.2026): mean power of the bins
+    # left in the mask, times the n-1 bins of the band, back from spectrum()'s
+    # amplitude scale (2/sum(w)) to a variance by Parseval - for Hann
+    # sigma^2 = sum(a^2)/3. Referred to a full-scale sine (2048 counts peak):
+    # SNR_FS and ENOB = (SNR_FS - 1.76)/6.02. Without a signal at the input
+    # the fundamental is only the highest noise bin; masking it costs nothing.
+    # Its own, wider mask: a tone between two bins leaks through the Hann
+    # window's skirt (amplitude ~1/k^3) far past +-2 bins - a full-scale tone
+    # adds ~2 counts^2 beyond 8 bins, ~0.1 beyond 16 (n = 513 bins).
+    nmask = np.ones(n, dtype=bool)
+    nmask[:exclude_bins] = False
+    for b, half in [(fund_bin, max(exclude_bins, n // 32))] + \
+                   [(int(round(h["freq"] / df)), max(exclude_bins, n // 64)) for h in harmonics]:
+        nmask[max(0, b - half):b + half + 1] = False
+    if not nmask.any():
+        nmask = mask
+    nfft = 2 * (n - 1)
+    w = np.hanning(nfft)
+    a2 = (2048.0 * 10.0 ** (db / 20.0)) ** 2
+    var = float(np.mean(a2[nmask])) * (n - 1) * w.sum() ** 2 / (2.0 * nfft * np.sum(w * w))
+    snr_fs_db = 10.0 * math.log10(2048.0 ** 2 / 2.0 / var) if var > 0 else float("inf")
     return dict(fund_freq=fund_freq, fund_db=fund_db, noise_db=noise_db,
-                snr_db=fund_db - noise_db, thd_pct=thd_pct, harmonics=harmonics)
+                snr_db=fund_db - noise_db, thd_pct=thd_pct, harmonics=harmonics,
+                noise_rms=math.sqrt(var), snr_fs_db=snr_fs_db, enob=(snr_fs_db - 1.76) / 6.02)
 
 
 def selftest() -> int:
@@ -2102,6 +2124,17 @@ def selftest() -> int:
     ok_all &= ok_peak
     print(f"grab (custom input) FFT peak {metrics.get('fund_freq', 0)/1e3:.1f} kHz (expect 250.0) ->",
           "PASS" if ok_peak else "FAIL")
+    # the integrated noise (14.10.2026): a sine plus 2.4 counts of white noise,
+    # rounded, must come back as sqrt(2.4^2 + 1/12) - with the tone and alone
+    rng = np.random.default_rng(1)
+    sig = 1000 * np.sin(2 * np.pi * 37.3 * tn / 1024)
+    exp_rms = math.sqrt(2.4 ** 2 + 1 / 12)
+    nm = [analyze_spectrum(*spectrum(np.round(2048 + a * sig + rng.normal(0, 2.4, 1024)), 200e3))
+          for a in (1, 0)]
+    ok_noise = all(abs(m["noise_rms"] / exp_rms - 1) < 0.1 for m in nm)
+    ok_all &= ok_noise
+    print(f"integrated noise: {nm[0]['noise_rms']:.2f} / {nm[1]['noise_rms']:.2f} counts with tone / alone "
+          f"(expect {exp_rms:.2f}), ENOB {nm[1]['enob']:.2f} ->", "PASS" if ok_noise else "FAIL")
 
     # A damaged frame must be reported, never silently accepted.
     ok4, _, meta4 = t.grab(corrupt_payload=True)
@@ -2549,12 +2582,13 @@ def main_gui(args):
       .tile .card-title::before { content: "▾ "; color: #64748b; }
       .tile.collapsed .card-title::before { content: "▸ "; }
       .tile.collapsed > :not(:first-child) { display: none !important; }
-      /* Chips readable: 14 px, and the neutral ones (color grey-8 - a value
-         without a verdict) light instead of dark grey on the dark cards.
-         Chips with a verdict keep their colour: positive / negative. */
+      /* Chips readable: 14 px. A value without a verdict is color
+         light-blue-3, one with a verdict positive / warning / negative.
+         Not grey-8 with a lighter colour forced over it (14.10.2026): Quasar's
+         .text-grey-8 is !important inside a cascade layer and beats any
+         unlayered rule - the chips stayed #616161 on the dark cards. */
       .q-chip { font-size: 14px !important; }
       .q-chip--dense { height: auto !important; padding: 3px 10px !important; }
-      .q-chip.text-grey-8 { color: #cbd5e1 !important; }
     </style>
     <script>
       // Fold / unfold a tile on a click on its title. The state is the
@@ -2650,7 +2684,7 @@ def main_gui(args):
             lambda e: (bench_client_in.set_visibility(e.value == "remote"),
                        bench_client_hint.set_visibility(e.value == "remote")))
         conn_btn = ui.button("connect", icon="usb").props("unelevated")
-        conn_chip = ui.chip("not connected", icon="link_off", color="grey-8").props("outline")
+        conn_chip = ui.chip("not connected", icon="link_off", color="light-blue-3").props("outline")
         # "remote": one chip per link the connection needs - relay, bench
         # agent, the agent's console port, a board answering on it - so a
         # failed connect says WHICH link is missing (remote.py's
@@ -2658,7 +2692,7 @@ def main_gui(args):
         with ui.row().classes("gap-1 items-center") as remote_row:
             remote_chips = {}
             for _name in ("relay", "bench agent", "console port", "board"):
-                with ui.chip(_name, icon="radio_button_unchecked", color="grey-8") \
+                with ui.chip(_name, icon="radio_button_unchecked", color="light-blue-3") \
                         .props("outline dense") as _c:
                     _tip = ui.tooltip("not checked yet")
                 remote_chips[_name] = (_c, _tip)
@@ -2668,7 +2702,7 @@ def main_gui(args):
             chip, tip = remote_chips[step["name"]]
             if step["ok"] is None:
                 chip.icon = "radio_button_unchecked"
-                chip.props("color=grey-8")
+                chip.props("color=light-blue-3")
                 tip.text = step.get("detail") or "not checked - an earlier link failed"
             else:
                 chip.icon = "check_circle" if step["ok"] else "cancel"
@@ -2764,7 +2798,7 @@ def main_gui(args):
                         sp_user_rate_btn = ui.button("use its rate").props("dense outline no-caps size=sm")
                         sp_user_noise_btn = ui.button("noise test", icon="graphic_eq")                             .props("dense outline no-caps size=sm")
                 sp_user_row.set_visibility(False)
-                sp_gz_chip = ui.chip("fs/16: Goertzel off", color="grey-8").props("dense outline")
+                sp_gz_chip = ui.chip("fs/16: Goertzel off", color="light-blue-3").props("dense outline")
                 # the application's rows (gui_app.py), if it has any
                 app_card = gui_app.Card(ui) if gui_app else None
                 sigproc_lbl = ui.label("").classes("text-xs text-slate-400")
@@ -2926,14 +2960,14 @@ def main_gui(args):
                 }
                 chips = {}
                 for _k in ("overrun", "late", "missed"):
-                    chips[_k] = ui.chip(f"{_k} –", color="grey-8").props("dense outline")
+                    chips[_k] = ui.chip(f"{_k} –", color="light-blue-3").props("dense outline")
                     with chips[_k]:
                         ui.tooltip(COUNTER_TIPS[_k]).style("font-size: 14px; max-width: 24rem;")
-                rate_chip = ui.chip("actual rate –", color="grey-8").props("dense outline")
-                halves_chip = ui.chip("halves/xfer –", color="grey-8").props("dense outline")
-                load_chip = ui.chip("CPU load –", color="grey-8").props("dense outline")
-                trig_chip = ui.chip("trigger off", color="grey-8").props("dense outline")
-                loop_chip = ui.chip("loop –", color="grey-8").props("dense outline")
+                rate_chip = ui.chip("actual rate –", color="light-blue-3").props("dense outline")
+                halves_chip = ui.chip("halves/xfer –", color="light-blue-3").props("dense outline")
+                load_chip = ui.chip("CPU load –", color="light-blue-3").props("dense outline")
+                trig_chip = ui.chip("trigger off", color="light-blue-3").props("dense outline")
+                loop_chip = ui.chip("loop –", color="light-blue-3").props("dense outline")
                 with loop_chip:
                     ui.tooltip("The signal generator's loop (SG.6): when the chain reads the pin "
                                "the generator drives (DAC2 = RA8 = core 5 / PINSEL 3, DAC1 = RA1 = "
@@ -2972,6 +3006,10 @@ def main_gui(args):
                                         format="%.3f").props("dense outlined").style("width: 12rem")
                     ui.label("ADC full scale (4096 counts) = this voltage; the right axis and the "
                              "tooltip show volts from it").classes("text-xs text-slate-400")
+                    ui.space()
+                    # 14.10.2026: the counts axis fitted to the grab instead of 0..4096 -
+                    # a noise floor of a few LSB is a flat line at full scale
+                    time_auto_cb = ui.checkbox("autoscale", value=False).props("dense")
                 # What this grab is: the signal source as the GUI set it up,
                 # and the window's own min..max - so a DAC change can be
                 # checked against the numbers, not only by eye.
@@ -3055,11 +3093,18 @@ def main_gui(args):
                     "H3": "3rd harmonic level relative to the fundamental, in dBc.",
                     "H4": "4th harmonic level relative to the fundamental, in dBc.",
                     "H5": "5th harmonic level relative to the fundamental, in dBc.",
+                    "noise rms": "Noise integrated over the whole band (DC, fundamental and harmonics "
+                                 "left out), in ADC counts (LSB) rms. With the average on, over the averaged spectrum.",
+                    "SNR FS": "That noise against a full-scale sine (2048 counts peak), in dB - the SNR the "
+                              "ADC would reach at full scale. Ideal 12 bit: 74 dB.",
+                    "ENOB": "Effective number of bits from that noise: (SNR FS - 1.76) / 6.02. Harmonics "
+                            "are not in it (that would be SINAD). Ideal 12 bit: 12.0.",
                 }
                 with ui.row().classes("w-full gap-2 flex-wrap"):
                     eval_chips = {}
-                    for k in ("fundamental", "level", "noise floor", "SNR", "THD", "H2", "H3", "H4", "H5"):
-                        chip = ui.chip(f"{k} –", color="grey-8").props("dense outline")
+                    for k in ("fundamental", "level", "noise floor", "SNR", "THD", "H2", "H3", "H4", "H5",
+                              "noise rms", "SNR FS", "ENOB"):
+                        chip = ui.chip(f"{k} –", color="light-blue-3").props("dense outline")
                         with chip:
                             ui.tooltip(EVAL_TOOLTIPS[k]).style("font-size: 14px; max-width: 22rem;")
                         eval_chips[k] = chip
@@ -3068,7 +3113,7 @@ def main_gui(args):
             with ui.card().classes("tile w-full rounded-xl p-3 gap-2") as triangle_card:
                 with ui.row().classes("w-full items-center gap-3 flex-wrap"):
                     ui.label("triangle verdict · test input only").classes("card-title")
-                    triangle_verdict_chip = ui.chip("no grab yet", color="grey-8").props("dense outline")
+                    triangle_verdict_chip = ui.chip("no grab yet", color="light-blue-3").props("dense outline")
                 ui.label(
                     "Shown only when the grab's own frame says a test triangle was the signal "
                     "(slp > 0 in the GRAB header) - a custom input's grab has nothing to judge "
@@ -3093,7 +3138,7 @@ def main_gui(args):
                     }
                     triangle_chips = {}
                     for _k in ("turning points", "up", "down", "slip", "model", "steps"):
-                        chip = ui.chip(f"{_k} –", color="grey-8").props("dense outline")
+                        chip = ui.chip(f"{_k} –", color="light-blue-3").props("dense outline")
                         with chip:
                             ui.tooltip(TRIANGLE_TIPS[_k]).style("font-size: 14px; max-width: 22rem;")
                         triangle_chips[_k] = chip
@@ -3252,6 +3297,8 @@ def main_gui(args):
                       "fundamental. With f0 = 0 the table is noise alone - into a filter, with the "
                       "FFT averaged, it shows the filter's frequency response (setup 'noise ...', or "
                       "'noise test' at the user filter)."),
+        (time_auto_cb, "Fit the counts axis to the grab shown (and the expected curve), rounded out to "
+                       "a 1/2/5 step, at least 10 counts; the volt axis follows. Off: 0..4096 counts."),
         (fft_auto_cb, "Fit the dB axis to the spectrum shown (rounded out to 10 dB, at least 20 dB); "
                       "off: the fixed -100..0 dBFS."),
         (fft_avg_cb, "Average the spectrum's power over the last N grabs (rate, length and processing "
@@ -3718,10 +3765,37 @@ def main_gui(args):
     # voltage baked in; rebuilt whenever either changes.
     time_axis = {"per_sample": 1e6 / 8e6, "unit": "µs"}
 
+    def time_yscale(vref):
+        """0..4096 counts (0..vref on the right), or with autoscale the
+        plotted data's range (grab and expected curve) rounded out to a
+        1/2/5 step, at least 10 counts tall; the volt axis gets the same
+        range and step, so its ticks stay on the counts' grid lines."""
+        yc, yv = time_chart.options["yAxis"]
+        data = [d for s in time_chart.options["series"] for _, d in s["data"] if np.isfinite(d)]
+        if time_auto_cb.value and data:
+            lo, hi = float(min(data)), float(max(data))
+            mid, half = (lo + hi) / 2.0, max((hi - lo) * 0.55, 5.0)
+            raw = 2.0 * half / 5.0
+            mag = 10.0 ** math.floor(math.log10(raw))
+            step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw)
+            lo, hi = step * math.floor((mid - half) / step), step * math.ceil((mid + half) / step)
+            yc.update(min=lo, max=hi, interval=step)
+            yv.update(min=lo * vref / 4096, max=hi * vref / 4096, interval=step * vref / 4096)
+            yv["axisLabel"].pop("formatter", None)
+            digits = max(0, min(6, 1 - math.floor(math.log10(step * vref / 4096))))
+            yv["axisLabel"][":formatter"] = f"v => v.toFixed({digits}) + ' V'"
+        else:
+            yc.update(min=0, max=4096)
+            yv.update(min=0, max=vref)
+            yc.pop("interval", None)
+            yv.pop("interval", None)
+            yv["axisLabel"].pop(":formatter", None)
+            yv["axisLabel"]["formatter"] = "{value} V"
+
     def update_time_tooltip():
         vref = float(vref_in.value or 3.3)
         per, unit = time_axis["per_sample"], time_axis["unit"]
-        time_chart.options["yAxis"][1]["max"] = vref
+        time_yscale(vref)
         time_chart.options["tooltip"][":formatter"] = (
             "p => { const s = p[0].data[0], c = p[0].data[1];"
             f" return (s * {per!r}).toFixed(3) + ' {unit}<br/>'"
@@ -3730,6 +3804,7 @@ def main_gui(args):
             " + '<span style=\"color:#94a3b8\">sample ' + (+s.toFixed(2)) + '</span>'; }")
         time_chart.update()
     vref_in.on_value_change(lambda e: update_time_tooltip())
+    time_auto_cb.on_value_change(lambda e: update_time_tooltip())
     update_time_tooltip()
 
     def update_dac_freq_label():
@@ -3799,7 +3874,7 @@ def main_gui(args):
             state["acq_active"] = None
             conn_btn.text, conn_btn.icon = "connect", "usb"
             conn_chip.text, conn_chip.icon = "not connected", "link_off"
-            conn_chip.props("color=grey-8")
+            conn_chip.props("color=light-blue-3")
             buf_lbl.text = "buf: not queried yet"
             return
         try:
@@ -3820,7 +3895,7 @@ def main_gui(args):
                 reset_steps()
                 remote_row.set_visibility(True)
                 conn_chip.text, conn_chip.icon = "remote: checking relay, agent, port ...", "hourglass_top"
-                conn_chip.props("color=grey-8")
+                conn_chip.props("color=light-blue-3")
                 steps = await run.io_bound(bench.check, 10.0)
                 for st in steps:
                     show_step(st)
@@ -4212,7 +4287,7 @@ def main_gui(args):
                                 + (f"; {app_card.summary()}" if app_card else ""))
         if not gz:
             sp_gz_chip.text = "fs/16: Goertzel off"
-            sp_gz_chip.props("color=grey-8")
+            sp_gz_chip.props("color=light-blue-3")
     def show_user_filter(filt, kv):
         """The user filter's row: what the board reports ('sigproc user': user,
         user_fs, user_id - cli.c), whether user_filter.json describes the same
@@ -4490,7 +4565,7 @@ def main_gui(args):
                 plot = [[i, int(v)] for i, v in enumerate(samples)]
                 n_samp = max(len(samples) - 1, 1)
                 trig_chip.text = "trigger off"
-                trig_chip.props("color=grey-8")
+                trig_chip.props("color=light-blue-3")
                 # emptied, not removed: the chart merges options, a removed
                 # key would leave the last line standing
                 time_chart.options["series"][0]["markLine"] = {"data": []}
@@ -4524,7 +4599,7 @@ def main_gui(args):
             else:
                 time_chart.options["series"][1]["data"] = []
                 loop_chip.text = "loop –"
-                loop_chip.props("color=grey-8")
+                loop_chip.props("color=light-blue-3")
             time_chart.options["xAxis"][0]["max"] = n_samp
             time_chart.options["xAxis"][1]["max"] = duration_s * t_scale
             time_chart.options["xAxis"][1]["name"] = t_name
@@ -4587,13 +4662,13 @@ def main_gui(args):
             if gzm is None:
                 sp_gz_chip.text = ("fs/16: no result in the frame" if sp_gz_cb.value
                                    else "fs/16: Goertzel off")
-                sp_gz_chip.props("color=grey-8")
+                sp_gz_chip.props("color=light-blue-3")
             else:
                 fs16 = meta["ksps"] / 16.0
                 sp_gz_chip.text = (f"fs/16 = {fs16:g} kHz: {gzm['amp']} LSB, "
                                    f"{gzm['share_pm'] / 10:.1f} % of the signal - "
                                    + ("DETECTED" if gzm["detected"] else "not detected"))
-                sp_gz_chip.props("color=" + ("positive" if gzm["detected"] else "grey-8"))
+                sp_gz_chip.props("color=" + ("positive" if gzm["detected"] else "light-blue-3"))
 
             # Grabs per second between the first grab and this one, while
             # LIVE runs only: counted from 'stream on' a SINGLE (one grab a
@@ -4618,12 +4693,12 @@ def main_gui(args):
             for k in ("overrun", "late", "missed"):
                 set_chip(k, meta[k])
             rate_chip.text = f"actual rate {meta['ksps']} kSPS"
-            rate_chip.props("color=grey-8")
+            rate_chip.props("color=light-blue-3")
             halves_chip.text = f"halves {meta['halves']} / xfer {meta['transfers']}"
-            halves_chip.props("color=grey-8")
+            halves_chip.props("color=light-blue-3")
             if load is None:
                 load_chip.text = "CPU load –"
-                load_chip.props("color=grey-8")
+                load_chip.props("color=light-blue-3")
             else:
                 load_chip.text = f"CPU load {load / 10:.1f} %"
                 load_chip.props("color=" + ("positive" if load < 700 else
@@ -4644,7 +4719,10 @@ def main_gui(args):
                         chip.text = f"H{k}  {harmonics[k]['rel_db']:.1f} dBc"
                     else:
                         chip.text = f"H{k} –"
-                    chip.props("color=grey-8")
+                    chip.props("color=light-blue-3")
+                eval_chips["noise rms"].text = f"noise rms {metrics['noise_rms']:.2f} LSB"
+                eval_chips["SNR FS"].text = f"SNR FS {metrics['snr_fs_db']:.1f} dB"
+                eval_chips["ENOB"].text = f"ENOB {metrics['enob']:.2f} bit"
 
             fake_no_tri = isinstance(t, FakeTarget) and t.fake_source in ("sine", "dac1")
             # processed data (proc=1) need not be a triangle any more
@@ -4657,7 +4735,7 @@ def main_gui(args):
                     # the slip test compares whole slopes; with fewer than
                     # two in the window there is nothing to compare
                     triangle_verdict_chip.text = "n/a - too few slopes in the window"
-                    triangle_verdict_chip.props("color=grey-8")
+                    triangle_verdict_chip.props("color=light-blue-3")
                 else:
                     triangle_verdict_chip.text = "PASS" if verdict else "FAIL"
                     triangle_verdict_chip.props(f'color={"positive" if verdict else "negative"}')

@@ -524,8 +524,11 @@ off.
 
 1. **reference voltage, V** - full scale (4096 counts) in volts; sets the right axis and
    the tooltip.
-2. **Source line** - what is on the input, and min/max of this grab.
-3. **Plot** - samples over time: left axis ADC counts, right axis volts, bottom axis
+2. **autoscale** - fits the counts axis to the grab shown (rounded out to a 1/2/5 step, at
+   least 10 counts tall), the volt axis follows; off, the axis is 0..4096 counts. For a
+   noise floor of a few LSB, which is a flat line at full scale.
+3. **Source line** - what is on the input, and min/max of this grab.
+4. **Plot** - samples over time: left axis ADC counts, right axis volts, bottom axis
    sample number, top axis time. Hover for single values; mouse wheel and drag zoom.
 
 With **trigger** on, the plot starts at the crossing of the level (dashed line) and shows
@@ -568,11 +571,19 @@ Appears once a noise test has run (button 7 in **signal processing**).
 1. **fundamental** - frequency of the strongest line.
 2. **level** - its level in dBFS.
 3. **noise floor** - median of the spectrum outside the fundamental and its harmonics.
-4. **SNR** - green from 40 dB.
+4. **SNR** - fundamental minus the noise floor (per bin, not the whole band); green from
+   40 dB.
 5. **THD** - harmonics 2..5 against the fundamental.
 6. **H2** (and H3..H5 beside it) - each harmonic in dBc.
+7. **noise rms** - the noise integrated over the whole band (DC, fundamental and harmonics
+   left out), in counts (LSB) rms; with **average** on, from the averaged spectrum.
+8. **SNR FS** - that noise against a full-scale sine (2048 counts peak): the SNR the ADC
+   would reach at full scale. Ideal 12 bit: 74 dB.
+9. **ENOB** - (SNR FS - 1.76) / 6.02; harmonics are not in it (that would be SINAD).
 
-Meaningful for a sine; for a triangle the harmonics are of course large.
+Items 1-6 are meaningful for a sine; for a triangle the harmonics are of course large.
+Items 7-9 also hold with nothing on the input: that is the ADC's noise floor.
+Values without a verdict are light blue, verdicts green / amber / red.
 
 #### triangle verdict · test input only
 

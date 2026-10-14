@@ -216,7 +216,7 @@ def adc_gui(p):
                          ("chip", "^down"), ("chip", "slip"), ("chip", "slope/model")],
              "adc_verdict")
         ts = card(page, "time signal")
-        shot(page, ts, [("field", "reference voltage"), ("text", "^source:"), ("chart", None)],
+        shot(page, ts, [("field", "reference voltage"), ("cb", "autoscale"), ("text", "^source:"), ("chart", None)],
              "adc_time_triangle")
         shot(page, card(page, "buffer"), [("field", "buffer size"), ("btn", "apply"),
                                           ("text", "^buf")], "adc_buffer")
@@ -249,7 +249,8 @@ def adc_gui(p):
         shot(page, sp, [("cb", "autoscale"), ("cb", "average"), ("field", "grabs"), ("chart", None)], "adc_spectrum")
         shot(page, card(page, "signal evaluation"), [
             ("chip", "fundamental"), ("chip", "level"), ("chip", "noise floor"), ("chip", "SNR"),
-            ("chip", "THD"), ("chip", "H2")], "adc_evaluation")
+            ("chip", "THD"), ("chip", "H2"), ("chip", "noise rms"), ("chip", "SNR FS"),
+            ("chip", "ENOB")], "adc_evaluation")
 
         print("dsPIC33 GUI: signal generator loop")
         sg = card(page, "signal generator")
